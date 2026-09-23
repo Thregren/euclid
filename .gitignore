@@ -1,0 +1,14 @@
+# 瓦片数据（16.5 GB，绝不入库）
+瓦片/
+
+# 构建产物
+.build/
+dist/
+*.app
+
+# macOS
+.DS_Store
+
+# Xcode / SwiftPM
+*.xcuserstate
+.swiftpm/
