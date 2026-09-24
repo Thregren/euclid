@@ -24,7 +24,8 @@ final class TileCanvasNSView: NSView {
     private var tileLayers: [SlippyTile: CALayer] = [:]
     private var tileTasks: [SlippyTile: Task<Void, Never>] = [:]
     private var missingTiles: Set<SlippyTile> = []
-    private var requestedTiles: Set<SlippyTile> = []
+    /// 已经排队等下一帧补请求的标记，避免同一帧重复调度。
+    private var refillScheduled = false
 
     private var provider: TileProvider?
     private var dataset: TileDataset?
@@ -178,7 +179,6 @@ final class TileCanvasNSView: NSView {
         for layer in tileLayers.values { layer.removeFromSuperlayer() }
         tileLayers.removeAll()
         missingTiles.removeAll()
-        requestedTiles.removeAll()
 
         guard let dataset else {
             provider = nil
@@ -251,18 +251,21 @@ final class TileCanvasNSView: NSView {
     // MARK: - 缩放控制
 
     func zoomIn(anchor: CGPoint? = nil) {
-        camera = camera.zoomed(by: 1.6, anchorViewPoint: anchor).clamped(zoomLevelRange: zoomBounds)
+        camera = camera.zoomed(by: 1.6, anchorViewPoint: anchor, zoomLevelRange: zoomBounds)
         syncLayers()
     }
 
     func zoomOut(anchor: CGPoint? = nil) {
-        camera = camera.zoomed(by: 1 / 1.6, anchorViewPoint: anchor).clamped(zoomLevelRange: zoomBounds)
+        camera = camera.zoomed(by: 1 / 1.6, anchorViewPoint: anchor, zoomLevelRange: zoomBounds)
         syncLayers()
     }
 
     func zoomToActualSize() {
         guard let dataset else { return }
-        camera = camera.settingZoomLevel(Double(dataset.zoomRange.upperBound)).clamped(zoomLevelRange: zoomBounds)
+        camera = camera.settingZoomLevel(
+            Double(dataset.zoomRange.upperBound),
+            zoomLevelRange: zoomBounds
+        )
         syncLayers()
     }
 
@@ -384,17 +387,42 @@ final class TileCanvasNSView: NSView {
         requestMissingTiles(needed: needed, provider: provider)
         renderGrid(zoom: zoom)
         refreshOverlay()
+        Self.traceView(camera: camera, zoomBounds: zoomBounds, dataZoom: zoom, needed: needed.count,
+                       loaded: tileLayers.values.filter { $0.contents != nil }.count,
+                       missing: missingTiles.count,
+                       tileDisplaySize: tileDisplaySize)
         reportViewport(visibleTiles: needed.count)
+    }
+
+    /// 调试用：`EUCLID_TRACE_VIEW=1` 时把每次渲染的关键数字打到 stderr。
+    static func traceView(
+        camera: MapCamera,
+        zoomBounds: ClosedRange<Double>,
+        dataZoom: Int,
+        needed: Int,
+        loaded: Int,
+        missing: Int,
+        tileDisplaySize: CGFloat
+    ) {
+        guard ProcessInfo.processInfo.environment["EUCLID_TRACE_VIEW"] != nil else { return }
+        let line = String(
+            format: "[view] z=%.2f 层级=%d 范围=%.2f…%.2f 需要=%d 已载入=%d 缺片=%d 瓦片边长=%.0fpt 中心=(%.5f,%.5f)\n",
+            camera.zoomLevel, dataZoom, zoomBounds.lowerBound, zoomBounds.upperBound,
+            needed, loaded, missing, tileDisplaySize, camera.center.x, camera.center.y
+        )
+        FileHandle.standardError.write(Data(line.utf8))
     }
 
     private func requestMissingTiles(needed: Set<SlippyTile>, provider: TileProvider) {
         let currentGeneration = generation
         let outstanding = tileTasks.count
+        // 只按「这一帧还缺图、没有在途请求、也不是已确认缺片」来判断是否要取图。
+        // 过去这里还记了一个「请求过就不再请求」的集合，结果是 —— 图层一旦被移除重建
+        // （换个缩放层级就会发生），新图层永远不会再取图，整屏变成空占位。
         var pending: [SlippyTile] = needed.filter { tile in
             tileLayers[tile]?.contents == nil
                 && tileTasks[tile] == nil
                 && !missingTiles.contains(tile)
-                && !requestedTiles.contains(tile)
         }
         guard !pending.isEmpty else { return }
 
@@ -407,15 +435,16 @@ final class TileCanvasNSView: NSView {
 
         let budget = max(0, maximumConcurrentRequests - outstanding)
         for tile in pending.prefix(budget) {
-            requestedTiles.insert(tile)
             tileTasks[tile] = Task { @MainActor [weak self] in
                 guard let self else { return }
                 let image = await provider.image(for: tile)
                 guard self.generation == currentGeneration else { return }
                 self.tileTasks[tile] = nil
                 guard let image else {
+                    if self.missingTiles.count > 50_000 { self.missingTiles.removeAll(keepingCapacity: true) }
                     self.missingTiles.insert(tile)
                     self.publishTileStats()
+                    self.scheduleRefill()
                     return
                 }
                 if let layer = self.tileLayers[tile] {
@@ -439,9 +468,21 @@ final class TileCanvasNSView: NSView {
                     }
                 }
                 self.publishTileStats()
+                // 并发额度腾出来了，把这一帧没排上队的瓦片接着取。
+                self.scheduleRefill()
             }
         }
-        if requestedTiles.count > 100_000 { requestedTiles.removeAll(keepingCapacity: true) }
+    }
+
+    /// 本轮请求结束后补跑一次同步，避免超出并发额度的瓦片要等到下次交互才加载。
+    private func scheduleRefill() {
+        guard !refillScheduled else { return }
+        refillScheduled = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.refillScheduled = false
+            self.syncLayers()
+        }
     }
 
     private func distanceSquared(_ tile: SlippyTile, center: CGPoint, zoom: Int) -> Double {
@@ -776,7 +817,7 @@ final class TileCanvasNSView: NSView {
             let steps = precise ? event.scrollingDeltaY / 20 : event.scrollingDeltaY
             guard abs(steps) > 0.0001 else { return }
             let factor = Foundation.exp(steps * Self.wheelZoomStep)
-            camera = camera.zoomed(by: factor, anchorViewPoint: point).clamped(zoomLevelRange: zoomBounds)
+            camera = camera.zoomed(by: factor, anchorViewPoint: point, zoomLevelRange: zoomBounds)
         } else {
             let delta = CGPoint(x: event.scrollingDeltaX, y: -event.scrollingDeltaY)
             camera = camera.translated(byViewDelta: delta).clamped(zoomLevelRange: zoomBounds)
@@ -790,7 +831,7 @@ final class TileCanvasNSView: NSView {
         let point = convert(event.locationInWindow, from: nil)
         let factor = 1 + event.magnification
         guard factor > 0.05 else { return }
-        camera = camera.zoomed(by: factor, anchorViewPoint: point).clamped(zoomLevelRange: zoomBounds)
+        camera = camera.zoomed(by: factor, anchorViewPoint: point, zoomLevelRange: zoomBounds)
         updateLiveCoordinate(point)
         reportCursor(point)
         syncLayers()

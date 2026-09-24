@@ -86,6 +86,51 @@ let anchorAfter = camera.zoomed(by: 2.5, anchorViewPoint: anchor).coordinate(for
 expectClose(anchorAfter.longitude, anchorBefore.longitude, accuracy: 1e-9, "缩放锚点经度不变")
 expectClose(anchorAfter.latitude, anchorBefore.latitude, accuracy: 1e-9, "缩放锚点纬度不变")
 
+// 到达缩放上下限后继续缩放，绝不能变成平移（否则影像会被推出画面）。
+let corner = CGPoint(x: 1190, y: 790)
+let atFloor = MapCamera(
+    center: camera.center,
+    zoomLevel: 11,
+    viewportSize: camera.viewportSize,
+    tilePixelSize: camera.tilePixelSize
+)
+var limitedOut = atFloor
+for _ in 0..<30 {
+    limitedOut = limitedOut.zoomed(by: 1 / 1.6, anchorViewPoint: corner, zoomLevelRange: 11...16)
+}
+expectClose(limitedOut.zoomLevel, 11, accuracy: 1e-9, "连续缩小应停在下限")
+expectClose(limitedOut.center.x, atFloor.center.x, accuracy: 1e-12, "到下限后继续缩小不应平移（x）")
+expectClose(limitedOut.center.y, atFloor.center.y, accuracy: 1e-12, "到下限后继续缩小不应平移（y）")
+
+let atCeiling = MapCamera(
+    center: camera.center,
+    zoomLevel: 16,
+    viewportSize: camera.viewportSize,
+    tilePixelSize: camera.tilePixelSize
+)
+var limitedIn = atCeiling
+for _ in 0..<30 {
+    limitedIn = limitedIn.zoomed(by: 1.6, anchorViewPoint: corner, zoomLevelRange: 11...16)
+}
+expectClose(limitedIn.zoomLevel, 16, accuracy: 1e-9, "连续放大应停在上限")
+expectClose(limitedIn.center.x, atCeiling.center.x, accuracy: 1e-12, "到上限后继续放大不应平移（x）")
+expectClose(limitedIn.center.y, atCeiling.center.y, accuracy: 1e-12, "到上限后继续放大不应平移（y）")
+
+// 下限处的一次滚动应当完全无效果（不是平移）。
+let oneStepOut = atFloor.zoomed(by: 0.8, anchorViewPoint: corner, zoomLevelRange: 11...16)
+expectClose(oneStepOut.zoomLevel, 11, accuracy: 1e-9, "下限处单步缩放层级不变")
+expectClose(oneStepOut.center.x, atFloor.center.x, accuracy: 1e-12, "下限处单步缩放不移位")
+expectClose(oneStepOut.center.y, atFloor.center.y, accuracy: 1e-12, "下限处单步缩放不移位（y）")
+// 未到限时锚点仍然生效。
+let midZoom = camera.zoomed(by: 1.6, anchorViewPoint: corner, zoomLevelRange: 11...16)
+expect(midZoom.zoomLevel > 14, "未到上限时正常放大")
+expect(midZoom.center.x != camera.center.x || midZoom.center.y != camera.center.y, "锚点缩放会移动中心")
+// 锚点补偿也不该被夹取破坏：未到限时锚点下的坐标保持不变。
+let midAnchorBefore = camera.coordinate(forViewPoint: corner)
+let midAnchorAfter = midZoom.coordinate(forViewPoint: corner)
+expectClose(midAnchorAfter.longitude, midAnchorBefore.longitude, accuracy: 1e-9, "带层级范围的缩放锚点经度不变")
+expectClose(midAnchorAfter.latitude, midAnchorBefore.latitude, accuracy: 1e-9, "带层级范围的缩放锚点纬度不变")
+
 let movedRight = camera.translated(byViewDelta: CGPoint(x: 100, y: 0))
 expect(movedRight.center.x < camera.center.x, "内容右移时相机中心西移")
 let movedUp = camera.translated(byViewDelta: CGPoint(x: 0, y: 100))

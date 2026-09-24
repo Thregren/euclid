@@ -77,7 +77,7 @@ final class CanvasController {
     func goTo(_ coordinate: GeoCoordinate) { view?.goTo(coordinate) }
     func fit() { view?.fitToData() }
     func zoomIn() { view?.zoomIn() }
-    func zoomOut() { view?.zoomOut() }
+    func zoomOut(anchor: CGPoint? = nil) { view?.zoomOut(anchor: anchor) }
     func actualSize() { view?.zoomToActualSize() }
 }
 

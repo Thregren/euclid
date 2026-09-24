@@ -39,19 +39,40 @@ public struct MapCamera: Sendable, Equatable {
     }
 
     /// 以某个视图点为锚点缩放（锚点下的地理坐标保持不变）。
-    public func settingZoomLevel(_ level: Double, anchorViewPoint: CGPoint? = nil) -> MapCamera {
+    ///
+    /// - Parameter zoomLevelRange: 给出时先把目标层级夹到该范围，**再**算锚点补偿。
+    ///   这一点很关键：若先按未夹取的层级算补偿、事后只修正比例尺，
+    ///   那么已经到缩放上下限时继续缩放会变成「平移」，几下就把影像推出画面。
+    public func settingZoomLevel(
+        _ level: Double,
+        anchorViewPoint: CGPoint? = nil,
+        zoomLevelRange: ClosedRange<Double>? = nil
+    ) -> MapCamera {
+        let target = zoomLevelRange.map { min(max(level, $0.lowerBound), $0.upperBound) } ?? level
+        // 层级没变化就不动视图，避免浮点噪声带来缓慢漂移。
+        guard abs(target - zoomLevel) > 1e-12 else { return self }
+
         var camera = self
         let anchor = anchorViewPoint ?? CGPoint(x: viewportSize.width / 2, y: viewportSize.height / 2)
         let anchorWorld = worldPoint(forViewPoint: anchor)
-        camera.pixelsPerWorldUnit = pow(2, level) * tilePixelSize
+        camera.pixelsPerWorldUnit = pow(2, target) * tilePixelSize
         let anchorAfter = camera.viewPoint(forWorldPoint: anchorWorld)
         camera.center.x += (anchorAfter.x - anchor.x) / camera.pixelsPerWorldUnit
         camera.center.y -= (anchorAfter.y - anchor.y) / camera.pixelsPerWorldUnit
         return camera
     }
 
-    public func zoomed(by factor: Double, anchorViewPoint: CGPoint? = nil) -> MapCamera {
-        settingZoomLevel(zoomLevel + log2(factor), anchorViewPoint: anchorViewPoint)
+    /// 按比例缩放；`zoomLevelRange` 的含义同 `settingZoomLevel(_:anchorViewPoint:zoomLevelRange:)`。
+    public func zoomed(
+        by factor: Double,
+        anchorViewPoint: CGPoint? = nil,
+        zoomLevelRange: ClosedRange<Double>? = nil
+    ) -> MapCamera {
+        settingZoomLevel(
+            zoomLevel + log2(factor),
+            anchorViewPoint: anchorViewPoint,
+            zoomLevelRange: zoomLevelRange
+        )
     }
 
     /// 视图内容随手指/鼠标移动 `delta` 点。
