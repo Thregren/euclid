@@ -179,6 +179,117 @@ expectClose(areaResult.closingError ?? 0, Geodesy.distance(from: rectangle[3], t
 let reversedArea = Geodesy.area(of: rectangle.reversed())
 expectClose(reversedArea, rectangleArea, accuracy: 1e-6, "面积与绕行方向无关")
 
+// MARK: - 画圆
+
+section("画圆")
+
+// 直接公式与反向公式互为逆运算。
+let circleCenter = GeoCoordinate(longitude: 10.0, latitude: 45.0)
+let circleRim = Geodesy.destination(from: circleCenter, initialBearing: 37, distance: 500)
+let circleInverse = Geodesy.inverse(from: circleCenter, to: circleRim)
+expectClose(circleInverse.distance, 500, accuracy: 1e-5, "直接公式往返距离一致")
+expectClose(circleInverse.initialBearing, 37, accuracy: 1e-7, "直接公式往返方位角一致")
+expectClose(
+    Geodesy.destination(from: circleCenter, initialBearing: 0, distance: 0).latitude,
+    circleCenter.latitude,
+    accuracy: 1e-12,
+    "零距离返回起点"
+)
+
+// 向东走一整圈应回到原点附近（跨经度 180° 的兜底路径另算）。
+let eastward = Geodesy.destination(from: circleCenter, initialBearing: 90, distance: 1000)
+expect(eastward.longitude > circleCenter.longitude, "向东方位角应使经度增大")
+let northward = Geodesy.destination(from: circleCenter, initialBearing: 0, distance: 1000)
+expect(northward.latitude > circleCenter.latitude, "正北方位角应使纬度增大")
+
+let circle = GeoMeasurement(kind: .circle, points: [circleCenter, circleRim])
+let circleResult = circle.result
+expectClose(circleResult.radius ?? 0, 500, accuracy: 1e-5, "圆半径取自圆心到半径点的测地距离")
+let analyticCircumference = 2 * Double.pi * 500
+expect(
+    abs((circleResult.totalLength - analyticCircumference) / analyticCircumference) < 1e-4,
+    "圆周长与 2πr 相对误差应小于 0.01%（实际 \(circleResult.totalLength)）"
+)
+let analyticArea = Double.pi * 500 * 500
+expect(
+    abs(((circleResult.area ?? 0) - analyticArea) / analyticArea) < 0.005,
+    "圆面积与 πr² 相对误差应小于 0.5%（实际 \(circleResult.area ?? 0)）"
+)
+expect(circleResult.segments.count == 1, "圆应保留一条圆心到半径点的记录")
+expect(circle.pointLabel(at: 0) == "圆心" && circle.pointLabel(at: 1) == "半径点", "圆的顶点命名")
+expect(circle.circleRadius != nil, "圆应给出半径")
+
+// 「定位到该测量」用的范围必须覆盖整个圆，而不是只有圆心和半径点。
+if let rect = circle.worldRect {
+    let worldCenter = WebMercator.normalized(circleCenter)
+    let eastEdge = WebMercator.normalized(
+        Geodesy.destination(from: circleCenter, initialBearing: 90, distance: 500)
+    )
+    expect(rect.minX < worldCenter.x && rect.maxX > eastEdge.x, "圆的范围应覆盖圆周")
+} else {
+    expect(false, "圆应给出世界范围")
+}
+
+// 半径点决定方向，输入半径后方位角保持不变。
+let dueEastRim = Geodesy.destination(from: circleCenter, initialBearing: 90, distance: 300)
+let resized = Geodesy.destination(from: circleCenter, initialBearing: 90, distance: 800)
+expectClose(Geodesy.distance(from: circleCenter, to: dueEastRim), 300, accuracy: 1e-5, "半径 300 米")
+expectClose(Geodesy.distance(from: circleCenter, to: resized), 800, accuracy: 1e-5, "半径 800 米")
+expect(resized.longitude > dueEastRim.longitude, "半径变大时半径点沿同一方位角外移")
+expect(Geodesy.circleRing(center: circleCenter, radius: 500).count == Geodesy.circleSampleCount, "圆周采样点数")
+expect(Geodesy.circleRing(center: circleCenter, radius: 0).isEmpty, "零半径不产生圆周点")
+
+// 传入已有采样点时结果必须与重新采样一致（标注层的缓存路径）。
+let sampledRing = Geodesy.circleRing(center: circleCenter, radius: 500)
+let reused = MeasurementCalculator.circleMetrics(center: circleCenter, radius: 500, ring: sampledRing)
+let resampled = MeasurementCalculator.circleMetrics(center: circleCenter, radius: 500)
+expectClose(reused.circumference, resampled.circumference, accuracy: 1e-9, "复用采样点的周长一致")
+expectClose(reused.area, resampled.area, accuracy: 1e-9, "复用采样点的面积一致")
+expect(reused.ring.count == sampledRing.count, "复用采样点时原样返回")
+expectClose(reused.radius, 500, accuracy: 1e-9, "度量结果保留半径")
+
+// MARK: - 样式
+
+section("样式")
+
+// 旧存档（没有 style 字段）要能正常读出来，并回落到默认样式。
+let legacyJSON = """
+{"id":"11111111-1111-1111-1111-111111111111","kind":"distance",\
+"points":[{"longitude":10,"latitude":45},{"longitude":10.01,"latitude":45}],"colorIndex":3}
+"""
+if let legacy = try? JSONDecoder().decode(GeoMeasurement.self, from: Data(legacyJSON.utf8)) {
+    expect(legacy.colorIndex == 3, "旧存档保留调色板索引")
+    expect(legacy.style == MeasurementStyle.standard, "旧存档缺 style 字段时使用默认样式")
+    expect(legacy.style.fillOpacity == MeasurementStyle.defaultFillOpacity, "默认填充不透明度")
+    expect(legacy.style.stroke == nil, "默认样式不覆盖描边颜色")
+} else {
+    expect(false, "缺少 style 字段的旧存档应能解码")
+}
+
+var styled = circle
+styled.style = MeasurementStyle(
+    stroke: ColorComponents(red: 0.92, green: 0.13, blue: 0.21),
+    fill: ColorComponents(red: 0.13, green: 0.44, blue: 0.93),
+    fillOpacity: 0.35,
+    strokeWidth: 3.5
+)
+if let encoded = try? JSONEncoder().encode(styled),
+   let decoded = try? JSONDecoder().decode(GeoMeasurement.self, from: encoded) {
+    expect(decoded.style == styled.style, "自定义样式应能往返编解码")
+    expect(decoded.style.stroke?.red == 0.92, "描边颜色分量保留")
+    expect(decoded.style.fillOpacity == 0.35, "填充不透明度保留")
+} else {
+    expect(false, "自定义样式的测量应能编解码")
+}
+
+expect(MeasurementKind.area.hasFill && MeasurementKind.circle.hasFill, "多边形与圆有填充")
+expect(!MeasurementKind.distance.hasFill && !MeasurementKind.point.hasFill, "折线与点没有填充")
+expect(
+    MeasurementStyle(fillOpacity: 4, strokeWidth: 99).sanitized()
+        == MeasurementStyle(fillOpacity: 1, strokeWidth: 12),
+    "样式会被限制到合法范围"
+)
+
 section("格式化")
 expect(MeasureFormat.distance(523.4) == "523.4 m", "米级格式")
 let kilometerText = MeasureFormat.distance(1234.5)
@@ -224,6 +335,51 @@ expect(source.fileCandidates(for: SlippyTile(zoom: 5, x: 32, y: 0)).isEmpty, "�
 // MARK: - 导出
 
 section("导出格式")
+
+// MARK: - 构造数据集（验证嗅探与范围回退）
+
+section("构造数据集")
+let syntheticRoot = URL(fileURLWithPath: NSTemporaryDirectory())
+    .appending(path: "euclid-check-\(UUID().uuidString)")
+defer { try? FileManager.default.removeItem(at: syntheticRoot) }
+
+func makeTile(zoom: Int, x: Int, y: Int) throws {
+    let directory = syntheticRoot.appending(path: "\(zoom)/\(x)")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let file = directory.appending(path: "\(y).png")
+    FileManager.default.createFile(atPath: file.path(percentEncoded: false), contents: Data([0x89, 0x50, 0x4E, 0x47]))
+}
+
+do {
+    try makeTile(zoom: 1, x: 0, y: 0)
+    for x in 1...2 {
+        try makeTile(zoom: 2, x: x, y: 1)
+    }
+} catch {
+    expect(false, "构造测试数据集失败：\(error)")
+}
+
+if let dataset = DatasetLocator.makeDataset(at: syntheticRoot) {
+    expect(dataset.zoomRange == 1...2, "应识别出层级 1...2")
+    expect(dataset.layout.directoryAxis == .xFirst, "应识别为 <z>/<x>/<y>")
+
+    if let extent = DatasetLocator.extent(of: dataset, preferredMaxDirectories: 10) {
+        expect(extent.level == 2, "应取目录数在预算内的最高层 z2")
+        expectClose(extent.worldRect.minX, 0.25, accuracy: 1e-12, "范围西边界")
+        expectClose(extent.worldRect.maxX, 0.75, accuracy: 1e-12, "范围东边界")
+        expectClose(extent.worldRect.minY, 0.25, accuracy: 1e-12, "范围北边界")
+        expectClose(extent.worldRect.maxY, 0.50, accuracy: 1e-12, "范围南边界")
+    } else {
+        expect(false, "应给出覆盖范围")
+    }
+
+    // 预算为 0 时所有层级都超标，应退化为目录数最少的层级而不是直接放弃。
+    expect(DatasetLocator.extent(of: dataset, preferredMaxDirectories: 0) != nil, "超预算时应退化给出范围")
+} else {
+    expect(false, "应能识别出构造的数据集")
+}
+
+// MARK: - 真实数据集（可选，传入目录时执行）
 let sampleMeasurement = GeoMeasurement(
     kind: .distance,
     points: path,
@@ -238,6 +394,78 @@ expect(kml.contains("<kml xmlns="), "KML 应包含命名空间")
 let csv = MeasurementExporter.csv([sampleMeasurement])
 expect(csv.contains("经度"), "CSV 应包含表头")
 expect(csv.split(separator: "\n").count == 4, "CSV 应有表头加 3 个点")
+
+// 圆导出为闭合多边形；半径同时出现在属性里。
+let circleGeoJSON = MeasurementExporter.geoJSON([circle])
+expect(circleGeoJSON.contains("\"Polygon\""), "圆在 GeoJSON 中应是闭合多边形")
+expect(circleGeoJSON.contains("\"radiusMeters\""), "GeoJSON 属性应包含半径")
+let circleKML = MeasurementExporter.kml([circle])
+expect(circleKML.contains("<Polygon>"), "圆在 KML 中应是 Polygon")
+
+// Excel：三个数据表 + 一页说明，并且必须是结构合法的 xlsx（ZIP）。
+let workbook = MeasurementExporter.excel(
+    [sampleMeasurement, circle],
+    datasetName: "自检数据集",
+    exportedAt: Date(timeIntervalSince1970: 1_700_000_000)
+)
+expect(workbook.count > 2_000, "xlsx 应包含足够内容（实际 \(workbook.count) 字节）")
+if let entries = ZIP.parse(workbook) {
+    let names = entries.map(\.name)
+    expect(names.count == 9, "xlsx 应包含 9 个部件（实际 \(names.count)）")
+    expect(names.contains("[Content_Types].xml"), "xlsx 应有内容类型清单")
+    expect(names.contains("_rels/.rels"), "xlsx 应有包关系")
+    expect(names.contains("xl/workbook.xml"), "xlsx 应有工作簿定义")
+    expect(names.contains("xl/_rels/workbook.xml.rels"), "xlsx 应有工作簿关系")
+    expect(names.contains("xl/styles.xml"), "xlsx 应有样式表")
+    expect(names.contains("xl/worksheets/sheet4.xml"), "xlsx 应有第 4 张工作表")
+
+    func part(_ name: String) -> String {
+        entries.first { $0.name == name }.map { String(decoding: $0.data, as: UTF8.self) } ?? ""
+    }
+    let workbookXML = part("xl/workbook.xml")
+    expect(workbookXML.contains("测量汇总"), "工作簿应包含「测量汇总」表名")
+    expect(workbookXML.contains("点坐标"), "工作簿应包含「点坐标」表名")
+    expect(workbookXML.contains("分段明细"), "工作簿应包含「分段明细」表名")
+    expect(workbookXML.contains("说明"), "工作簿应包含「说明」表名")
+
+    let summary = part("xl/worksheets/sheet1.xml")
+    // 表头 + 2 条测量 = 3 行。
+    expect(summary.components(separatedBy: "<row ").count - 1 == 3, "汇总表应有表头加 2 条测量")
+    expect(summary.contains("长度 / 周长(米)"), "汇总表表头包含长度列")
+    expect(summary.contains("半径(米)"), "汇总表表头包含半径列")
+    expect(summary.contains("inlinestr") || summary.contains("inlineStr"), "文本单元格使用内联字符串")
+
+    let vertices = part("xl/worksheets/sheet2.xml")
+    // 表头 + 折线 3 点 + 圆 2 点 = 6 行。
+    expect(vertices.components(separatedBy: "<row ").count - 1 == 6, "点坐标表应有 6 行（含表头）")
+    expect(vertices.contains("圆心") && vertices.contains("半径点"), "点坐标表应标明圆心与半径点")
+    expect(vertices.contains("东坐标(米)"), "点坐标表应包含墨卡托东坐标")
+
+    let segments = part("xl/worksheets/sheet3.xml")
+    // 表头 + 折线 2 段 + 圆 1 段（半径）= 4 行。
+    expect(segments.components(separatedBy: "<row ").count - 1 == 4, "分段表应有 4 行（含表头）")
+    expect(segments.contains("起点") && segments.contains("终点"), "分段表应包含起终点")
+
+    let notes = part("xl/worksheets/sheet4.xml")
+    expect(notes.contains("自检数据集"), "说明页应写入数据集名称")
+    expect(notes.contains("WGS84"), "说明页应写明坐标系")
+} else {
+    expect(false, "xlsx 应是可解析的 ZIP 容器")
+}
+
+// 少量测量也要能导出（空列表不应崩溃）。
+expect(!MeasurementExporter.excel([]).isEmpty, "空测量列表也应产出可打开的工作簿")
+
+// 可选：把样例工作簿写到磁盘，便于用 Excel / Numbers / 脚本复核。
+if let dumpPath = ProcessInfo.processInfo.environment["EUCLID_DUMP_XLSX"] {
+    do {
+        let url = URL(fileURLWithPath: dumpPath)
+        try workbook.write(to: url)
+        print("  · 样例工作簿已写出：\(url.path(percentEncoded: false))")
+    } catch {
+        expect(false, "写出样例工作簿失败：\(error)")
+    }
+}
 
 // MARK: - 真实数据集（可选，传入目录时执行）
 

@@ -50,12 +50,6 @@ public actor TileProvider {
 
     public var dataSource: DirectoryTileSource { source }
 
-    public func cachedImage(for tile: SlippyTile) -> CGImage? {
-        guard let image = cache[tile] else { return nil }
-        touch(tile)
-        return image
-    }
-
     /// 取瓦片图片；不存在时返回 nil。
     public func image(for tile: SlippyTile) async -> CGImage? {
         if let image = cache[tile] {
@@ -85,17 +79,6 @@ public actor TileProvider {
             missingTiles.insert(tile)
         }
         return image
-    }
-
-    public func clearCache() {
-        cache.removeAll()
-        recency.removeAll()
-        cachedBytes = 0
-        missingTiles.removeAll()
-    }
-
-    public func forgetMissing() {
-        missingTiles.removeAll()
     }
 
     // MARK: - 缓存

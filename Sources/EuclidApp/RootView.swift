@@ -95,21 +95,21 @@ struct RootView: View {
             set: { model.measurements.tool = $0 }
         )) {
             ForEach(MapTool.allCases, id: \.self) { tool in
-                Label(tool.title, systemImage: tool.symbolName)
+                Text(tool.title)
                     .tag(tool)
                     .help(tool.help)
             }
         }
         .pickerStyle(.segmented)
         .labelsHidden()
-        .frame(width: 176)
-        .help("工具（⌘1–⌘4，或按 \(MapTool.allCases.map(\.shortcut).joined(separator: " / "))）：浏览、点坐标、测距、测面积")
+        .frame(width: 232)
+        .help("工具（⌘1–⌘5，或按 \(MapTool.allCases.map(\.shortcut).joined(separator: " / "))）：浏览、点坐标、测距、测面积、画圆")
     }
 
     private var exportMenu: some View {
         Menu {
             Section("复制到剪贴板") {
-                ForEach(MeasurementExportFormat.allCases) { format in
+                ForEach(MeasurementExportFormat.textFormats) { format in
                     Button("复制为 \(format.title)") {
                         model.copyMeasurements(as: format)
                     }
@@ -117,7 +117,7 @@ struct RootView: View {
             }
             Section("导出文件") {
                 ForEach(MeasurementExportFormat.allCases) { format in
-                    Button("导出为 \(format.title)…") {
+                    Button(exportTitle(for: format)) {
                         model.exportMeasurements(as: format)
                     }
                 }
@@ -127,6 +127,13 @@ struct RootView: View {
         }
         .help("导出或复制测量结果")
         .disabled(!model.measurements.hasContent)
+    }
+
+    private func exportTitle(for format: MeasurementExportFormat) -> String {
+        switch format {
+        case .excel: return "导出为 Excel 表格 (.xlsx)…"
+        default: return "导出为 \(format.title)…"
+        }
     }
 }
 
@@ -179,20 +186,7 @@ struct MapScreen: View {
     }
 
     private var toolHint: String? {
-        switch model.measurements.tool {
-        case .browse:
-            return nil
-        case .point:
-            return "点击地图取点，坐标显示在检查器中"
-        case .distance:
-            return model.measurements.draft.isEmpty
-                ? "点击开始测距，双击或回车结束"
-                : "继续点击加点 · 双击/回车结束 · ⌫ 撤销 · Esc 取消 · 按住 Shift 约束方向"
-        case .area:
-            return model.measurements.draft.isEmpty
-                ? "点击开始测面积，闭合后双击或回车结束"
-                : "继续点击加点 · 双击/回车闭合 · ⌫ 撤销 · Esc 取消 · 按住 Shift 约束方向"
-        }
+        model.measurements.tool.hint(draftCount: model.measurements.draft.count)
     }
 }
 
@@ -265,7 +259,7 @@ struct EmptyStateView: View {
                 .foregroundStyle(.tint)
             Text("打开本地瓦片")
                 .font(.title2.weight(.semibold))
-            Text("选择包含 `<z>/<x>/<y>` 目录结构的瓦片文件夹，\n支持 WebODM、ODM 等标准 XYZ 输出。")
+            Text("选择包含 `<z>/<x>/<y>` 目录结构的瓦片文件夹，\n支持 WebODM、ODM 等标准 XYZ 输出。\n也可以直接把文件夹拖到这里。")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)

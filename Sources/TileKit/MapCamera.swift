@@ -82,6 +82,28 @@ public struct MapCamera: Sendable, Equatable {
         WebMercator.coordinate(fromNormalized: worldPoint(forViewPoint: point))
     }
 
+    /// 图层坐标（y 向下，与 `isGeometryFlipped` 的子层一致）。
+    ///
+    /// 瓦片层与测量标注层共用这套换算，实现只保留在这里。
+    public func layerPoint(forWorldPoint point: CGPoint) -> CGPoint {
+        let view = viewPoint(forWorldPoint: point)
+        return CGPoint(x: view.x, y: viewportSize.height - view.y)
+    }
+
+    public func layerPoint(for coordinate: GeoCoordinate) -> CGPoint {
+        layerPoint(forWorldPoint: WebMercator.normalized(coordinate))
+    }
+
+    /// 让指定的世界范围（含内边距）完整落入视图。
+    public func fitting(_ worldRect: CGRect, padding: Double = 28) -> MapCamera {
+        MapCamera.fitting(
+            worldRect,
+            viewportSize: viewportSize,
+            padding: padding,
+            tilePixelSize: tilePixelSize
+        )
+    }
+
     /// 当前视图覆盖的世界范围（minY 为北边界）。
     public var visibleWorldRect: CGRect {
         let halfWidth = viewportSize.width / 2 / pixelsPerWorldUnit

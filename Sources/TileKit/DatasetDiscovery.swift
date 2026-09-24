@@ -151,10 +151,21 @@ public enum DatasetLocator {
         }
         guard !levels.isEmpty else { return nil }
 
-        for level in levels.reversed() {
+        // 候选层级：优先取目录数在预算内的最高层；若所有层级都超预算，
+        // 退化成目录数最少的那一层——统计得粗一点，也好过完全给不出范围。
+        let scanned: [(level: Int, columns: [Int])] = levels.reversed().map { level in
+            (level, numericDirectories(in: dataset.rootURL.appending(path: String(level))))
+        }
+        let preferred = scanned.first { !$0.columns.isEmpty && $0.columns.count <= preferredMaxDirectories }
+        let candidates = preferred.map { [$0] }
+            ?? scanned.filter { !$0.columns.isEmpty }
+                .sorted { $0.columns.count < $1.columns.count }
+                .prefix(1)
+
+        for candidate in candidates {
+            let level = candidate.level
+            let columns = candidate.columns
             let levelURL = dataset.rootURL.appending(path: String(level))
-            let columns = numericDirectories(in: levelURL)
-            guard !columns.isEmpty, columns.count <= preferredMaxDirectories else { continue }
 
             var minColumn = Int.max, maxColumn = Int.min
             var minRow = Int.max, maxRow = Int.min

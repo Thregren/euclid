@@ -105,6 +105,94 @@ public enum Geodesy {
         inverse(from: start, to: end).distance
     }
 
+    /// Vincenty 直接公式：从起点沿指定方位角走一段距离后到达的位置。
+    ///
+    /// 用于画圆（按半径反算圆周采样点）与「输入半径」功能。
+    public static func destination(
+        from start: GeoCoordinate,
+        initialBearing: Double,
+        distance: Double
+    ) -> GeoCoordinate {
+        guard distance > 0 else { return start }
+
+        let a = semiMajorAxis
+        let b = a * (1 - flattening)
+        let phi1 = start.latitude * .pi / 180
+        let alpha1 = initialBearing * .pi / 180
+        let sinAlpha1 = sin(alpha1)
+        let cosAlpha1 = cos(alpha1)
+
+        let tanU1 = (1 - flattening) * tan(phi1)
+        let cosU1 = 1 / (1 + tanU1 * tanU1).squareRoot()
+        let sinU1 = tanU1 * cosU1
+        let sigma1 = atan2(tanU1, cosAlpha1)
+        let sinAlpha = cosU1 * sinAlpha1
+        let cosSquaredAlpha = max(0, 1 - sinAlpha * sinAlpha)
+        let uSquared = cosSquaredAlpha * (a * a - b * b) / (b * b)
+
+        let bigA = 1 + uSquared / 16384 * (4096 + uSquared * (-768 + uSquared * (320 - 175 * uSquared)))
+        let bigB = uSquared / 1024 * (256 + uSquared * (-128 + uSquared * (74 - 47 * uSquared)))
+
+        var sigma = distance / (b * bigA)
+        var cos2SigmaM = 0.0
+        var sinSigma = 0.0
+        var cosSigma = 1.0
+        for _ in 0..<200 {
+            cos2SigmaM = cos(2 * sigma1 + sigma)
+            sinSigma = sin(sigma)
+            cosSigma = cos(sigma)
+            let deltaSigma = bigB * sinSigma
+                * (cos2SigmaM + bigB / 4
+                    * (cosSigma * (-1 + 2 * cos2SigmaM * cos2SigmaM)
+                        - bigB / 6 * cos2SigmaM * (-3 + 4 * sinSigma * sinSigma)
+                        * (-3 + 4 * cos2SigmaM * cos2SigmaM)))
+            let previous = sigma
+            sigma = distance / (b * bigA) + deltaSigma
+            if abs(sigma - previous) <= 1e-12 { break }
+        }
+
+        let tmp = sinU1 * sinSigma - cosU1 * cosSigma * cosAlpha1
+        let phi2 = atan2(
+            sinU1 * cosSigma + cosU1 * sinSigma * cosAlpha1,
+            (1 - flattening) * (sinAlpha * sinAlpha + tmp * tmp).squareRoot()
+        )
+        let lambda = atan2(sinSigma * sinAlpha1, cosU1 * cosSigma - sinU1 * sinSigma * cosAlpha1)
+        let c = flattening / 16 * cosSquaredAlpha * (4 + flattening * (4 - 3 * cosSquaredAlpha))
+        let longitudeOffset = lambda - (1 - c) * flattening * sinAlpha
+            * (sigma + c * sinSigma
+                * (cos2SigmaM + c * cosSigma * (-1 + 2 * cos2SigmaM * cos2SigmaM)))
+
+        var longitude = start.longitude + longitudeOffset * 180 / .pi
+        longitude = (longitude + 540).truncatingRemainder(dividingBy: 360) - 180
+        return GeoCoordinate(longitude: longitude, latitude: phi2 * 180 / .pi)
+    }
+
+    /// 测地圆默认的采样点数。
+    public static let circleSampleCount = 360
+
+    /// 以 `center` 为圆心、`radius` 米为半径的测地圆采样点（不含与首点重复的闭合点）。
+    public static func circleRing(
+        center: GeoCoordinate,
+        radius: Double,
+        samples: Int = Geodesy.circleSampleCount
+    ) -> [GeoCoordinate] {
+        guard samples >= 3, radius > 0 else { return [] }
+        return (0..<samples).map { index in
+            let bearing = Double(index) / Double(samples) * 360
+            return destination(from: center, initialBearing: bearing, distance: radius)
+        }
+    }
+
+    /// 闭合环的周长（米）。
+    public static func perimeter(of ring: [GeoCoordinate]) -> Double {
+        guard ring.count >= 2 else { return 0 }
+        var total = 0.0
+        for index in ring.indices {
+            total += distance(from: ring[index], to: ring[(index + 1) % ring.count])
+        }
+        return total
+    }
+
     /// 球面方位角，作为不收敛时的近似。
     private static func bearingOnSphere(from start: GeoCoordinate, to end: GeoCoordinate) -> Double {
         let phi1 = start.latitude * .pi / 180

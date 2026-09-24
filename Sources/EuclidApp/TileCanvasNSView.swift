@@ -42,6 +42,12 @@ final class TileCanvasNSView: NSView {
     private var dragLastPoint: CGPoint?
     private var dragStartPoint: CGPoint?
     private var pendingClickPoint: CGPoint?
+    /// 中键拖动平移的上一帧位置（与左键拖动互不干扰）。
+    private var middleDragLastPoint: CGPoint?
+    /// 当前指针悬停的顶点，用于高亮提示可拖动。
+    private var hoveredVertex: (measurementID: UUID?, index: Int)?
+    /// 已经显示过的瓦片，用于只在首次出现时做淡入。
+    private var shownTiles: Set<SlippyTile> = []
 
     /// 单帧最多渲染的瓦片数量，作为异常情况下的安全阀。
     private let maximumTilesPerFrame = 1200
@@ -51,6 +57,8 @@ final class TileCanvasNSView: NSView {
     private let snapRadius: CGFloat = 12
     /// 点击与拖动位移的区分阈值（点）。
     private let clickTolerance: CGFloat = 4
+    /// 鼠标滚轮每一格滚动量的缩放指数（`exp(step * 该系数)`）。
+    private static let wheelZoomStep = 0.22
 
     var camera = MapCamera(
         center: CGPoint(x: 0.5, y: 0.5),
@@ -176,6 +184,7 @@ final class TileCanvasNSView: NSView {
             provider = nil
             self.dataset = nil
             extentRect = nil
+            measurementStore?.cursorInfo = nil
             onTileStatsChanged?(0, 0)
             syncLayers()
             return
@@ -223,6 +232,12 @@ final class TileCanvasNSView: NSView {
             padding: 28,
             tilePixelSize: Double(dataset.layout.tileSize)
         )
+        syncLayers()
+    }
+
+    /// 缩放到指定的世界范围。
+    func fitToWorldRect(_ rect: CGRect, padding: Double = 56) {
+        camera = camera.fitting(rect, padding: padding).clamped(zoomLevelRange: zoomBounds)
         syncLayers()
     }
 
@@ -305,14 +320,20 @@ final class TileCanvasNSView: NSView {
         }
         let total = columns.count * rows.count
         guard total <= maximumTilesPerFrame else {
+            // 超出安全阀时宁可清空，也不要留着上一帧的残影误导判读。
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            for layer in tileLayers.values { layer.removeFromSuperlayer() }
+            tileLayers.removeAll()
+            CATransaction.commit()
             refreshOverlay()
+            onTileStatsChanged?(0, missingTiles.count)
             reportViewport(visibleTiles: total)
             return
         }
 
         let tileWorldSize = 1.0 / Double(1 << zoom)
         let tileDisplaySize = CGFloat(camera.pixelsPerWorldUnit * tileWorldSize)
-        let viewportHeight = bounds.height
         let scale = window?.backingScaleFactor ?? 2
 
         var needed = Set<SlippyTile>()
@@ -334,11 +355,10 @@ final class TileCanvasNSView: NSView {
         for tile in needed {
             let worldX = Double(tile.x) / Double(1 << zoom)
             let worldY = Double(tile.y) / Double(1 << zoom)
-            let viewX = (worldX - camera.center.x) * camera.pixelsPerWorldUnit + bounds.width / 2
-            let viewTopY = (camera.center.y - worldY) * camera.pixelsPerWorldUnit + bounds.height / 2
+            let origin = camera.layerPoint(forWorldPoint: CGPoint(x: worldX, y: worldY))
             let frame = CGRect(
-                x: viewX,
-                y: viewportHeight - viewTopY,
+                x: origin.x,
+                y: origin.y,
                 width: tileDisplaySize,
                 height: tileDisplaySize
             )
@@ -404,6 +424,19 @@ final class TileCanvasNSView: NSView {
                     layer.contents = image
                     layer.backgroundColor = nil
                     CATransaction.commit()
+
+                    // 首次出现在屏幕上的瓦片淡入，避免成片「跳」出来。
+                    if self.shownTiles.insert(tile).inserted {
+                        let fade = CABasicAnimation(keyPath: "opacity")
+                        fade.fromValue = 0
+                        fade.toValue = 1
+                        fade.duration = 0.18
+                        fade.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                        layer.add(fade, forKey: "fadeIn")
+                        if self.shownTiles.count > 20_000 {
+                            self.shownTiles.removeAll(keepingCapacity: true)
+                        }
+                    }
                 }
                 self.publishTileStats()
             }
@@ -480,20 +513,27 @@ final class TileCanvasNSView: NSView {
             overlay.update(
                 draft: [],
                 draftKind: .distance,
+                draftStyle: .standard,
                 measurements: [],
                 selectedID: nil,
                 liveCoordinate: nil,
+                hoveredVertex: nil,
                 camera: camera,
                 showLabels: false
             )
             return
         }
+        let hoveredCoordinate = hoveredVertex.flatMap {
+            store.vertex(at: $0.index, measurementID: $0.measurementID)
+        }
         overlay.update(
             draft: store.draft,
             draftKind: store.draftKind,
+            draftStyle: store.pendingStyle,
             measurements: store.measurements,
             selectedID: store.selectedID,
             liveCoordinate: store.liveCoordinate,
+            hoveredVertex: hoveredCoordinate,
             camera: camera,
             showLabels: store.showLabels
         )
@@ -507,6 +547,7 @@ final class TileCanvasNSView: NSView {
         dragStartPoint = point
 
         if let hit = hitTestVertex(at: point) {
+            measurementStore?.markUndoPoint()
             dragTarget = .vertex(measurementID: hit.measurementID, index: hit.index)
             dragLastPoint = point
             NSCursor.closedHand.set()
@@ -586,10 +627,48 @@ final class TileCanvasNSView: NSView {
         }
     }
 
+    // MARK: - 中键平移
+
+    /// 鼠标中键：按住拖动即可平移，任何工具下都可用。
+    override func otherMouseDown(with event: NSEvent) {
+        guard event.buttonNumber == 2 else {
+            super.otherMouseDown(with: event)
+            return
+        }
+        window?.makeFirstResponder(self)
+        middleDragLastPoint = convert(event.locationInWindow, from: nil)
+        NSCursor.closedHand.set()
+    }
+
+    override func otherMouseDragged(with event: NSEvent) {
+        guard event.buttonNumber == 2, let last = middleDragLastPoint else {
+            super.otherMouseDragged(with: event)
+            return
+        }
+        let point = convert(event.locationInWindow, from: nil)
+        let delta = CGPoint(x: point.x - last.x, y: point.y - last.y)
+        camera = camera.translated(byViewDelta: delta).clamped(zoomLevelRange: zoomBounds)
+        middleDragLastPoint = point
+        updateLiveCoordinate(point)
+        reportCursor(point)
+        syncLayers()
+    }
+
+    override func otherMouseUp(with event: NSEvent) {
+        guard event.buttonNumber == 2 else {
+            super.otherMouseUp(with: event)
+            return
+        }
+        middleDragLastPoint = nil
+        (tool == .browse ? NSCursor.openHand : NSCursor.crosshair).set()
+        window?.invalidateCursorRects(for: self)
+    }
+
     override func mouseMoved(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         updateLiveCoordinate(point)
         reportCursor(point)
+        updateHover(at: point)
         if tool != .browse, measurementStore?.draft.isEmpty == false {
             refreshOverlay()
         }
@@ -598,12 +677,22 @@ final class TileCanvasNSView: NSView {
     override func mouseExited(with event: NSEvent) {
         measurementStore?.cursorInfo = nil
         measurementStore?.liveCoordinate = nil
+        hoveredVertex = nil
         refreshOverlay()
     }
 
     private func updateLiveCoordinate(_ point: CGPoint) {
         guard let store = measurementStore, tool != .browse, !store.draft.isEmpty else { return }
         store.liveCoordinate = camera.coordinate(forViewPoint: point)
+    }
+
+    /// 指针悬停到顶点时高亮，提示这里可以拖动。
+    private func updateHover(at point: CGPoint) {
+        let hit = hitTestVertex(at: point)
+        let changed = hit?.measurementID != hoveredVertex?.measurementID || hit?.index != hoveredVertex?.index
+        guard changed else { return }
+        hoveredVertex = hit
+        refreshOverlay()
     }
 
     private func reportCursor(_ point: CGPoint) {
@@ -673,15 +762,21 @@ final class TileCanvasNSView: NSView {
         camera.viewPoint(forWorldPoint: WebMercator.normalized(coordinate))
     }
 
+    /// 鼠标滚轮缩放，触摸板双指滚动平移。
+    ///
+    /// - 普通鼠标滚轮（`hasPreciseScrollingDeltas == false`）：每个滚动量按指数缩放，锚点跟随指针；
+    /// - 触摸板双指滚动：平移，按住 ⌘ 时改为缩放；
+    /// - 触摸板捏合走 `magnify(with:)`，双击走 `smartMagnify(with:)`。
     override func scrollWheel(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         let precise = event.hasPreciseScrollingDeltas
         let wantsZoom = !precise || event.modifierFlags.contains(.command)
 
         if wantsZoom {
-            let delta = precise ? event.scrollingDeltaY / 20 : event.scrollingDeltaY / 4
-            guard abs(delta) > 0.0001 else { return }
-            camera = camera.zoomed(by: Foundation.exp(delta), anchorViewPoint: point).clamped(zoomLevelRange: zoomBounds)
+            let steps = precise ? event.scrollingDeltaY / 20 : event.scrollingDeltaY
+            guard abs(steps) > 0.0001 else { return }
+            let factor = Foundation.exp(steps * Self.wheelZoomStep)
+            camera = camera.zoomed(by: factor, anchorViewPoint: point).clamped(zoomLevelRange: zoomBounds)
         } else {
             let delta = CGPoint(x: event.scrollingDeltaX, y: -event.scrollingDeltaY)
             camera = camera.translated(byViewDelta: delta).clamped(zoomLevelRange: zoomBounds)
@@ -738,6 +833,9 @@ final class TileCanvasNSView: NSView {
             window?.invalidateCursorRects(for: self)
         case "a":
             measurementStore?.tool = .area
+            window?.invalidateCursorRects(for: self)
+        case "o":
+            measurementStore?.tool = .circle
             window?.invalidateCursorRects(for: self)
         case "+", "=":
             zoomIn()

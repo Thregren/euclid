@@ -52,6 +52,12 @@ struct Euclid: App {
             }
             .keyboardShortcut("o", modifiers: .command)
         }
+        CommandGroup(replacing: .undoRedo) {
+            Button("撤销") { model.performUndo() }
+                .keyboardShortcut("z", modifiers: .command)
+            Button("重做") { model.performRedo() }
+                .keyboardShortcut("z", modifiers: [.command, .shift])
+        }
         CommandGroup(after: .toolbar) {
             Toggle(isOn: Bindable(model).showInspector) {
                 Text("显示检查器")
@@ -82,17 +88,37 @@ struct Euclid: App {
                 .keyboardShortcut("3", modifiers: .command)
             Button("测面积") { model.measurements.tool = .area }
                 .keyboardShortcut("4", modifiers: .command)
+            Button("画圆") { model.measurements.tool = .circle }
+                .keyboardShortcut("5", modifiers: .command)
             Divider()
             Button("结束当前测量") {
                 model.measurements.finishDraft()
                 model.canvas.refreshOverlay()
             }
             .keyboardShortcut(.return, modifiers: [.command])
-            .disabled(model.measurements.draft.count < 2)
+            .disabled(model.measurements.draft.count < (model.measurements.draftKind == .area ? 3 : 2))
             Button("清除全部测量") {
                 model.clearMeasurements()
             }
             .keyboardShortcut("k", modifiers: [.command, .shift])
+            .disabled(!model.measurements.hasContent)
+            Divider()
+            Menu("导出测量结果") {
+                Section("复制到剪贴板") {
+                    ForEach(MeasurementExportFormat.textFormats) { format in
+                        Button("复制为 \(format.title)") {
+                            model.copyMeasurements(as: format)
+                        }
+                    }
+                }
+                Section("导出文件") {
+                    ForEach(MeasurementExportFormat.allCases) { format in
+                        Button("导出为 \(format.title)…") {
+                            model.exportMeasurements(as: format)
+                        }
+                    }
+                }
+            }
             .disabled(!model.measurements.hasContent)
         }
     }

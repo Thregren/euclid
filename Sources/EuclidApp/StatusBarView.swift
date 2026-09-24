@@ -43,6 +43,14 @@ struct StatusBarView: View {
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
 
+                if !model.measurements.measurements.isEmpty {
+                    Divider().frame(height: 12)
+                    Text("\(model.measurements.measurements.count) 条测量")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+
                 if let statusMessage = model.statusMessage {
                     Divider().frame(height: 12)
                     Text(statusMessage)

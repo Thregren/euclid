@@ -72,6 +72,7 @@ final class CanvasController {
         view?.showTileGrid = isVisible
     }
 
+    func fit(to worldRect: CGRect) { view?.fitToWorldRect(worldRect) }
     func refreshOverlay() { view?.refreshOverlay() }
     func goTo(_ coordinate: GeoCoordinate) { view?.goTo(coordinate) }
     func fit() { view?.fitToData() }
@@ -110,12 +111,19 @@ final class AppModel {
 
     /// 扫描代号，用于丢弃过期的扫描结果。
     private var scanGeneration = 0
+    /// 状态栏提示的自动清除任务。
+    private var statusClearTask: Task<Void, Never>?
+    /// 存档写入的防抖任务。
+    private var archiveTask: Task<Void, Never>?
 
     /// 启动时待打开的数据集目录。真正的扫描延后到窗口出现之后，避免在 App 初始化阶段触发状态变化。
     private var initialURL: URL?
 
     init() {
         canvas.bind(measurements: measurements)
+        measurements.onChange = { [weak self] in
+            self?.scheduleArchiveSave()
+        }
         recentFolders = Self.loadRecentFolders()
         if let saved = UserDefaults.standard.string(forKey: "lastRootFolder"),
            FileManager.default.fileExists(atPath: saved) {
@@ -128,6 +136,78 @@ final class AppModel {
         return paths
             .filter { FileManager.default.fileExists(atPath: $0) }
             .map { URL(fileURLWithPath: $0) }
+    }
+
+    // MARK: - 状态栏提示
+
+    /// 设置状态栏提示；默认几秒后自动清除，避免旧消息一直挂着。
+    func setStatus(_ message: String?, autoClearAfter seconds: Double = 4) {
+        statusMessage = message
+        statusClearTask?.cancel()
+        guard let message, !message.isEmpty, seconds > 0 else { return }
+        statusClearTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(seconds))
+            guard !Task.isCancelled else { return }
+            self?.statusMessage = nil
+        }
+    }
+
+    // MARK: - 测量存档
+
+    private func scheduleArchiveSave() {
+        guard let dataset = selectedDataset else { return }
+        let path = dataset.rootURL.path(percentEncoded: false)
+        let snapshot = measurements.measurements
+        archiveTask?.cancel()
+        archiveTask = Task {
+            try? await Task.sleep(for: .seconds(0.8))
+            guard !Task.isCancelled else { return }
+            MeasurementArchive.save(snapshot, for: path)
+        }
+    }
+
+    /// 撤销 / 重做测量操作。
+    func undoMeasurement() {
+        measurements.undo()
+        canvas.refreshOverlay()
+    }
+
+    func redoMeasurement() {
+        measurements.redo()
+        canvas.refreshOverlay()
+    }
+
+    /// 菜单里的撤销：文本输入框获得焦点时交给系统撤销，否则撤销测量操作。
+    func performUndo() {
+        if let responder = NSApp.keyWindow?.firstResponder, responder is NSTextView,
+           responder.tryToPerform(Selector(("undo:")), with: nil) {
+            return
+        }
+        guard measurements.canUndo else {
+            NSSound.beep()
+            return
+        }
+        undoMeasurement()
+        setStatus(nil)
+    }
+
+    func performRedo() {
+        if let responder = NSApp.keyWindow?.firstResponder, responder is NSTextView,
+           responder.tryToPerform(Selector(("redo:")), with: nil) {
+            return
+        }
+        guard measurements.canRedo else {
+            NSSound.beep()
+            return
+        }
+        redoMeasurement()
+        setStatus(nil)
+    }
+
+    /// 把视野缩放并居中到某条测量。
+    func zoomToMeasurement(_ measurement: GeoMeasurement) {
+        guard let rect = measurement.worldRect else { return }
+        canvas.fit(to: rect)
     }
 
     /// 打开启动时记录的数据集（由界面在首个窗口出现后调用）。
@@ -159,7 +239,7 @@ final class AppModel {
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: url.path(percentEncoded: false), isDirectory: &isDirectory),
               isDirectory.boolValue else {
-            statusMessage = "请选择文件夹，而不是文件"
+            setStatus("请选择文件夹，而不是文件")
             return
         }
         rootFolder = url
@@ -179,7 +259,7 @@ final class AppModel {
         let generation = scanGeneration
         AppModel.trace("scan start \(url.path(percentEncoded: false))")
         isScanning = true
-        statusMessage = nil
+        setStatus(nil)
         Task {
             let found = await Task.detached(priority: .userInitiated) {
                 DatasetLocator.discover(at: url)
@@ -189,7 +269,7 @@ final class AppModel {
             isScanning = false
             datasets = found
             if found.isEmpty {
-                statusMessage = "在 \(url.lastPathComponent) 中没有找到形如 <z>/<x>/<y> 的瓦片目录"
+                setStatus("在 \(url.lastPathComponent) 中没有找到形如 <z>/<x>/<y> 的瓦片目录", autoClearAfter: 0)
                 selectDataset(nil)
             } else {
                 selectDataset(found[0].id)
@@ -207,6 +287,8 @@ final class AppModel {
             return
         }
         canvas.set(dataset: dataset, extent: nil)
+        measurements.restore(MeasurementArchive.measurements(for: dataset.rootURL.path(percentEncoded: false)))
+        canvas.refreshOverlay()
         Task {
             let result = await Task.detached(priority: .userInitiated) {
                 DatasetLocator.extent(of: dataset)
@@ -233,6 +315,7 @@ enum MeasurementExportFormat: String, CaseIterable, Identifiable {
     case geoJSON
     case kml
     case csv
+    case excel
 
     var id: String { rawValue }
 
@@ -241,6 +324,7 @@ enum MeasurementExportFormat: String, CaseIterable, Identifiable {
         case .geoJSON: return "GeoJSON"
         case .kml: return "KML"
         case .csv: return "CSV"
+        case .excel: return "Excel"
         }
     }
 
@@ -249,7 +333,16 @@ enum MeasurementExportFormat: String, CaseIterable, Identifiable {
         case .geoJSON: return "geojson"
         case .kml: return "kml"
         case .csv: return "csv"
+        case .excel: return "xlsx"
         }
+    }
+
+    /// Excel 是二进制格式，不能直接复制成文本。
+    var isText: Bool { self != .excel }
+
+    /// 可以复制到剪贴板的格式。
+    static var textFormats: [MeasurementExportFormat] {
+        allCases.filter(\.isText)
     }
 
     func render(_ measurements: [GeoMeasurement]) -> String {
@@ -257,6 +350,17 @@ enum MeasurementExportFormat: String, CaseIterable, Identifiable {
         case .geoJSON: return MeasurementExporter.geoJSON(measurements)
         case .kml: return MeasurementExporter.kml(measurements)
         case .csv: return MeasurementExporter.csv(measurements)
+        case .excel: return ""
+        }
+    }
+
+    /// 导出用的字节内容。
+    func data(_ measurements: [GeoMeasurement], datasetName: String? = nil) -> Data {
+        switch self {
+        case .excel:
+            return MeasurementExporter.excel(measurements, datasetName: datasetName)
+        default:
+            return Data(render(measurements).utf8)
         }
     }
 }
@@ -264,11 +368,11 @@ enum MeasurementExportFormat: String, CaseIterable, Identifiable {
 extension AppModel {
     /// 复制全部测量结果到剪贴板。
     func copyMeasurements(as format: MeasurementExportFormat = .geoJSON) {
-        guard !measurements.measurements.isEmpty else { return }
+        guard !measurements.measurements.isEmpty, format.isText else { return }
         let text = format.render(measurements.measurements)
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
-        statusMessage = "已复制 \(measurements.measurements.count) 条测量结果（\(format.title)）"
+        setStatus("已复制 \(measurements.measurements.count) 条测量结果（\(format.title)）")
     }
 
     /// 导出测量结果到文件。
@@ -281,10 +385,11 @@ extension AppModel {
         panel.message = "导出 \(measurements.measurements.count) 条测量结果"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do {
-            try format.render(measurements.measurements).write(to: url, atomically: true, encoding: .utf8)
-            statusMessage = "已导出到 \(url.lastPathComponent)"
+            let payload = format.data(measurements.measurements, datasetName: selectedDataset?.name)
+            try payload.write(to: url, options: .atomic)
+            setStatus("已导出 \(measurements.measurements.count) 条测量结果到 \(url.lastPathComponent)")
         } catch {
-            statusMessage = "导出失败：\(error.localizedDescription)"
+            setStatus("导出失败：\(error.localizedDescription)", autoClearAfter: 8)
         }
     }
 
@@ -292,7 +397,7 @@ extension AppModel {
     func copyToClipboard(_ text: String, message: String? = nil) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
-        if let message { statusMessage = message }
+        if let message { setStatus(message) }
     }
 
     func goToCoordinate(longitude: Double, latitude: Double) {
