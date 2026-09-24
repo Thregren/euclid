@@ -24,6 +24,12 @@ macOS 原生本地瓦片查看器，为 **WebODM / ODM 输出的正射影像 XYZ
 
 ## 快速开始
 
+不想编译就直接下 [Releases](https://github.com/Thregren/euclid/releases/latest) 里的
+`Euclid-<版本>-macos-arm64.zip`（Apple Silicon，macOS 14+），解压后把「尺规.app」拖进「应用程序」；
+发布包是 ad-hoc 签名、未做公证，首次打开需要右键「打开」。
+
+从源码构建：
+
 ```bash
 git clone https://github.com/Thregren/euclid.git
 cd euclid
