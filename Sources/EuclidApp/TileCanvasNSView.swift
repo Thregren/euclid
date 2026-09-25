@@ -167,12 +167,15 @@ final class TileCanvasNSView: NSView {
     /// 本地影像层（上层）。传 nil 表示关掉这一层。
     func setLocal(dataset: TileDataset?, extent: DatasetExtent?) {
         guard let dataset else {
+            let previousScale = camera.groundMetersPerPoint
+            let hadContent = localStack.isActive || onlineStack.isActive
             self.dataset = nil
             localStack.clear()
             awaitingExtent = false
             extentRect = nil
             defaultFitRect = nil
             refreshCamera(fitRect: nil, defaultZoomLevel: nil)
+            restoreGroundScale(previousScale, when: hadContent)
             updateAccessibilityLabel()
             syncLayers()
             return
@@ -225,9 +228,14 @@ final class TileCanvasNSView: NSView {
     /// 在线底图层（下层）。传 nil 表示关掉这一层。
     func setOnline(basemap: OnlineBasemap?, fitRect: CGRect?) {
         onlineFitRect = fitRect
+        // 开关底图 / 换源之前，先记下当前的地面比例：重配会改动相机里的瓦片边长，
+        // 直接沿用 zoomLevel 会让画面跳一下（那就是「开关底图把视图重置了」）。
+        let hadContent = onlineStack.isActive || localStack.isActive
+        let previousScale = camera.groundMetersPerPoint
         guard let basemap, basemap.isValid else {
             onlineStack.clear()
             refreshCamera(fitRect: nil, defaultZoomLevel: nil)
+            restoreGroundScale(previousScale, when: hadContent)
             updateAccessibilityLabel()
             syncLayers()
             return
@@ -244,10 +252,21 @@ final class TileCanvasNSView: NSView {
             maxConcurrentRequests: 24
         )
         updateAccessibilityLabel()
-        // 已经有本地数据时不打断当前视图；只有在线底图时按它的范围适配一次。
-        refreshCamera(fitRect: localStack.isActive ? nil : (fitRect ?? Self.worldRect),
-                      defaultZoomLevel: 2)
+        if hadContent {
+            // 已经有东西在看：保持当前视野，只是把这一层挂上/换掉。
+            refreshCamera(fitRect: nil, defaultZoomLevel: nil)
+            restoreGroundScale(previousScale, when: true)
+        } else {
+            // 第一次打开在线底图：给一个完整的世界视图（世界范围的中心是 0°,0°）。
+            refreshCamera(fitRect: fitRect ?? Self.worldRect, defaultZoomLevel: 2)
+        }
         syncLayers()
+    }
+
+    /// 重配图层之后把地面比例套回去（`condition` 为假时不动，让首次适配生效）。
+    private func restoreGroundScale(_ scale: Double, when condition: Bool) {
+        guard condition, scale > 0, scale.isFinite else { return }
+        camera = camera.settingGroundMetersPerPoint(scale).clamped(zoomLevelRange: zoomBounds)
     }
 
     /// 两层的不透明度：把上层影像淡下去就能看到下层的路网做对照。

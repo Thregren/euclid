@@ -169,6 +169,10 @@ final class AppModel {
     let tileExport = TileExportModel()
     /// 生成面板是否展开。
     var showTileExportSheet = false
+    /// 「本地瓦片服务」面板的状态。
+    let tileServer = TileServerModel()
+    /// 本地瓦片服务面板是否展开。
+    var showTileServerSheet = false
 
     /// 当前在线底图；用本地数据时为 nil。
     var onlineBasemap: OnlineBasemap? {

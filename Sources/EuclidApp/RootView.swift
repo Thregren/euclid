@@ -28,6 +28,10 @@ struct RootView: View {
             TileExportSheet()
                 .environment(model)
         }
+        .sheet(isPresented: $model.showTileServerSheet) {
+            TileServerSheet()
+                .environment(model)
+        }
         .task {
             model.activateInitialDataset()
             DebugDownloadScript.runIfRequested(model: model)
@@ -35,6 +39,7 @@ struct RootView: View {
             DebugExportScript.runIfRequested(model: model)
             DebugTileExportScript.runIfRequested(model: model)
             DebugVerifyScript.runIfRequested(model: model)
+            DebugTileServerScript.runIfRequested(model: model)
         }
     }
 
@@ -104,6 +109,7 @@ struct RootView: View {
             Divider()
             Button("下载在线瓦片…") { model.showDownloadSheet = true }
             Button("从影像生成瓦片…") { model.showTileExportSheet = true }
+            Button("本地瓦片服务…") { model.showTileServerSheet = true }
         } label: {
             Label("底图", systemImage: model.onlineBasemap == nil ? "square.stack.3d.up" : "globe")
         }

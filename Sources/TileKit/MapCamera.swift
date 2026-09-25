@@ -217,4 +217,17 @@ public struct MapCamera: Sendable, Equatable {
         camera.pixelsPerWorldUnit = pow(2, zoom) * tilePixelSize / displayScale
         return camera
     }
+
+    /// 按「一个视图点对应多少米」设置比例。
+    ///
+    /// 切换图层时用：不同来源的瓦片边长不同，同样的 `zoomLevel` 会对应不同的地面比例，
+    /// 直接沿用层级会让画面跳一下；按地面比例套回去，用户看到的范围就不变。
+    public func settingGroundMetersPerPoint(_ metersPerPoint: Double) -> MapCamera {
+        guard metersPerPoint > 0, metersPerPoint.isFinite else { return self }
+        let latitude = WebMercator.latitude(normalizedY: center.y)
+        let ground = WebMercator.groundMetersPerWorldUnit(latitude: latitude)
+        var camera = self
+        camera.pixelsPerWorldUnit = ground / metersPerPoint
+        return camera
+    }
 }

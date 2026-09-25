@@ -28,6 +28,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         true
     }
+
+    /// 关掉最后一个窗口就退出：不留菜单栏与后台进程（关窗后点菜单栏什么都出不来，那种状态最费解）。
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        true
+    }
 }
 
 @main
@@ -67,6 +72,11 @@ struct Euclid: App {
             }
             .keyboardShortcut("t", modifiers: [.command, .shift])
             .help("把 GeoTIFF / TIFF 切成各级瓦片，生成后可直接浏览")
+            Button("本地瓦片服务…") {
+                model.showTileServerSheet = true
+            }
+            .keyboardShortcut("l", modifiers: [.command, .shift])
+            .help("把本地瓦片用 HTTP 提供给别的工具（例如 OSM 在线编辑器）")
             Divider()
             Button("快速导出当前视图（含标注）") {
                 model.quickExportView()

@@ -327,6 +327,52 @@ enum DebugVerifyScript {
             // 3) 快速导出（不弹面板，直接落到快捷导出目录）
             model.quickExportView()
             log("快速导出：状态=「\(model.statusMessage ?? "无")」")
+
+            // 4) 开关在线底图不应改变视野（按地面比例与中心对比）
+            @MainActor func reading() -> String {
+                let center = model.viewport.center
+                return String(format: "中心 %.5f,%.5f  地面比例 %.4f 米/点",
+                              center.longitude, center.latitude, model.viewport.metersPerPoint)
+            }
+            let viewBefore = reading()
+            model.usesOnlineBasemap = true
+            try? await Task.sleep(for: .seconds(3))
+            let viewWithBasemap = reading()
+            model.usesOnlineBasemap = false
+            try? await Task.sleep(for: .seconds(3))
+            let viewAfter = reading()
+            log("开关底图：开之前 \(viewBefore)")
+            log("开关底图：开着时 \(viewWithBasemap)")
+            log("开关底图：关掉后 \(viewAfter)")
+
+            // 5) 关窗是否退出（设置了 EUCLID_DEBUG_VERIFY_CLOSE 时）
+            if ProcessInfo.processInfo.environment["EUCLID_DEBUG_VERIFY_CLOSE"] != nil {
+                log("即将关闭主窗口，若程序正常退出则不会再看到后续日志")
+                NSApplication.shared.windows.first(where: { $0.isVisible })?.close()
+                try? await Task.sleep(for: .seconds(3))
+                log("关闭窗口后程序仍在运行（这条不该出现）")
+            }
+        }
+    }
+}
+
+/// 开发调试用的本地瓦片服务脚本。
+///
+/// `EUCLID_DEBUG_TILE_SERVER=<端口>` 时启动后把当前数据集做成 HTTP 服务，便于无人值守核对。
+@MainActor
+enum DebugTileServerScript {
+    static func runIfRequested(model: AppModel) {
+        guard let raw = ProcessInfo.processInfo.environment["EUCLID_DEBUG_TILE_SERVER"],
+              let port = Int(raw) else { return }
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(9))
+            let server = model.tileServer
+            server.prepare(source: model.selectedDataset?.rootURL)
+            server.port = port
+            server.start()
+            FileHandle.standardError.write(Data(
+                "[server] 运行=\(server.isRunning) 端口=\(server.actualPort) 模板=\(server.urlTemplate)\n".utf8
+            ))
         }
     }
 }
