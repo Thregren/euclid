@@ -21,6 +21,7 @@
 ./Fixtures/TIFF/make-fixtures.sh      # 需要 magick（ImageMagick）与 python3
 ```
 
-`geo_utm50_deflate.tif` 的定位点与像素尺度取自一份真实的 ODM 正射影像
-（`odm_orthophoto.tif`，UTM 50N，5 cm/像素），脚本里把这两个值与 GeoKey
-（EPSG:32650）一起注入 IFD，因此自检里可以用 PROJ 算出的四角坐标当基准。
+`geo_utm50_deflate.tif` 的定位点取 **UTM 50N 中央经线上的整数格点**
+（东坐标 500000、北坐标 3000000、5 cm/像素），刻意与任何真实测区无关；
+脚本把定位点、像素尺度与 GeoKey（EPSG:32650）一起注入 IFD，
+自检里用 PROJ 算出的四角坐标当基准。

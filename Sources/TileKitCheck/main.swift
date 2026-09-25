@@ -1489,14 +1489,15 @@ do {
     expect(utm50 != nil, "应认出 EPSG:32650")
     if let utm50 {
         // echo "500000 3000000" | cs2cs -f "%.10f" +proj=utm +zone=50 +datum=WGS84 +to +proj=longlat +datum=WGS84
-        let corner = Projection.toWGS84(x: 500000, y: 3000000, crs: .transverseMercator(utm50))
+        // → 117.0000000000  27.1224696416
+        let corner = Projection.toWGS84(x: 500_000, y: 3_000_000, crs: .transverseMercator(utm50))
         expectClose(corner?.longitude ?? .nan, 117.0000000000, accuracy: 1e-8, "UTM 50N 反算经度")
         expectClose(corner?.latitude ?? .nan, 27.1224696416, accuracy: 1e-8, "UTM 50N 反算纬度")
         // 正算回去
         if let corner {
             let back = Projection.fromWGS84(corner, crs: .transverseMercator(utm50))
-            expectClose(back.map { Double($0.x) } ?? .nan, 500000, accuracy: 0.005, "UTM 50N 正算东坐标（毫米级）")
-            expectClose(back.map { Double($0.y) } ?? .nan, 3000000, accuracy: 0.005, "UTM 50N 正算北坐标（毫米级）")
+            expectClose(back.map { Double($0.x) } ?? .nan, 500_000, accuracy: 0.005, "UTM 50N 正算东坐标（毫米级）")
+            expectClose(back.map { Double($0.y) } ?? .nan, 3_000_000, accuracy: 0.005, "UTM 50N 正算北坐标（毫米级）")
         }
     }
 
