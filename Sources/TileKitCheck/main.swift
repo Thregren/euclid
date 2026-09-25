@@ -552,7 +552,18 @@ if let dumpPath = ProcessInfo.processInfo.environment["EUCLID_DUMP_XLSX"] {
 // MARK: - 真实数据集（可选，传入目录时执行）
 
 if CommandLine.arguments.count > 1 {
-    let root = URL(fileURLWithPath: CommandLine.arguments[1])
+    let target = URL(fileURLWithPath: CommandLine.arguments[1])
+    var isDirectory: ObjCBool = false
+    FileManager.default.fileExists(atPath: target.path(percentEncoded: false), isDirectory: &isDirectory)
+    if !isDirectory.boolValue {
+        await rasterCheck(url: target)
+    } else {
+        datasetCheck(root: target)
+    }
+}
+
+@MainActor
+func datasetCheck(root: URL) {
     section("数据集嗅探：\(root.path(percentEncoded: false))")
     let discovered = DatasetLocator.discover(at: root)
     print("  找到 \(discovered.count) 个数据集")
@@ -586,6 +597,138 @@ if CommandLine.arguments.count > 1 {
         expect(source.fileCandidates(for: mid).count == dataset.layout.fileExtensions.count, "\(dataset.name) 生成候选路径")
     }
     expect(discovered.count >= 1, "应在测试目录中找到至少 1 个数据集")
+}
+
+/// 单幅影像体检：`./Scripts/run-checks.sh /path/to/orthophoto.tif`
+///
+/// 打印尺寸、坐标基准、地面分辨率与覆盖范围，再按窗口首屏的样子取几块图，
+/// 并统计首屏耗时（大图没有内建概览时这一步会明显变慢，正好量出来）。
+/// `EUCLID_RASTER_DUMP=<目录>` 时把解出来的瓦片写成 PNG，便于目视核对。
+@MainActor
+func rasterCheck(url: URL) async {
+    section("单幅影像：\(url.lastPathComponent)")
+    guard let dataset = try? RasterLoader.load(url: url) else {
+        expect(false, "应能读出单幅影像（\(url.lastPathComponent)）")
+        return
+    }
+    print("  尺寸 \(dataset.pixelSizeText)　体积 \(dataset.fileSizeText)　\(dataset.compression)　\(dataset.bitsPerSample) 位"
+        + (dataset.hasAlpha ? "　含 alpha" : ""))
+    print("  坐标基准 \(dataset.crsName)" + (dataset.hasOverviews ? "　内建概览：有" : "　内建概览：无"))
+    if let gsd = dataset.groundSampleDistance {
+        print(String(format: "  地面分辨率 %.3f 米/像素", gsd))
+    }
+    let rect = dataset.worldRect
+    let northWest = WebMercator.coordinate(fromNormalized: CGPoint(x: rect.minX, y: rect.minY))
+    let southEast = WebMercator.coordinate(fromNormalized: CGPoint(x: rect.maxX, y: rect.maxY))
+    print(String(
+        format: "  范围 lon %.7f…%.7f　lat %.7f…%.7f",
+        northWest.longitude, southEast.longitude, southEast.latitude, northWest.latitude
+    ))
+    print(String(format: "  原始比例 z%.2f　虚拟层级 z0–z%d", dataset.maximumDataZoom, dataset.zoomRange.upperBound))
+
+    expect(dataset.pixelWidth > 0 && dataset.pixelHeight > 0, "应读出像素尺寸")
+    expect(dataset.isGeoreferenced, "应认出地理参考（否则按未配准打开）")
+    expect(rect.width > 0 && rect.height > 0, "覆盖范围不应退化")
+    expect(northWest.longitude >= -180 && northWest.longitude <= 180, "经度应在合法范围内")
+    expect(northWest.latitude >= -90 && northWest.latitude <= 90, "纬度应在合法范围内")
+    if let gsd = dataset.groundSampleDistance {
+        expect(gsd > 0.0001 && gsd < 1000, "地面分辨率应在合理范围（实际 \(gsd) 米/像素）")
+    }
+
+    let source = dataset.source
+    let dumpDirectory = ProcessInfo.processInfo.environment["EUCLID_RASTER_DUMP"]
+    if let dumpDirectory { try? FileManager.default.createDirectory(atPath: dumpDirectory, withIntermediateDirectories: true) }
+
+    func dump(_ image: CGImage?, _ name: String) {
+        guard let dumpDirectory, let image else { return }
+        let url = URL(fileURLWithPath: dumpDirectory).appending(path: name)
+        guard let destination = CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil) else { return }
+        CGImageDestinationAddImage(destination, image, nil)
+        CGImageDestinationFinalize(destination)
+    }
+
+    // 1) 「原始比例」那一级：看细节与清晰度。
+    let detailZoom = min(30, max(0, Int(ceil(dataset.maximumDataZoom))))
+    let count = Double(1 << detailZoom)
+    let centerTile = SlippyTile(
+        zoom: detailZoom,
+        x: min(max(Int(rect.midX * count), 0), (1 << detailZoom) - 1),
+        y: min(max(Int(rect.midY * count), 0), (1 << detailZoom) - 1)
+    )
+    var start = Date()
+    let detail = await source.image(for: centerTile)
+    let detailMilliseconds = Date().timeIntervalSince(start) * 1000
+    expect(detail != nil, "原始比例附近应能取到图（z\(detailZoom)）")
+    print(String(format: "  原始比例取图 z%d/%d/%d：%.0f ms%@",
+                 detailZoom, centerTile.x, centerTile.y, detailMilliseconds,
+                 detail.map { "（\($0.width)×\($0.height)）" } ?? "（失败）"))
+    dump(detail, "detail.png")
+
+    // 整幅概览：走的是「缩放时挑低分辨率级」那条路，用 alpha 均值与直方图核对是否丢内容。
+    start = Date()
+    let overview = dataset.renderOverview(maxPixelSize: 1024)
+    let overviewMilliseconds = Date().timeIntervalSince(start) * 1000
+    expect(overview != nil, "应能渲染整幅概览")
+    if let overview, let pixels = rgbaBytes(of: overview) {
+        var alphaSum = 0
+        for index in stride(from: 3, to: pixels.count, by: 4) { alphaSum += Int(pixels[index]) }
+        let meanAlpha = Double(alphaSum) / Double(pixels.count / 4) / 255
+        print(String(format: "  整幅概览 %d×%d：%.0f ms，平均 alpha %.4f",
+                     overview.width, overview.height, overviewMilliseconds, meanAlpha))
+        expect(meanAlpha > 0.55 && meanAlpha < 0.75,
+               "整幅概览的平均 alpha 应与数据一致（约 0.63，实际 \(meanAlpha)）")
+    }
+    dump(overview, "overview.png")
+    // 再渲染一份 2048 宽的：它会挑到与「深缩放时的瓦片」同一级概览（3751 那一级），
+    // 用来区分「数据本身的空洞」与「取图路径丢内容」。
+    let coarse = dataset.renderOverview(maxPixelSize: 2048)
+    dump(coarse, "overview-2048.png")
+
+    // 深缩放时的单块瓦片：与上面那份概览用的是同一级数据，
+    // 因此它必须同样密实（中心区域本来就是不透明的）。
+    let tileZoom = max(0, Int(dataset.maximumDataZoom.rounded(.down)) - 1)
+    let tileCount = Double(1 << tileZoom)
+    let sourceTile = SlippyTile(
+        zoom: tileZoom,
+        x: min(max(Int(rect.midX * tileCount), 0), (1 << tileZoom) - 1),
+        y: min(max(Int(rect.midY * tileCount), 0), (1 << tileZoom) - 1)
+    )
+    start = Date()
+    let tileImage = await source.image(for: sourceTile)
+    let tileMilliseconds = Date().timeIntervalSince(start) * 1000
+    if let tileImage, let pixels = rgbaBytes(of: tileImage) {
+        var alphaSum = 0
+        for index in stride(from: 3, to: pixels.count, by: 4) { alphaSum += Int(pixels[index]) }
+        let meanAlpha = Double(alphaSum) / Double(pixels.count / 4) / 255
+        print(String(format: "  深缩放瓦片 z%d/%d/%d：%.0f ms，平均 alpha %.4f",
+                     tileZoom, sourceTile.x, sourceTile.y, tileMilliseconds, meanAlpha))
+        expect(meanAlpha > 0.9, "深缩放瓦片应密实（中心区域不透明，实际平均 alpha \(meanAlpha)）")
+    } else {
+        expect(false, "深缩放瓦片应能取到图（z\(tileZoom)）")
+    }
+    dump(tileImage, "tile-deep.png")
+
+    // 2) 首屏：按「适配窗口」的层级，数一数要几块、总共多久。
+    let viewport = CGSize(width: 808, height: 808)
+    let fitZoom = min(detailZoom, max(0, Int(floor(log2(viewport.width / (rect.width * 512))))))
+    let fitCount = Double(1 << fitZoom)
+    let columns = Int((rect.width * Double(1 << fitZoom)).rounded(.up)) + 1
+    let rows = Int((rect.height * Double(1 << fitZoom)).rounded(.up)) + 1
+    start = Date()
+    var loaded = 0
+    for column in 0..<columns {
+        for row in 0..<rows {
+            let tile = SlippyTile(
+                zoom: fitZoom,
+                x: min(max(Int(rect.minX * fitCount) + column, 0), (1 << fitZoom) - 1),
+                y: min(max(Int(rect.minY * fitCount) + row, 0), (1 << fitZoom) - 1)
+            )
+            if await source.image(for: tile) != nil { loaded += 1 }
+        }
+    }
+    let fitMilliseconds = Date().timeIntervalSince(start) * 1000
+    print(String(format: "  首屏 z%d：%d/%d 块，共 %.0f ms", fitZoom, loaded, columns * rows, fitMilliseconds))
+    expect(loaded > 0, "首屏应至少取到一块图")
 }
 
 // MARK: - 在线瓦片下载
@@ -1225,6 +1368,167 @@ do {
     await provider.invalidate()
     expect(await provider.cachedTileCount == 0, "失效后缓存应为空")
     expect(await provider.image(for: absent) != nil, "缓存失效后应重新读取（这时文件已存在）")
+}
+
+// MARK: - 单幅影像（TIFF 解码、投影与地理参考）
+
+/// 仓库根下的 `Fixtures/TIFF`（按源文件位置定位，不受当前工作目录影响）。
+var tiffFixtures: URL {
+    URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()   // TileKitCheck
+        .deletingLastPathComponent()   // Sources
+        .deletingLastPathComponent()   // 仓库根
+        .appending(path: "Fixtures/TIFF")
+}
+
+/// 把一张图读出 RGBA8 字节（两边都走同一条路径，因此比较结果不受 y 轴方向影响）。
+func rgbaBytes(of image: CGImage) -> [UInt8]? {
+    let width = image.width, height = image.height
+    var buffer = [UInt8](repeating: 0, count: width * height * 4)
+    let ok: Bool = buffer.withUnsafeMutableBytes { raw -> Bool in
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let context = CGContext(
+                data: raw.baseAddress, width: width, height: height,
+                bitsPerComponent: 8, bytesPerRow: width * 4, space: space,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+              ) else { return false }
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        return true
+    }
+    return ok ? buffer : nil
+}
+
+func imageContents(of url: URL) -> CGImage? {
+    guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+    return CGImageSourceCreateImageAtIndex(source, 0, nil)
+}
+
+section("单幅影像：TIFF 解码（对照 libtiff 写出的样本）")
+
+do {
+    var expected: [UInt8] = []
+    if let expectedImage = imageContents(of: tiffFixtures.appending(path: "base.png")),
+       let bytes = rgbaBytes(of: expectedImage) {
+        expected = bytes
+    } else {
+        expect(false, "读不到参照图 base.png（\(tiffFixtures.path(percentEncoded: false))）")
+    }
+
+    struct Fixture {
+        var file: String
+        var compression: String
+        var note: String
+    }
+    let fixtures = [
+        Fixture(file: "rgba_strip_none.tif", compression: "未压缩", note: "横条 + 未压缩"),
+        Fixture(file: "rgba_tile_deflate_p2.tif", compression: "Deflate", note: "分块 + Deflate + Predictor 2"),
+        Fixture(file: "rgba_strip_lzw.tif", compression: "LZW", note: "横条 + LZW + Predictor 2"),
+        Fixture(file: "rgba_strip_packbits.tif", compression: "PackBits", note: "横条 + PackBits"),
+    ]
+
+    for fixture in fixtures {
+        let url = tiffFixtures.appending(path: fixture.file)
+        guard let dataset = try? RasterLoader.load(url: url) else {
+            expect(false, "\(fixture.file) 应能打开")
+            continue
+        }
+        expect(dataset.pixelWidth == 32 && dataset.pixelHeight == 32,
+               "\(fixture.file) 应读出 32 × 32")
+        expect(dataset.compression == fixture.compression,
+               "\(fixture.file) 压缩方式应识别为 \(fixture.compression)（实际 \(dataset.compression)）")
+        expect(dataset.hasAlpha, "\(fixture.file) 应认出 alpha 通道")
+
+        guard let image = dataset.renderOverview(maxPixelSize: 32),
+              let actual = rgbaBytes(of: image) else {
+            expect(false, "\(fixture.file) 应能解出整幅图")
+            continue
+        }
+        expect(actual.count == expected.count, "\(fixture.file) 解出的字节数应与参照一致")
+        var mismatches = 0
+        var firstMismatch = -1
+        for index in 0..<min(actual.count, expected.count) where actual[index] != expected[index] {
+            mismatches += 1
+            if firstMismatch < 0 { firstMismatch = index }
+        }
+        if mismatches > 0, firstMismatch >= 0 {
+            let pixel = firstMismatch / 4
+            print("    \(fixture.note)：首个不同点在像素 (\(pixel % 32), \(pixel / 32))，"
+                + "期望 \(Array(expected[firstMismatch..<min(firstMismatch + 4, expected.count)]))，"
+                + "实际 \(Array(actual[firstMismatch..<min(firstMismatch + 4, actual.count)]))")
+        }
+        expect(mismatches == 0, "\(fixture.note)：解出的像素应与源图逐点一致（不同 \(mismatches) 个字节）")
+    }
+
+    // GeoTIFF：标签解析 + 定位。四角由 PROJ 9.7（cs2cs）算出，容差 1e-7 度（约 1 cm）。
+    let geoURL = tiffFixtures.appending(path: "geo_utm50_deflate.tif")
+    if let dataset = try? RasterLoader.load(url: geoURL) {
+        expect(dataset.isGeoreferenced, "geoTIFF 应被认成已配准")
+        expect(dataset.crsName.contains("32650"), "应认出 EPSG:32650（实际 \(dataset.crsName)）")
+        let rect = dataset.worldRect
+        let northWest = WebMercator.coordinate(fromNormalized: CGPoint(x: rect.minX, y: rect.minY))
+        let southEast = WebMercator.coordinate(fromNormalized: CGPoint(x: rect.maxX, y: rect.maxY))
+        // 注意：等东坐标线在 UTM 里是斜的，所以影像的四个角和轴对齐包围盒的四个角并不重合
+        // （包围盒的西边取西南角的经度、北边取西北角的纬度）。参考值由 PROJ 9.7 的 cs2cs 算出。
+        expectClose(northWest.longitude, 117.0000000000, accuracy: 1e-8, "包围盒西边（西南角）经度")
+        expectClose(northWest.latitude, 27.1224696416, accuracy: 1e-8, "包围盒北边（西北角）纬度")
+        expectClose(southEast.longitude, 117.0000161425, accuracy: 1e-8, "包围盒东边（东北角）经度")
+        expectClose(southEast.latitude, 27.1224551975, accuracy: 1e-8, "包围盒南边（东南角）纬度")
+        if let gsd = dataset.groundSampleDistance {
+            expectClose(gsd, 0.049995, accuracy: 1e-4, "geoTIFF 地面分辨率应为像素尺度")
+        }
+    } else {
+        expect(false, "geoTIFF 样本应能打开")
+    }
+}
+
+section("单幅影像：投影换算（对照 PROJ 9.7）")
+
+do {
+    // 参考值由 `cs2cs` 算出（PROJ 9.7.0），见每行的注释。
+    let utm50 = TransverseMercator.fromEPSG(32650)
+    expect(utm50 != nil, "应认出 EPSG:32650")
+    if let utm50 {
+        // echo "500000 3000000" | cs2cs -f "%.10f" +proj=utm +zone=50 +datum=WGS84 +to +proj=longlat +datum=WGS84
+        let corner = Projection.toWGS84(x: 500000, y: 3000000, crs: .transverseMercator(utm50))
+        expectClose(corner?.longitude ?? .nan, 117.0000000000, accuracy: 1e-8, "UTM 50N 反算经度")
+        expectClose(corner?.latitude ?? .nan, 27.1224696416, accuracy: 1e-8, "UTM 50N 反算纬度")
+        // 正算回去
+        if let corner {
+            let back = Projection.fromWGS84(corner, crs: .transverseMercator(utm50))
+            expectClose(back.map { Double($0.x) } ?? .nan, 500000, accuracy: 0.005, "UTM 50N 正算东坐标（毫米级）")
+            expectClose(back.map { Double($0.y) } ?? .nan, 3000000, accuracy: 0.005, "UTM 50N 正算北坐标（毫米级）")
+        }
+    }
+
+    // echo "116.3974 39.9093" | cs2cs +proj=longlat +datum=WGS84 +to +proj=tmerc +lat_0=0 +lon_0=114 +k=1 +x_0=500000 +y_0=0 +ellps=GRS80
+    // → 705004.54  4422210.83
+    if let tm = TransverseMercator.fromEPSG(4547) {
+        let point = Projection.fromWGS84(GeoCoordinate(longitude: 116.3974, latitude: 39.9093), crs: .transverseMercator(tm))
+        expectClose(point.map { Double($0.x) } ?? .nan, 705_004.54, accuracy: 0.1, "CGCS2000 3 度带 CM 114E 东坐标")
+        expectClose(point.map { Double($0.y) } ?? .nan, 4_422_210.83, accuracy: 0.1, "CGCS2000 3 度带 CM 114E 北坐标")
+        if let point {
+            let back = Projection.toWGS84(x: point.x, y: point.y, crs: .transverseMercator(tm))
+            expectClose(back?.longitude ?? .nan, 116.3974, accuracy: 1e-7, "CGCS2000 反算经度")
+            expectClose(back?.latitude ?? .nan, 39.9093, accuracy: 1e-7, "CGCS2000 反算纬度")
+        }
+    } else {
+        expect(false, "应认出 EPSG:4547")
+    }
+
+    // Web 墨卡托：赤道处 1 米 = 1 米，且与 WebMercator 的归一化换算一致。
+    let equator = Projection.toWGS84(x: 0, y: 0, crs: .webMercator)
+    expectClose(equator?.longitude ?? .nan, 0, accuracy: 1e-9, "Web 墨卡托原点经度")
+    expectClose(equator?.latitude ?? .nan, 0, accuracy: 1e-9, "Web 墨卡托原点纬度")
+    let mercator = Projection.fromWGS84(GeoCoordinate(longitude: 120, latitude: 30), crs: .webMercator)
+    expectClose(mercator.map { Double($0.x) } ?? .nan, 13_358_338.90, accuracy: 0.1, "Web 墨卡托东坐标（120°E）")
+    expectClose(mercator.map { Double($0.y) } ?? .nan, 3_503_549.84, accuracy: 0.1, "Web 墨卡托北坐标（30°N）")
+
+    // 经纬度基准：恒等。
+    let geographic = Projection.toWGS84(x: 119.5, y: 26.5, crs: .geographic)
+    expect(geographic == GeoCoordinate(longitude: 119.5, latitude: 26.5), "经纬度基准应为恒等变换")
+    // 认不出来的投影要老实返回 nil，而不是硬按经纬度摆。
+    expect(Projection.toWGS84(x: 500000, y: 3000000, crs: .unknown(code: 2421)) == nil,
+           "认不出的投影不应给出坐标")
 }
 
 // MARK: - 汇总

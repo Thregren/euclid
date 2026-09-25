@@ -46,6 +46,11 @@ struct StatusBarView: View {
             Label(dataset.name, systemImage: "square.stack.3d.up")
                 .font(.subheadline)
                 .lineLimit(1)
+        } else if let raster = model.selectedRaster {
+            Label(raster.name, systemImage: "photo")
+                .font(.subheadline)
+                .lineLimit(1)
+                .help(raster.isGeoreferenced ? raster.crsName : (raster.placementNote ?? ""))
         } else {
             Text(model.statusMessage ?? "就绪")
                 .font(.subheadline)

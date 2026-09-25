@@ -65,6 +65,16 @@ final class CanvasController {
         apply()
     }
 
+    /// 装配（或关掉）单幅影像图层。
+    func set(raster: RasterDataset?) {
+        let apply: () -> Void = { [weak self] in
+            guard let self else { return }
+            self.view?.setLocal(raster: raster)
+        }
+        pending = apply
+        apply()
+    }
+
     /// 装配（或关掉）在线底图层。
     func set(online basemap: OnlineBasemap?, fitRect: CGRect?) {
         let apply: () -> Void = { [weak self] in
@@ -113,8 +123,12 @@ final class AppModel {
     /// 全局共享实例：AppDelegate 需要用它来响应「用本应用打开文件夹」。
     static let shared = AppModel()
 
+    /// 瓦片数据集（`<z>/<x>/<y>` 目录）。
     var datasets: [TileDataset] = []
-    var selectedDatasetID: TileDataset.ID?
+    /// 单幅影像（GeoTIFF / TIFF / 普通图片，按需解出屏幕上的那一块）。
+    var rasters: [RasterDataset] = []
+    /// 当前选中的本地来源 id：瓦片数据集是目录路径，单幅影像是文件路径。
+    var selectedSourceID: String?
     var isScanning = false
     /// 正在读取数据范围：这期间画布是空的，界面上要给个进度指示。
     var isResolvingExtent = false
@@ -156,7 +170,7 @@ final class AppModel {
     }
 
     /// 界面上是否有可看的内容（本地数据集或在线底图）。
-    var hasMapContent: Bool { selectedDataset != nil || onlineBasemap != nil }
+    var hasMapContent: Bool { selectedSourceName != nil || onlineBasemap != nil }
 
     /// 正在忙什么；nil 表示空闲。用于画布上的进度指示（HIG：加载时别只留空白）。
     var loadingMessage: String? {
@@ -167,7 +181,7 @@ final class AppModel {
 
     /// 当前底图的显示名。
     var basemapName: String {
-        onlineBasemap?.name ?? selectedDataset?.name ?? "未打开"
+        onlineBasemap?.name ?? selectedSourceName ?? "未打开"
     }
 
     /// 按当前选择刷新画布。
@@ -177,9 +191,13 @@ final class AppModel {
 
     /// 装配本地图层。只在数据集真的换了才重装，避免切换底图时把本地层也重取一遍。
     func applyLocalLayer(force: Bool = false) {
-        guard force || selectedDatasetID != appliedLocalDatasetID else { return }
-        appliedLocalDatasetID = selectedDatasetID
-        canvas.set(dataset: selectedDataset, extent: extent)
+        guard force || selectedSourceID != appliedLocalDatasetID else { return }
+        appliedLocalDatasetID = selectedSourceID
+        if let raster = selectedRaster {
+            canvas.set(raster: raster)
+        } else {
+            canvas.set(dataset: selectedDataset, extent: extent)
+        }
         canvas.setLayerOpacity(local: localLayerOpacity, online: onlineLayerOpacity)
     }
 
@@ -212,7 +230,23 @@ final class AppModel {
     }
 
     var selectedDataset: TileDataset? {
-        datasets.first { $0.id == selectedDatasetID }
+        datasets.first { $0.id == selectedSourceID }
+    }
+
+    /// 当前选中的单幅影像。
+    var selectedRaster: RasterDataset? {
+        rasters.first { $0.id == selectedSourceID }
+    }
+
+    /// 当前本地来源的名字（瓦片数据集或单幅影像）。
+    var selectedSourceName: String? {
+        selectedDataset?.name ?? selectedRaster?.name
+    }
+
+    /// 当前本地来源的目录 / 文件路径（测量存档与「最近打开」用）。
+    private var selectedSourcePath: String? {
+        selectedDataset?.rootURL.path(percentEncoded: false)
+            ?? selectedRaster?.fileURL.path(percentEncoded: false)
     }
 
     /// 扫描代号，用于丢弃过期的扫描结果。
@@ -274,8 +308,7 @@ final class AppModel {
         // 调试用的示例测量（EUCLID_DEMO_MEASUREMENT）只是铺上去截图核对的，
         // 不能写进存档：那会覆盖掉用户自己量的结果。
         guard !DebugFixtures.isEnabled else { return }
-        guard let dataset = selectedDataset else { return }
-        let path = dataset.rootURL.path(percentEncoded: false)
+        guard let path = selectedSourcePath else { return }
         let snapshot = measurements.measurements
         archiveTask?.cancel()
         archiveTask = Task {
@@ -333,8 +366,8 @@ final class AppModel {
     func activateInitialDataset() {
         guard let url = initialURL else { return }
         initialURL = nil
-        rootFolder = url
-        scan(url)
+        // `open` 会分辨目录与文件：目录按瓦片数据集扫描，文件按单幅影像读。
+        open(url)
     }
 
 
@@ -354,14 +387,37 @@ final class AppModel {
         open(url)
     }
 
+    /// 打开单幅影像（GeoTIFF / TIFF，也收普通图片：读不出地理参考就按未配准显示）。
+    func promptForRaster() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "打开"
+        panel.message = "选择单幅影像（GeoTIFF / TIFF / PNG 等）"
+        panel.allowedContentTypes = [.tiff, .image]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        open(url)
+    }
+
     func open(_ url: URL) {
         var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: url.path(percentEncoded: false), isDirectory: &isDirectory),
-              isDirectory.boolValue else {
-            setStatus("请选择文件夹，而不是文件")
+        guard FileManager.default.fileExists(atPath: url.path(percentEncoded: false), isDirectory: &isDirectory) else {
+            setStatus("找不到这个路径：\(url.lastPathComponent)")
+            return
+        }
+        remember(url)
+        guard isDirectory.boolValue else {
+            // 文件：按单幅影像打开（GeoTIFF / TIFF / 普通图片）。
+            openRaster(url)
             return
         }
         rootFolder = url
+        scan(url)
+    }
+
+    /// 记住最近打开过的目录或文件。
+    private func remember(_ url: URL) {
         let path = url.path(percentEncoded: false)
         UserDefaults.standard.set(path, forKey: "lastRootFolder")
         recentFolders.removeAll { $0.path(percentEncoded: false) == path }
@@ -370,7 +426,27 @@ final class AppModel {
             recentFolders = Array(recentFolders.prefix(8))
         }
         UserDefaults.standard.set(recentFolders.map { $0.path(percentEncoded: false) }, forKey: "recentFolders")
-        scan(url)
+    }
+
+    /// 读单幅影像：只读文件头（IFD），因此再大的图也是秒开。
+    func openRaster(_ url: URL) {
+        isResolvingExtent = true
+        setStatus("正在读取影像…", autoClearAfter: 0)
+        Task {
+            let result: Result<RasterDataset, Error> = await Task.detached(priority: .userInitiated) {
+                do { return .success(try RasterLoader.load(url: url)) } catch { return .failure(error) }
+            }.value
+            isResolvingExtent = false
+            AppModel.trace("raster loaded \(url.lastPathComponent)")
+            switch result {
+            case .success(let raster):
+                rasters.removeAll { $0.id == raster.id }
+                rasters.insert(raster, at: 0)
+                selectSource(raster.id)
+            case .failure(let error):
+                setStatus("打开影像失败：\((error as? TIFFError)?.description ?? error.localizedDescription)", autoClearAfter: 8)
+            }
+        }
     }
 
     private func scan(_ url: URL) {
@@ -389,17 +465,36 @@ final class AppModel {
             datasets = found
             if found.isEmpty {
                 setStatus("在 \(url.lastPathComponent) 中没有找到形如 <z>/<x>/<y> 的瓦片目录", autoClearAfter: 0)
-                selectDataset(nil)
+                selectSource(nil)
             } else {
-                selectDataset(found[0].id)
+                selectSource(found[0].id)
             }
         }
     }
 
-    func selectDataset(_ id: TileDataset.ID?) {
+    /// 选中一个本地来源：瓦片数据集或单幅影像。
+    func selectSource(_ id: String?) {
         AppModel.trace("select \(id ?? "nil")")
-        selectedDatasetID = id
+        selectedSourceID = id
         extent = nil
+
+        // 单幅影像：尺寸、坐标系与覆盖范围都在读文件头时就算好了，不需要异步扫描。
+        if let raster = rasters.first(where: { $0.id == id }) {
+            isResolvingExtent = false
+            extent = raster.extent
+            applyLocalLayer(force: true)
+            applyOnlineLayer()
+            measurements.restore(MeasurementArchive.measurements(for: raster.id))
+            canvas.refreshOverlay()
+            reportRaster(raster)
+            if DebugFixtures.isEnabled {
+                DebugFixtures.populateMeasurements(in: raster.extent, store: measurements)
+                canvas.refreshOverlay()
+            }
+            DebugZoomScript.runIfRequested(canvas: canvas)
+            return
+        }
+
         guard let dataset = datasets.first(where: { $0.id == id }) else {
             isResolvingExtent = false
             applyLocalLayer(force: true)
@@ -419,7 +514,7 @@ final class AppModel {
             let result = await Task.detached(priority: .userInitiated) {
                 DatasetLocator.extent(of: dataset)
             }.value
-            guard selectedDatasetID == dataset.id else { return }
+            guard selectedSourceID == dataset.id else { return }
             isResolvingExtent = false
             AppModel.trace("extent done \(String(describing: result?.tileCount))")
             extent = result
@@ -435,6 +530,21 @@ final class AppModel {
             }
             DebugZoomScript.runIfRequested(canvas: canvas)
         }
+    }
+
+    /// 打开单幅影像后在状态栏交代一句：看了什么、多大、多清晰、是否配准。
+    private func reportRaster(_ raster: RasterDataset) {
+        if let note = raster.placementNote {
+            setStatus("\(raster.name)：未配准（\(note)），已按 1 像素 = 1 米摆放", autoClearAfter: 8)
+            return
+        }
+        var parts = ["\(raster.pixelSizeText)", raster.crsName]
+        if let gsd = raster.groundSampleDistance {
+            parts.append(gsd >= 1
+                ? String(format: "%.2f 米/像素", gsd)
+                : String(format: "%.1f 厘米/像素", gsd * 100))
+        }
+        setStatus("单幅影像 \(raster.name)：\(parts.joined(separator: " · "))", autoClearAfter: 6)
     }
 
     static func trace(_ message: String) {
@@ -518,7 +628,7 @@ extension AppModel {
         panel.message = "导出 \(measurements.measurements.count) 条测量结果"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do {
-            let payload = format.data(measurements.measurements, datasetName: selectedDataset?.name)
+            let payload = format.data(measurements.measurements, datasetName: selectedSourceName)
             try payload.write(to: url, options: .atomic)
             setStatus("已导出 \(measurements.measurements.count) 条测量结果到 \(url.lastPathComponent)")
         } catch {
@@ -609,17 +719,17 @@ extension AppModel {
     /// 信息栏内容：现在看的是什么、中心在哪、多大比例、量了几条。
     private var viewImageInfo: ViewExporter.Info? {
         guard hasMapContent else { return nil }
-        let dataset = selectedDataset
+        let hasLocal = selectedSourceName != nil
         let online = onlineBasemap
         var subtitleParts: [String] = []
-        if dataset != nil, let online {
+        if hasLocal, let online {
             subtitleParts.append("叠加 \(online.name)")
         }
         if let online, !online.attribution.isEmpty {
             subtitleParts.append(online.attribution)
         }
         return ViewExporter.Info(
-            title: dataset?.name ?? online?.name ?? basemapName,
+            title: selectedSourceName ?? online?.name ?? basemapName,
             subtitle: subtitleParts.isEmpty ? nil : subtitleParts.joined(separator: " · "),
             center: viewport.center,
             zoom: viewport.dataZoom,

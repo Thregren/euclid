@@ -1,6 +1,7 @@
 # 尺规 · Euclid
 
-macOS 原生本地瓦片查看器，为 **WebODM / ODM 输出的正射影像 XYZ 瓦片**设计，
+macOS 原生本地影像查看器，为 **WebODM / ODM 输出的正射影像**设计：
+既能打开 `<z>/<x>/<y>` 瓦片目录，也能**直接打开一整幅 GeoTIFF**（按需解码，不必先切瓦片）。
 支持坐标读取、折线测距、多边形测面积与画圆。没有联网依赖，所有计算在本机完成。
 
 当前版本 **1.7.0**，下载见 [Releases](https://github.com/Thregren/euclid/releases/latest)。
@@ -12,6 +13,9 @@ macOS 原生本地瓦片查看器，为 **WebODM / ODM 输出的正射影像 XYZ
 
 - **流畅浏览**：Core Animation 图层金字塔渲染，平移缩放由窗口服务器在 GPU 上合成，
   拖动时不重绘 CPU；稀疏覆盖、缺片、符号链接挂载都能正确处理
+- **单幅影像（GeoTIFF）**：⌘⇧O 直接打开一整幅 `.tif`——按地理参考摆到正确位置、
+  按屏幕需要的区域现解，再大的图也不用先切瓦片、也不整张进内存；内建概览（GDAL 那套
+  reduced-resolution 目录）会被自动利用，缩小时取低分辨率级
 - **坐标读取**：度分秒、十进制度、Web Mercator 米、瓦片 `z/x/y`、瓦片内像素，
   一键复制或输入经纬度跳转
 - **测距**：多点折线，逐段给出长度、方位角、罗盘方位与转角，另有总长与起终点直线距离
@@ -63,6 +67,10 @@ open "dist/尺规.app"
 打开数据集：⌘O 选择文件夹，或把文件夹拖到窗口 / Dock 图标上；应用会记住上次打开的目录。
 也可以直接选择装数据集的父目录，应用会向下找三层。
 
+打开单幅影像：⌘⇧O 选择 `.tif` / `.tiff`（或 PNG 等图片），也可以直接把文件拖进窗口。
+带地理参考的会按它自己的坐标系摆到正确位置，并与在线底图、测量坐标对齐；
+没有地理标签的按「1 像素 = 1 米」摆着看，界面上会写明「未配准」。
+
 | 工具 | 快捷键 | 操作 |
 | --- | --- | --- |
 | 浏览 | V / ⌘1 | 鼠标滚轮或捏合缩放，中键拖动、左键拖动、双指滚动平移，双击放大，⌥双击缩小 |
@@ -103,6 +111,9 @@ open "dist/尺规.app"
 │  DirectoryTileSource           散文件数据源读取                                 │
 │  TileProvider                  actor：LRU 缓存 + 并发解码闸门 + 缺片负缓存      │
 │  MapCamera                     视图变换、缩放锚点、可见瓦片范围                  │
+│  TIFF / TIFFDecoder            单幅 TIFF 的目录解析与按区域解码（无第三方依赖）  │
+│  GeoTIFF / RasterTileSource    地理参考 → WGS84，把瓦片请求换算成像素区域       │
+│  Projection                    经纬度 / Web 墨卡托 / UTM / 高斯克吕格互转       │
 │  Geodesy / Measurement         测地线距离、面积、测量模型                        │
 │  MeasurementExport             GeoJSON / KML / CSV / Excel(.xlsx)               │
 │  XLSX                          零依赖 OOXML 生成 + 存储式 ZIP 打包              │
@@ -124,6 +135,10 @@ Sources/TileKit/          核心库
   DatasetDiscovery.swift    数据集嗅探、扩展名与布局判定、覆盖范围统计
   TileProvider.swift        图片供应者（LRU 缓存、并发闸门、负缓存）
   MapCamera.swift           相机变换与可见瓦片计算
+  TIFF.swift                TIFF / BigTIFF 目录解析（尺寸、分块表、GeoTIFF 标签）
+  TIFFDecoder.swift         按区域解码：Deflate / LZW / PackBits / JPEG + Predictor 2
+  GeoTIFF.swift             地理参考、单幅影像模型与取图来源
+  Projection.swift          经纬度 / Web 墨卡托 / 横轴墨卡托（UTM、高斯克吕格）
   Geodesy.swift             Vincenty 测地线、面积、显示格式化
   Measurement.swift         测量模型与结果计算
   MeasurementStyle.swift    与 UI 无关的颜色分量与逐条样式
@@ -168,6 +183,17 @@ Scripts/                  构建与自检脚本
 因为只有正确的轴向才会存在转置路径。行号基准（XYZ 北起源 / TMS 南起源）无法从文件名推断，
 按 WebODM 默认约定取 XYZ，并在数据结构里保留可配置项。
 
+**单幅影像：自己读 TIFF，按需解码。**
+`ImageIO` 能把整张图解出来，但正射影像动辄上亿像素，整张大图进内存不现实；
+更要紧的是它不暴露 GeoTIFF 的地理标签（`ModelPixelScale` / `ModelTiepoint` /
+`GeoKeyDirectory`），没有这些就摆不对位置。因此 `TIFF.swift` 只读 IFD
+（尺寸、分块表、压缩方式、地理标签），`TIFFDecoder.swift` 再按屏幕需要的区域逐块解压
+（分块 / 横条；未压缩 / Deflate / LZW / PackBits / JPEG；8 与 16 位；
+灰度 / RGB / 调色板 / alpha；Predictor 2），采样到目标尺寸后交回现有渲染链路——
+**内存占用与影像有多大无关**。内建概览（GDAL 的 reduced-resolution 目录、COG 的 SubIFD）
+会被当作金字塔层级用，所以缩小时不必去解整幅图。地理参考交给 `Projection`：
+经纬度、Web 墨卡托、UTM、CGCS2000 的高斯克吕格分带都换算到 WGS84。
+
 **坐标约定：三种坐标系各司其职。**
 世界坐标是归一化的 Web Mercator（`0...1`，x 向东、y 向南）；
 NSView 未翻转，视图坐标 y 向上，鼠标事件直接可用；
@@ -211,7 +237,7 @@ WebODM / ODM 输出的正射影像基于 WGS84（CGCS2000 与 WGS84 的差异在
 
 ## 质量保障
 
-`./Scripts/run-checks.sh` 覆盖 287 项检查：
+`./Scripts/run-checks.sh` 覆盖 329 项检查：
 
 - 投影与瓦片编号往返一致性，并与真实数据集实测编号对照
 - 相机变换互逆性、缩放锚点不变性、适配范围后的完整性
@@ -226,6 +252,10 @@ WebODM / ODM 输出的正射影像基于 WGS84（CGCS2000 与 WGS84 的差异在
   缺片/重试/跳过已存在、并发上限、进度单调、取消、落盘清单与「下载目录可被识别为数据集」
 - 在线取图：远程来源的层级夹取、失败重试、404 视为缺片、缺密钥判定，
   以及供应者的解码、内存缓存命中、缺片负缓存、预取与缓存失效
+- 单幅影像：用 **libtiff 写出来的样本**（横条 / 分块 × 未压缩 / Deflate / LZW / PackBits）
+  逐像素比对——同一张源图，一条路径走 `ImageIO`、一条走自带的 TIFF 解码，
+  错的会立刻显形；另有 GeoTIFF 标签解析与 **PROJ 9.7 算出的四角坐标**对照，
+  以及 UTM / CGCS2000 高斯克吕格 / Web 墨卡托的正反算对照
 - 坐标基准：境外不做偏移、境内偏移量级在百米级、一键往返误差在厘米级、
   与公开流传的实现逐位对照（WGS84 → GCJ-02）、BD-09 等于 GCJ-02 再偏移，
   以及「偏移基准下的下载计划要按该基准的瓦片网格取编号」
@@ -236,6 +266,12 @@ WebODM / ODM 输出的正射影像基于 WGS84（CGCS2000 与 WGS84 的差异在
 
 ## 已知限制
 
+- 单幅影像暂不支持：分离平面（`PlanarConfiguration = 2`）、浮点样本、`Predictor = 3`、
+  非 8 / 16 位的位深，以及 JPEG-in-TIFF 的老式（`Compression = 6`）写法；
+  认不出的投影会按「未配准」显示而不是猜一个位置
+- **没有内建概览的大图**，首次在很低的放大倍数下看会慢一些（要解压覆盖整幅的压缩块）：
+  用 `gdaladdo` 加一次概览，或者直接用 `gdal_translate -co TILED=YES -co COPY_SRC_OVERVIEWS=YES`
+  存成带概览的 GeoTIFF / COG 就会很快
 - 基准偏移取的是**视图中心处**的线性近似：一片城区（几公里）内误差在米级，
   省级视野下会差几十米；用来判读与配准检查够用，不要拿它当高精度配准
 - 首次打开「文稿」「桌面」「下载」中的目录时，macOS 会要求一次文件访问授权
@@ -249,6 +285,26 @@ WebODM / ODM 输出的正射影像基于 WGS84（CGCS2000 与 WGS84 的差异在
 - [技术路线](docs/01-技术路线.md)｜[构建与运行](docs/02-构建与运行.md)｜[开发进度](docs/03-进度.md)｜[使用说明](docs/04-使用说明.md)
 
 ## 更新日志
+
+### 1.8.0
+
+- **新增：直接打开单幅影像（GeoTIFF / TIFF）**——⌘⇧O，也可以直接把 `.tif` 拖进窗口。
+  ODM / WebODM 的 `odm_orthophoto.tif` 不用先切成瓦片，打开就能看、能量、能出图
+  - 自带 TIFF 解析与按区域解码：分块（tile）与横条（strip）、未压缩 / Deflate / LZW /
+    PackBits / JPEG、8 与 16 位、灰度 / RGB / 调色板 / alpha、Predictor 2 都支持；
+    只解屏幕需要的那一块，**内存与影像大小无关**（实测 115 MB / 6100 万像素的 ODM 影像：
+    首屏 84 ms、1:1 取图 25 ms）
+  - 内建概览（GDAL 的 reduced-resolution 目录、COG 的 SubIFD）当金字塔用，缩小时取低分辨率级
+  - 地理参考按 GeoTIFF 标签摆放：UTM、CGCS2000 高斯克吕格、Web 墨卡托、经纬度都换算到 WGS84，
+    与在线底图、测量坐标严格对齐；认不出坐标系或没有地理标签的按「1 像素 = 1 米」显示并写明「未配准」
+  - 侧栏、检查器新增单幅影像条目（像素尺寸、坐标系、地面分辨率、压缩方式、文件大小、是否有内建概览）
+- **修复：整块瓦片随机变空**。解码后交给 `CGImage` 的像素指针只在 `withUnsafeBytes` 闭包内有效，
+  闭包一返回那块内存就可能被复用——于是同一张图时好时坏：有时整块瓦片全透明，
+  有时又是好的。现在改成由 `Data` 支撑、生命周期跟着图像走
+  （自检里加了「整幅概览平均 alpha」这类量化断言，正是它把这个偶发问题钉住的）
+- 自检扩到 **329 项**：新增用 **libtiff 写出的样本**逐像素比对（横条 / 分块 × 未压缩 / Deflate /
+  LZW / PackBits，含 alpha 与预乘处理）、GeoTIFF 定位与 **PROJ 9.7** 四角对照、
+  UTM / CGCS2000 / Web 墨卡托正反算对照，以及「拿一个影像文件当参数」的单幅影像体检
 
 ### 1.7.0
 

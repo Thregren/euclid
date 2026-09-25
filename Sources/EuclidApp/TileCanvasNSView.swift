@@ -192,6 +192,32 @@ final class TileCanvasNSView: NSView {
         syncLayers()
     }
 
+    /// 本地影像层：单幅影像（GeoTIFF / TIFF / 普通图片）。
+    ///
+    /// 与瓦片数据集走同一条图层栈，区别只有取图来源：那个按 `<z>/<x>/<y>` 读文件，
+    /// 这个按屏幕需要的像素区域现解。范围与坐标系在读文件头时就已经确定，不必等扫描。
+    func setLocal(raster: RasterDataset?) {
+        guard let raster else {
+            setLocal(dataset: nil, extent: nil)
+            return
+        }
+        dataset = nil
+        localStack.configure(
+            source: raster.source,
+            name: raster.name,
+            tileSize: raster.tileSize,
+            zoomRange: raster.zoomRange,
+            followsDisplayScale: false,
+            maximumDataZoom: raster.maximumDataZoom
+        )
+        extentRect = raster.worldRect
+        defaultFitRect = raster.worldRect
+        awaitingExtent = false
+        refreshCamera(fitRect: raster.worldRect, defaultZoomLevel: nil)
+        updateAccessibilityLabel()
+        syncLayers()
+    }
+
     /// 在线底图层（下层）。传 nil 表示关掉这一层。
     func setOnline(basemap: OnlineBasemap?, fitRect: CGRect?) {
         onlineFitRect = fitRect

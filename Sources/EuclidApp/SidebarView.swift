@@ -60,13 +60,13 @@ struct SidebarView: View {
                     }
                 }
 
-                if model.selectedDataset != nil {
+                if model.selectedSourceName != nil {
                     opacityRow("影像不透明度", value: $model.localLayerOpacity)
                 }
             }
 
             Section {
-                if model.datasets.isEmpty {
+                if model.datasets.isEmpty && model.rasters.isEmpty {
                     Text(model.isScanning ? "正在扫描…" : "尚未打开数据集")
                         .font(.callout)
                         .foregroundStyle(.secondary)
@@ -75,12 +75,25 @@ struct SidebarView: View {
                         DatasetRow(dataset: dataset)
                             .tag(dataset.id)
                     }
+                    ForEach(model.rasters) { raster in
+                        RasterRow(raster: raster)
+                            .tag(raster.id)
+                    }
                 }
             } header: {
                 // HIG：边栏底部不放关键操作（窗口下沿常被挡），把入口放到区块标题上。
                 HStack {
                     Text("数据源")
                     Spacer()
+                    Button {
+                        model.promptForRaster()
+                    } label: {
+                        Image(systemName: "photo.badge.plus")
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.tint)
+                    .help("打开单幅影像（GeoTIFF / TIFF / 图片，⌘⇧O）")
+                    .accessibilityLabel("打开单幅影像")
                     Button {
                         model.promptForFolder()
                     } label: {
@@ -161,9 +174,41 @@ struct SidebarView: View {
 
     private var selection: Binding<TileDataset.ID?> {
         Binding(
-            get: { model.selectedDatasetID },
-            set: { model.selectDataset($0) }
+            get: { model.selectedSourceID },
+            set: { model.selectSource($0) }
         )
+    }
+}
+
+/// 单幅影像一行：像素尺寸 + 地面分辨率（或未配准提示）。
+private struct RasterRow: View {
+    let raster: RasterDataset
+
+    var body: some View {
+        HStack(spacing: 9) {
+            Image(systemName: "photo")
+                .font(.body)
+                .foregroundStyle(.tint)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(raster.name)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    private var detail: String {
+        guard raster.isGeoreferenced else { return "\(raster.pixelSizeText) · 未配准" }
+        guard let gsd = raster.groundSampleDistance else { return raster.pixelSizeText }
+        let resolution = gsd >= 1
+            ? String(format: "%.2f 米/像素", gsd)
+            : String(format: "%.1f 厘米/像素", gsd * 100)
+        return "\(raster.pixelSizeText) · \(resolution)"
     }
 }
 

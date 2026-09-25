@@ -42,6 +42,12 @@ struct InspectorView: View {
                         .lineLimit(1)
                         .truncationMode(.middle)
                 }
+            } else if let raster = model.selectedRaster {
+                LabeledContent("本地影像") {
+                    Text("\(raster.name) · \(percent(model.localLayerOpacity))")
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
             }
             if let basemap = model.onlineBasemap {
                 LabeledContent("在线底图") {
@@ -86,12 +92,36 @@ struct InspectorView: View {
                 LabeledContent("行号基准", value: dataset.layout.rowOrigin == .north ? "XYZ（北起源）" : "TMS（南起源）")
                 LabeledContent("坐标基准", value: "WGS84 / Web Mercator")
             }
+        } else if let raster = model.selectedRaster {
+            Section("单幅影像") {
+                LabeledContent("名称") {
+                    Text(raster.name)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                LabeledContent("像素尺寸", value: "\(raster.pixelSizeText) px")
+                LabeledContent("坐标基准", value: raster.crsName)
+                if let gsd = raster.groundSampleDistance {
+                    LabeledContent("地面分辨率", value: gsd >= 1
+                        ? String(format: "%.2f 米/像素", gsd)
+                        : String(format: "%.1f 厘米/像素", gsd * 100))
+                }
+                LabeledContent("压缩", value: "\(raster.compression) · \(raster.bitsPerSample) 位"
+                    + (raster.hasAlpha ? " · 含 alpha" : ""))
+                LabeledContent("文件大小", value: raster.fileSizeText)
+                LabeledContent("内建概览", value: raster.hasOverviews ? "有（缩放取低分辨率级）" : "无")
+                if let note = raster.placementNote {
+                    Label(note, systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
         }
     }
 
     @ViewBuilder
     private func extentSection(_ extent: DatasetExtent) -> some View {
-        Section("覆盖范围") {
+        Section(model.selectedRaster == nil ? "覆盖范围" : "影像范围") {
             LabeledContent("西经 / 东经") {
                 Text(String(
                     format: "%.5f … %.5f",
@@ -108,7 +138,9 @@ struct InspectorView: View {
                 ))
                 .monospacedDigit()
             }
-            LabeledContent("估算瓦片数", value: "\(extent.tileCount)")
+            if model.selectedRaster == nil {
+                LabeledContent("估算瓦片数", value: "\(extent.tileCount)")
+            }
         }
     }
 

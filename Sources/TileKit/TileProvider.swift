@@ -74,8 +74,7 @@ public actor TileProvider {
         let limiter = self.limiter
         let task = Task.detached(priority: .userInitiated) { () -> CGImage? in
             await limiter.acquire()
-            let data = await source.data(for: tile)
-            let image = data.flatMap { ImageDecoder.decode($0) }
+            let image = await source.image(for: tile)
             await limiter.release()
             return image
         }

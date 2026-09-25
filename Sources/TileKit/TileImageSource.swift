@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 
 /// 瓦片字节来源。
@@ -13,6 +14,17 @@ public protocol TileImageSource: Sendable {
     /// 实现要自己保证不阻塞调用方的执行器：目录来源把阻塞读取放到后台，
     /// 在线来源走异步网络请求。
     func data(for tile: SlippyTile) async -> Data?
+
+    /// 取瓦片图片。默认实现是「先取字节再解码」；
+    /// 像单幅影像这种「按区域现解」的来源覆盖它，省掉一次编码往返。
+    func image(for tile: SlippyTile) async -> CGImage?
+}
+
+public extension TileImageSource {
+    func image(for tile: SlippyTile) async -> CGImage? {
+        guard let data = await data(for: tile) else { return nil }
+        return ImageDecoder.decode(data)
+    }
 }
 
 /// 取图请求的公共默认参数。

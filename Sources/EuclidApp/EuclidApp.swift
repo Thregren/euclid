@@ -52,6 +52,11 @@ struct Euclid: App {
                 model.promptForFolder()
             }
             .keyboardShortcut("o", modifiers: .command)
+            Button("打开单幅影像…") {
+                model.promptForRaster()
+            }
+            .keyboardShortcut("o", modifiers: [.command, .shift])
+            .help("打开 GeoTIFF / TIFF / 图片（按地理参考摆到正确位置）")
             Button("下载在线瓦片…") {
                 model.showDownloadSheet = true
             }

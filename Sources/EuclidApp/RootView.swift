@@ -37,8 +37,14 @@ struct RootView: View {
             let attribution = basemap.attribution.isEmpty ? "" : " · \(basemap.attribution)"
             return "在线底图 z0–z\(basemap.zoomRange.upperBound)\(attribution)"
         }
-        guard let dataset = model.selectedDataset else { return "未打开数据集" }
-        return "z\(dataset.zoomRange.lowerBound)–z\(dataset.zoomRange.upperBound) · \(dataset.layout.tileSize)px"
+        if let dataset = model.selectedDataset {
+            return "z\(dataset.zoomRange.lowerBound)–z\(dataset.zoomRange.upperBound) · \(dataset.layout.tileSize)px"
+        }
+        if let raster = model.selectedRaster {
+            let shape = raster.isGeoreferenced ? raster.crsName : "未配准"
+            return "单幅影像 \(raster.pixelSizeText) · \(shape)"
+        }
+        return "未打开数据集"
     }
 
     @ToolbarContentBuilder
