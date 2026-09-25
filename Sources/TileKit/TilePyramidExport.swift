@@ -69,6 +69,19 @@ public struct TilePyramidProgress: Sendable {
     public var bytes: Int
     public var zoom: Int
 
+    public init(
+        completed: Int = 0, total: Int = 0, written: Int = 0,
+        skipped: Int = 0, failed: Int = 0, bytes: Int = 0, zoom: Int = 0
+    ) {
+        self.completed = completed
+        self.total = total
+        self.written = written
+        self.skipped = skipped
+        self.failed = failed
+        self.bytes = bytes
+        self.zoom = zoom
+    }
+
     public var fraction: Double { total > 0 ? Double(completed) / Double(total) : 0 }
 }
 
@@ -81,6 +94,19 @@ public struct TilePyramidSummary: Sendable {
     public var elapsed: Double
     public var cancelled: Bool
     public var outputDirectory: URL
+
+    public init(
+        written: Int = 0, skipped: Int = 0, failed: Int = 0, bytes: Int = 0,
+        elapsed: Double = 0, cancelled: Bool = false, outputDirectory: URL
+    ) {
+        self.written = written
+        self.skipped = skipped
+        self.failed = failed
+        self.bytes = bytes
+        self.elapsed = elapsed
+        self.cancelled = cancelled
+        self.outputDirectory = outputDirectory
+    }
 }
 
 public enum TilePyramidError: Error, CustomStringConvertible {

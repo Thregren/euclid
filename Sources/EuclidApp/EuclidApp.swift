@@ -62,6 +62,11 @@ struct Euclid: App {
                 model.showDownloadSheet = true
             }
             .keyboardShortcut("d", modifiers: [.command, .shift])
+            Button("从影像生成瓦片…") {
+                model.promptForTileExport()
+            }
+            .keyboardShortcut("t", modifiers: [.command, .shift])
+            .help("把 GeoTIFF / TIFF 切成各级瓦片，生成后可直接浏览")
             Divider()
             Button("导出当前视图为图片…") {
                 model.exportViewAsImage()

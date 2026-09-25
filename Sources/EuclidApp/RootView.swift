@@ -24,6 +24,10 @@ struct RootView: View {
             DownloadSheet()
                 .environment(model)
         }
+        .sheet(isPresented: $model.showTileExportSheet) {
+            TileExportSheet()
+                .environment(model)
+        }
         .task {
             model.activateInitialDataset()
             DebugDownloadScript.runIfRequested(model: model)

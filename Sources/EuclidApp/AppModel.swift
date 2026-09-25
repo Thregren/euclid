@@ -162,6 +162,10 @@ final class AppModel {
     let canvas = CanvasController()
     let measurements = MeasurementStore()
     let download = TileDownloadModel()
+    /// 「从影像生成瓦片」面板的状态。
+    let tileExport = TileExportModel()
+    /// 生成面板是否展开。
+    var showTileExportSheet = false
 
     /// 当前在线底图；用本地数据时为 nil。
     var onlineBasemap: OnlineBasemap? {
@@ -270,6 +274,9 @@ final class AppModel {
         download.onSourceChanged = { [weak self] in
             guard let self, self.usesOnlineBasemap else { return }
             self.applyBasemap()
+        }
+        tileExport.onStatus = { [weak self] message in
+            self?.setStatus(message, autoClearAfter: 8)
         }
         measurements.onChange = { [weak self] in
             self?.scheduleArchiveSave()
@@ -385,6 +392,11 @@ final class AppModel {
         }
         guard panel.runModal() == .OK, let url = panel.url else { return }
         open(url)
+    }
+
+    /// 打开「从影像生成瓦片」面板：已经打开单幅影像时带上它，否则进去再选。
+    func promptForTileExport() {
+        showTileExportSheet = true
     }
 
     /// 打开单幅影像（GeoTIFF / TIFF，也收普通图片：读不出地理参考就按未配准显示）。
