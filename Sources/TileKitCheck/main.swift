@@ -783,7 +783,8 @@ do {
                 accuracy: 1e-9, "包围盒西边界")
 
     // 层级越深，覆盖同一范围需要的瓦片越多；每层瓦片数应严格递增。
-    let city = GeoBounds(west: 119.30, south: 25.68, east: 119.52, north: 25.86)
+    // 范围取一座公开城市的通用包围盒（与任何具体测区无关），只用来考算法性质。
+    let city = GeoBounds(west: 120.10, south: 30.20, east: 120.32, north: 30.38)
     let plan = try TileDownloadPlan(bounds: city, zoomRange: 12...16)
     var previous = 0
     for range in plan.ranges {
@@ -933,7 +934,7 @@ do {
         .appending(path: "euclid-download-check-\(UUID().uuidString)")
     defer { try? FileManager.default.removeItem(at: root) }
 
-    let bounds = GeoBounds(west: 119.30, south: 25.68, east: 119.52, north: 25.86)
+    let bounds = GeoBounds(west: 120.10, south: 30.20, east: 120.32, north: 30.38)
     let plan = try TileDownloadPlan(bounds: bounds, zoomRange: 12...13)
     let tiles = plan.allTiles()
     let template = "https://tiles.test/{z}/{x}/{y}.png"
@@ -1055,7 +1056,7 @@ do {
     defer { try? FileManager.default.removeItem(at: root) }
 
     let plan = try TileDownloadPlan(
-        bounds: GeoBounds(west: 119.0, south: 25.4, east: 119.9, north: 26.1),
+        bounds: GeoBounds(west: 119.8, south: 30.1, east: 120.7, north: 30.8),
         zoomRange: 12...12
     )
     expect(plan.totalTileCount > 8, "取消测试的范围应包含足够多的瓦片")
@@ -1081,7 +1082,7 @@ do {
 
 do {
     // 偏移基准下的下载计划：瓦片编号要按该基准的网格算。
-    let bounds = GeoBounds(west: 119.30, south: 25.68, east: 119.32, north: 25.70)
+    let bounds = GeoBounds(west: 120.10, south: 30.20, east: 120.12, north: 30.22)
     let plain = try TileDownloadPlan(bounds: bounds, zoomRange: 16...16)
     let shifted = try TileDownloadPlan(bounds: bounds, zoomRange: 16...16, datum: .gcj02)
     expect(plain.datum == .wgs84, "默认基准应为 WGS84")
@@ -1175,19 +1176,19 @@ do {
     // 界面上同一条测量会被反复取用（平移缩放重绘、检查器刷新），
     // 因此求值带缓存：这里逐项核对「缓存路径 = 直算路径」以及命中与淘汰的行为。
     let polyline = [
-        GeoCoordinate(longitude: 119.300, latitude: 26.070),
-        GeoCoordinate(longitude: 119.310, latitude: 26.080),
-        GeoCoordinate(longitude: 119.320, latitude: 26.075),
+        GeoCoordinate(longitude: 120.100, latitude: 30.200),
+        GeoCoordinate(longitude: 120.110, latitude: 30.210),
+        GeoCoordinate(longitude: 120.120, latitude: 30.205),
     ]
     let polygon = [
-        GeoCoordinate(longitude: 119.300, latitude: 26.070),
-        GeoCoordinate(longitude: 119.320, latitude: 26.070),
-        GeoCoordinate(longitude: 119.320, latitude: 26.090),
-        GeoCoordinate(longitude: 119.300, latitude: 26.090),
+        GeoCoordinate(longitude: 120.100, latitude: 30.200),
+        GeoCoordinate(longitude: 120.120, latitude: 30.200),
+        GeoCoordinate(longitude: 120.120, latitude: 30.220),
+        GeoCoordinate(longitude: 120.100, latitude: 30.220),
     ]
     let circle = [
-        GeoCoordinate(longitude: 119.310, latitude: 26.080),
-        GeoCoordinate(longitude: 119.320, latitude: 26.080),
+        GeoCoordinate(longitude: 120.110, latitude: 30.210),
+        GeoCoordinate(longitude: 120.120, latitude: 30.210),
     ]
 
     MeasurementCalculator.resetResultCache()
@@ -1250,8 +1251,8 @@ do {
     for index in 0..<(MeasurementCalculator.resultCacheLimit + 40) {
         let offset = Double(index) * 0.0001
         _ = MeasurementCalculator.evaluate(kind: .distance, points: [
-            GeoCoordinate(longitude: 119.0 + offset, latitude: 26.0),
-            GeoCoordinate(longitude: 119.001 + offset, latitude: 26.001),
+            GeoCoordinate(longitude: 120.0 + offset, latitude: 30.0),
+            GeoCoordinate(longitude: 120.001 + offset, latitude: 30.001),
         ])
     }
     expect(MeasurementCalculator.resultCacheCount <= MeasurementCalculator.resultCacheLimit,
@@ -1267,8 +1268,8 @@ do {
     // 时间对比只打印出来看看，不做断言（机器负载会影响绝对值）。
     let dense = (0..<200).map { index in
         GeoCoordinate(
-            longitude: 119.30 + Double(index) * 1e-5,
-            latitude: 26.07 + Double(index % 13) * 1e-5
+            longitude: 120.10 + Double(index) * 1e-5,
+            latitude: 30.20 + Double(index % 13) * 1e-5
         )
     }
     let iterations = 200
@@ -1495,9 +1496,9 @@ do {
         // 注意：等东坐标线在 UTM 里是斜的，所以影像的四个角和轴对齐包围盒的四个角并不重合
         // （包围盒的西边取西南角的经度、北边取西北角的纬度）。参考值由 PROJ 9.7 的 cs2cs 算出。
         expectClose(northWest.longitude, 117.0000000000, accuracy: 1e-8, "包围盒西边（西南角）经度")
-        expectClose(northWest.latitude, 27.1224696416, accuracy: 1e-8, "包围盒北边（西北角）纬度")
-        expectClose(southEast.longitude, 117.0000161425, accuracy: 1e-8, "包围盒东边（东北角）经度")
-        expectClose(southEast.latitude, 27.1224551975, accuracy: 1e-8, "包围盒南边（东南角）纬度")
+        expectClose(northWest.latitude, 40.6508565156, accuracy: 1e-8, "包围盒北边（西北角）纬度")
+        expectClose(southEast.longitude, 117.0000189232, accuracy: 1e-8, "包围盒东边（东北角）经度")
+        expectClose(southEast.latitude, 40.6508421030, accuracy: 1e-8, "包围盒南边（东南角）纬度")
         if let gsd = dataset.groundSampleDistance {
             expectClose(gsd, 0.049995, accuracy: 1e-4, "geoTIFF 地面分辨率应为像素尺度")
         }
@@ -1550,8 +1551,8 @@ do {
     expectClose(mercator.map { Double($0.y) } ?? .nan, 3_503_549.84, accuracy: 0.1, "Web 墨卡托北坐标（30°N）")
 
     // 经纬度基准：恒等。
-    let geographic = Projection.toWGS84(x: 119.5, y: 26.5, crs: .geographic)
-    expect(geographic == GeoCoordinate(longitude: 119.5, latitude: 26.5), "经纬度基准应为恒等变换")
+    let geographic = Projection.toWGS84(x: 120.5, y: 30.5, crs: .geographic)
+    expect(geographic == GeoCoordinate(longitude: 120.5, latitude: 30.5), "经纬度基准应为恒等变换")
     // 认不出来的投影要老实返回 nil，而不是硬按经纬度摆。
     expect(Projection.toWGS84(x: 500000, y: 3000000, crs: .unknown(code: 2421)) == nil,
            "认不出的投影不应给出坐标")

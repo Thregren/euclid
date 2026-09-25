@@ -40,7 +40,8 @@ magick base.png "${common[@]}" -compress LZW    -define tiff:rows-per-strip=8 rg
 magick base.png "${common[@]}" -compress RLE    -define tiff:rows-per-strip=8 rgba_strip_packbits.tif
 
 # 2) 给分块 Deflate 那份注入 GeoTIFF 标签（EPSG:32650，定位点取中央经线上的整数格点，
-#    刻意与任何真实测区无关）。
+#    刻意与任何真实测区无关：东坐标 500000 是 117°E 中央经线本身，北坐标取 4500000，
+#    落在一座公开城市的近郊，纯属「一个整格点」）。
 python3 - <<'PY'
 import struct
 
@@ -55,7 +56,7 @@ for index in range(count):
     entries.append((tag, kind, number, source[base + 8:base + 12]))
 
 scale = struct.pack("<3d", 0.049995, 0.049995, 0.0)
-tiepoint = struct.pack("<6d", 0, 0, 0, 500_000.0, 3_000_000.0, 0.0)
+tiepoint = struct.pack("<6d", 0, 0, 0, 500_000.0, 4_500_000.0, 0.0)
 keys = [1, 1, 0, 6,
         1024, 0, 1, 1,        # GTModelTypeGeoKey：投影坐标
         1025, 0, 1, 1,        # GTRasterTypeGeoKey：PixelIsArea
