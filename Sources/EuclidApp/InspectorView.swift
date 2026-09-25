@@ -7,14 +7,18 @@ struct InspectorView: View {
     var body: some View {
         Form {
             if model.hasMapContent {
-                CursorCoordinateSection()
+                // Order follows Pixelmator Pro: document (layers) → selected object → task → readouts → source details.
+                LayerPanel()
+                if let layer = model.selectedLayer {
+                    LayerPropertiesSection(layer: layer)
+                }
                 MeasurementSection()
-                layersSection
-                datasetSection
+                CursorCoordinateSection()
                 if let extent = model.extent {
                     extentSection(extent)
                 }
                 viewSection
+                datasetSection
             } else {
                 Section {
                     ContentUnavailableView(
@@ -34,34 +38,6 @@ struct InspectorView: View {
 
     /// 图层信息：本地影像与在线底图各自的不透明度与来源。
     @ViewBuilder
-    private var layersSection: some View {
-        Section("图层") {
-            ForEach(model.layers) { layer in
-                LabeledContent(layer.name) {
-                    Text("\(percent(layer.opacity))\(layer.isVisible ? "" : " · 已隐藏")\(layer.isAnchor ? " · 基准" : "")")
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-            }
-            if let basemap = model.onlineBasemap {
-                LabeledContent("底图层级", value: "z0 – z\(basemap.zoomRange.upperBound)")
-                LabeledContent("坐标基准", value: basemap.datum.title)
-                if basemap.datum != .wgs84 {
-                    LabeledContent("对齐偏移", value: basemap.offsetText(at: model.viewport.center))
-                }
-                if !basemap.attribution.isEmpty {
-                    LabeledContent("版权", value: basemap.attribution)
-                }
-                if !basemap.terms.isEmpty {
-                    Text(basemap.terms)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-        }
-    }
-
     private func percent(_ value: Double) -> String {
         "\(Int((value * 100).rounded()))%"
     }

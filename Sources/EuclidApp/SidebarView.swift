@@ -8,56 +8,6 @@ struct SidebarView: View {
         @Bindable var model = model
 
         List(selection: selection) {
-            Section("图层") {
-                if model.layers.isEmpty {
-                    Text("还没有图层。用下面的按钮添加本地数据或在线底图。")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                } else {
-                    // 列表顺序就是叠放顺序（下面的在底层）。
-                    ForEach(model.layers) { layer in
-                        LayerRow(layer: layer)
-                    }
-                }
-
-                if model.onlineLayer != nil {
-                    Picker("坐标基准", selection: Bindable(model.download).datum) {
-                        ForEach(Datum.allCases) { datum in
-                            Text(datum.shortTitle).tag(datum)
-                        }
-                    }
-                    .pickerStyle(.menu)
-                    .help("在线底图的坐标基准：高德 / 腾讯选 GCJ-02、百度选 BD-09")
-                }
-
-                Menu {
-                    ForEach(TileSourceTemplate.presets) { preset in
-                        Button(preset.name) {
-                            model.download.sourceID = preset.id
-                            model.usesOnlineBasemap = true
-                        }
-                    }
-                } label: {
-                    Label("添加在线底图", systemImage: "globe")
-                }
-
-                Menu {
-                    if model.datasets.isEmpty && model.rasters.isEmpty {
-                        Text("先在下面打开数据")
-                    }
-                    ForEach(model.rasters) { raster in
-                        Button(raster.name) { model.addLayer(model.makeLayer(raster: raster)) }
-                    }
-                    if !model.datasets.isEmpty { Divider() }
-                    ForEach(model.datasets) { dataset in
-                        Button(dataset.name) { model.addLayer(model.makeLayer(dataset: dataset)) }
-                    }
-                } label: {
-                    Label("添加本地数据为图层", systemImage: "square.stack.3d.up")
-                }
-                .disabled(model.datasets.isEmpty && model.rasters.isEmpty)
-            }
-
             Section {
                 if model.datasets.isEmpty && model.rasters.isEmpty {
                     Text(model.isScanning ? "正在扫描…" : "尚未打开数据集")
@@ -81,6 +31,7 @@ struct SidebarView: View {
                 // HIG：边栏底部不放关键操作（窗口下沿常被挡），把入口放到区块标题上。
                 HStack {
                     Text("可用数据")
+                        .help("点一条即把它设为基准层；叠加显示请用右侧「图层」面板的「插入图层」")
                     Spacer()
                     Button {
                         model.promptForRaster()

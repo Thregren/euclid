@@ -46,7 +46,10 @@ struct MapLayer: Identifiable {
         case online
     }
 
+    /// 实例 id（复制图层时各层不同）。
     var id: String
+    /// 来源身份：数据集目录 / 影像文件路径 / "online"。用来判断「这一层代表哪个来源」。
+    var sourceID: String
     var kind: Kind
     var name: String
     /// 取图来源。
@@ -168,6 +171,13 @@ final class AppModel {
     /// 每层各有一条不透明度。
     private(set) var layers: [MapLayer] = []
 
+    /// 面板里选中的那一层（不透明度等属性作用于它）。
+    var selectedLayerID: String?
+
+    var selectedLayer: MapLayer? {
+        layers.first { $0.id == selectedLayerID } ?? anchorLayer ?? layers.last
+    }
+
     /// 基准层（本地来源）。
     var anchorLayer: MapLayer? { layers.first { $0.isAnchor } }
     /// 最上面那层在线底图（界面上的「底图」指的就是它）。
@@ -194,6 +204,40 @@ final class AppModel {
         pushLayers()
     }
 
+    /// 选中某一层；选中的是另一份本地数据时，顺手把它切换成基准层（测量与相机跟着走）。
+    func selectLayer(_ id: String) {
+        selectedLayerID = id
+        guard let layer = layers.first(where: { $0.id == id }),
+              !layer.isAnchor, layer.kind != .online else { return }
+        selectedSourceID = layer.sourceID
+    }
+
+    /// 移除当前选中层（没有选中时移除最上面那层）。
+    func removeSelectedLayer() {
+        guard let id = selectedLayer?.id else { return }
+        removeLayer(id)
+        selectedLayerID = layers.last?.id
+    }
+
+    func canMoveSelectedLayer(up: Bool) -> Bool {
+        guard let id = selectedLayer?.id, let index = layers.firstIndex(where: { $0.id == id }) else { return false }
+        return layers.indices.contains(up ? index + 1 : index - 1)
+    }
+
+    func moveSelectedLayer(up: Bool) {
+        guard let id = selectedLayer?.id, canMoveSelectedLayer(up: up) else { return }
+        moveLayer(id, up: up)
+    }
+
+    /// 把某一层设为基准层（测量、存档与相机尺度以它为准）。
+    func setAnchorLayer(_ id: String) {
+        guard let index = layers.firstIndex(where: { $0.id == id }), layers[index].kind != .online else { return }
+        for i in layers.indices { layers[i].isAnchor = (i == index) }
+        selectedSourceID = id
+        pushLayers()
+        setStatus("基准层已改为：\(layers[index].name)", autoClearAfter: 5)
+    }
+
     /// 显示 / 隐藏某一层。
     func setVisible(_ visible: Bool, of id: String) {
         guard let index = layers.firstIndex(where: { $0.id == id }) else { return }
@@ -205,6 +249,7 @@ final class AppModel {
     func removeLayer(_ id: String) {
         guard let index = layers.firstIndex(where: { $0.id == id }) else { return }
         let removed = layers.remove(at: index)
+        if selectedLayerID == id { selectedLayerID = layers.last?.id }
         if removed.isAnchor {
             selectedSourceID = nil
             appliedLocalDatasetID = nil
@@ -227,9 +272,34 @@ final class AppModel {
         pushLayers()
     }
 
+    /// 复制一层（叠在原层上面）。
+    func duplicateLayer(_ id: String) {
+        guard let index = layers.firstIndex(where: { $0.id == id }) else { return }
+        var copy = layers[index]
+        copy.id = UUID().uuidString
+        copy.isAnchor = false
+        layers.insert(copy, at: index + 1)
+        selectedLayerID = copy.id
+        pushLayers()
+        setStatus("已复制图层：\(copy.name)", autoClearAfter: 5)
+    }
+
+    /// 拖拽排序（列表顺序即叠放顺序，末尾在最上）。
+    func moveLayers(from offsets: IndexSet, to destination: Int) {
+        layers.move(fromOffsets: offsets, toOffset: destination)
+        pushLayers()
+    }
+
+    /// 全部显示 / 全部隐藏。
+    func setAllLayersVisible(_ visible: Bool) {
+        for index in layers.indices { layers[index].isVisible = visible }
+        pushLayers()
+    }
+
     /// 直接加一层（侧栏「添加本地数据 / 添加在线底图」用）。
     func addLayer(_ layer: MapLayer) {
         layers.append(layer)
+        selectedLayerID = layer.id
         pushLayers()
         setStatus("已添加图层：\(layer.name)", autoClearAfter: 5)
     }
@@ -242,7 +312,8 @@ final class AppModel {
     /// 由本地来源造一层。
     func makeLayer(dataset: TileDataset) -> MapLayer {
         MapLayer(
-            id: dataset.id,
+            id: UUID().uuidString,
+            sourceID: dataset.id,
             kind: .dataset,
             name: dataset.name,
             source: dataset.source,
@@ -262,7 +333,8 @@ final class AppModel {
     /// 由单幅影像造一层。
     func makeLayer(raster: RasterDataset) -> MapLayer {
         MapLayer(
-            id: raster.id,
+            id: UUID().uuidString,
+            sourceID: raster.id,
             kind: .raster,
             name: raster.name,
             source: raster.source,
@@ -282,7 +354,8 @@ final class AppModel {
     /// 由在线底图配置造一层。
     func makeLayer(basemap: OnlineBasemap) -> MapLayer {
         MapLayer(
-            id: Self.onlineLayerID,
+            id: UUID().uuidString,
+            sourceID: Self.onlineLayerID,
             kind: .online,
             name: basemap.name,
             source: basemap.makeSource(),
@@ -374,7 +447,7 @@ final class AppModel {
 
         let previousOpacity = onlineLayer?.opacity ?? 1
         let previousVisibility = onlineLayer?.isVisible ?? true
-        layers.removeAll { $0.kind == .online && $0.id == Self.onlineLayerID }
+        layers.removeAll { $0.kind == .online && $0.sourceID == Self.onlineLayerID }
 
         guard let basemap, basemap.invalidReason == nil else {
             if let reason = basemap?.invalidReason {

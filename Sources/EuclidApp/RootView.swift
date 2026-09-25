@@ -82,9 +82,24 @@ struct RootView: View {
         }
     }
 
-    /// 底图切换：本地数据集或某个在线瓦片源。
+    /// 图层菜单：添加图层、在线底图设置、瓦片工具（参照 Pixelmator 把同类操作收在一个菜单里）。
     private var basemapMenu: some View {
         Menu {
+            Section("添加图层") {
+                ForEach(TileSourceTemplate.presets) { preset in
+                    Button("在线 · \(preset.name)") {
+                        model.download.sourceID = preset.id
+                        model.usesOnlineBasemap = true
+                    }
+                }
+                ForEach(model.rasters) { raster in
+                    Button("本地 · \(raster.name)") { model.addLayer(model.makeLayer(raster: raster)) }
+                }
+                ForEach(model.datasets) { dataset in
+                    Button("本地 · \(dataset.name)") { model.addLayer(model.makeLayer(dataset: dataset)) }
+                }
+            }
+            Divider()
             Picker("底图", selection: Bindable(model).usesOnlineBasemap) {
                 Text("本地数据").tag(false)
                 Text("在线底图").tag(true)
@@ -111,9 +126,9 @@ struct RootView: View {
             Button("从影像生成瓦片…") { model.showTileExportSheet = true }
             Button("本地瓦片服务…") { model.showTileServerSheet = true }
         } label: {
-            Label("底图", systemImage: model.onlineBasemap == nil ? "square.stack.3d.up" : "globe")
+            Label("图层", systemImage: "square.3.layers.3d")
         }
-        .help("当前底图：\(model.basemapName)")
+        .help("添加图层、切换在线底图与瓦片工具（当前：\(model.basemapName)）")
     }
 
     private var toolPicker: some View {
