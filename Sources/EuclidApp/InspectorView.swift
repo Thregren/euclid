@@ -36,26 +36,15 @@ struct InspectorView: View {
     @ViewBuilder
     private var layersSection: some View {
         Section("图层") {
-            if let dataset = model.selectedDataset {
-                LabeledContent("本地影像") {
-                    Text("\(dataset.name) · \(percent(model.localLayerOpacity))")
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-            } else if let raster = model.selectedRaster {
-                LabeledContent("本地影像") {
-                    Text("\(raster.name) · \(percent(model.localLayerOpacity))")
+            ForEach(model.layers) { layer in
+                LabeledContent(layer.name) {
+                    Text("\(percent(layer.opacity))\(layer.isVisible ? "" : " · 已隐藏")\(layer.isAnchor ? " · 基准" : "")")
                         .lineLimit(1)
                         .truncationMode(.middle)
                 }
             }
             if let basemap = model.onlineBasemap {
-                LabeledContent("在线底图") {
-                    Text("\(basemap.name) · \(percent(model.onlineLayerOpacity))")
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-                LabeledContent("层级", value: "z0 – z\(basemap.zoomRange.upperBound)")
+                LabeledContent("底图层级", value: "z0 – z\(basemap.zoomRange.upperBound)")
                 LabeledContent("坐标基准", value: basemap.datum.title)
                 if basemap.datum != .wgs84 {
                     LabeledContent("对齐偏移", value: basemap.offsetText(at: model.viewport.center))

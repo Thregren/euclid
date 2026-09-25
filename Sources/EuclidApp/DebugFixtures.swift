@@ -328,11 +328,22 @@ enum DebugVerifyScript {
             model.quickExportView()
             log("快速导出：状态=「\(model.statusMessage ?? "无")」")
 
-            // 4) 开关在线底图不应改变视野（按地面比例与中心对比）
+            // 4) 多图层：开关之前应当有本地 + 在线两层，各自独立的不透明度
+            @MainActor func layersText() -> String {
+                model.layers.map { "\($0.name)(\($0.kind.rawValue)) \(Int(($0.opacity * 100).rounded()))%" }
+                    .joined(separator: " / ")
+            }
+            log("图层（开关底图之前）：" + layersText())
+
+            // 5) 开关在线底图不应改变视野（按地面比例与中心对比）
             @MainActor func reading() -> String {
                 let center = model.viewport.center
-                return String(format: "中心 %.5f,%.5f  地面比例 %.4f 米/点",
-                              center.longitude, center.latitude, model.viewport.metersPerPoint)
+                let bounds = model.canvas.visibleBounds()
+                let box = bounds.map { String(format: "可见 %.5f…%.5f / %.5f…%.5f",
+                                              $0.west, $0.east, $0.south, $0.north) } ?? "可见 —"
+                return String(format: "中心 %.5f,%.5f  地面比例 %.4f 米/点  层级 z%.2f  %@",
+                              center.longitude, center.latitude, model.viewport.metersPerPoint,
+                              model.viewport.zoomLevel, box)
             }
             let viewBefore = reading()
             model.usesOnlineBasemap = true
@@ -344,6 +355,14 @@ enum DebugVerifyScript {
             log("开关底图：开之前 \(viewBefore)")
             log("开关底图：开着时 \(viewWithBasemap)")
             log("开关底图：关掉后 \(viewAfter)")
+
+            // 6) 每层独立的不透明度
+            model.usesOnlineBasemap = true
+            try? await Task.sleep(for: .seconds(2))
+            if let online = model.onlineLayer { model.setOpacity(of: online.id, to: 0.5) }
+            if let anchorLayer = model.anchorLayer { model.setOpacity(of: anchorLayer.id, to: 0.8) }
+            try? await Task.sleep(for: .seconds(2))
+            log("两层各不相同的不透明度：" + layersText())
 
             // 5) 关窗是否退出（设置了 EUCLID_DEBUG_VERIFY_CLOSE 时）
             if ProcessInfo.processInfo.environment["EUCLID_DEBUG_VERIFY_CLOSE"] != nil {

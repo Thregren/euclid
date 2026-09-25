@@ -1,6 +1,28 @@
 import SwiftUI
 import TileKit
 
+/// 按钮标题后面缀上快捷键：界面上的实体按钮要能看出它对应哪个键。
+/// （菜单里系统会自动显示快捷键，但检查器里的按钮不会，只能自己标。）
+struct ShortcutButtonLabel: View {
+    let title: String
+    var symbol: String?
+    var shortcut: String
+
+    var body: some View {
+        HStack(spacing: 6) {
+            if let symbol {
+                Label(title, systemImage: symbol)
+            } else {
+                Text(title)
+            }
+            Text(shortcut)
+                .font(.caption)
+                .monospacedDigit()
+                .foregroundStyle(.tertiary)
+        }
+    }
+}
+
 /// 指针坐标分区。
 ///
 /// 单独成视图，是为了让高频更新的指针坐标只重绘这一小块，不影响检查器其余部分。
@@ -44,18 +66,16 @@ struct CursorCoordinateSection: View {
                         .textSelection(.enabled)
                 }
                 Button {
-                    model.copyToClipboard(
-                        CoordinateText.decimal(cursor.coordinate, precision: 7),
-                        message: "已复制坐标"
-                    )
+                    model.copyCursorCoordinate()
                 } label: {
-                    Label("复制坐标", systemImage: "doc.on.doc")
+                    ShortcutButtonLabel(title: "复制坐标", symbol: "doc.on.doc", shortcut: "⌥⌘C")
                 }
+                .help("复制当前指针坐标（⌥⌘C）")
                 // 与「点坐标」工具落的是同一种测量：把指针放到目标上按 P 就好。
                 Button {
                     model.dropPointAtCursor()
                 } label: {
-                    Label("记下这个点", systemImage: "mappin.and.ellipse")
+                    ShortcutButtonLabel(title: "记下这个点", symbol: "mappin.and.ellipse", shortcut: "P")
                 }
                 .help("把指针所在的坐标记成一个点（快捷键 P），与「点坐标」工具共用同一份测量数据")
             } else {
@@ -115,10 +135,25 @@ struct MeasurementSection: View {
             if store.hasContent {
                 // 「彻底保存」与「彻底清理」明确摆在一起：存档是自动的，另外还能另存为文件带走。
                 HStack(spacing: 8) {
-                    Button("保存到文件…") { model.saveMeasurementsToFile() }
-                    Button("从文件载入…") { model.loadMeasurementsFromFile() }
+                    Button {
+                        model.saveMeasurementsToFile()
+                    } label: {
+                        ShortcutButtonLabel(title: "保存到文件…", shortcut: "⌘S")
+                    }
+                    .help("把当前测量另存为一个 JSON 文件（⌘S）")
+                    Button {
+                        model.loadMeasurementsFromFile()
+                    } label: {
+                        ShortcutButtonLabel(title: "从文件载入…", shortcut: "⌥⌘O")
+                    }
+                    .help("从文件里追加测量（⌥⌘O）")
                     Spacer()
-                    Button("清除全部", role: .destructive) { model.clearMeasurements() }
+                    Button(role: .destructive) {
+                        model.clearMeasurements()
+                    } label: {
+                        ShortcutButtonLabel(title: "清除全部", shortcut: "⌘⇧K")
+                    }
+                    .help("清除全部测量（⌘⇧K），清完可以用 ⌘Z 撤销")
                 }
                 .controlSize(.small)
                 Text("改动按数据集 / 影像自动存档，下次打开自动恢复；也可以另存为文件带走。")
@@ -160,19 +195,28 @@ struct MeasurementSection: View {
                 }
             }
             HStack {
-                Button("结束") {
+                Button {
                     store.finishDraft()
                     model.canvas.refreshOverlay()
+                } label: {
+                    ShortcutButtonLabel(title: "结束", shortcut: "↩")
                 }
                 .disabled(store.draft.count < (store.draftKind == .area ? 3 : 2))
-                Button("撤销一点") {
+                .help("结束当前测量（回车）")
+                Button {
                     store.removeLastDraftPoint()
                     model.canvas.refreshOverlay()
+                } label: {
+                    ShortcutButtonLabel(title: "撤销一点", shortcut: "⌫")
                 }
-                Button("取消") {
+                .help("撤掉刚点下的那个点（退格）")
+                Button {
                     store.cancelDraft()
                     model.canvas.refreshOverlay()
+                } label: {
+                    ShortcutButtonLabel(title: "取消", shortcut: "esc")
                 }
+                .help("取消整条草稿（Esc）")
             }
             .controlSize(.small)
         }

@@ -8,61 +8,54 @@ struct SidebarView: View {
         @Bindable var model = model
 
         List(selection: selection) {
-            Section("底图") {
-                Toggle("叠加在线底图", isOn: $model.usesOnlineBasemap)
+            Section("图层") {
+                if model.layers.isEmpty {
+                    Text("还没有图层。用下面的按钮添加本地数据或在线底图。")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                } else {
+                    // 列表顺序就是叠放顺序（下面的在底层）。
+                    ForEach(model.layers) { layer in
+                        LayerRow(layer: layer)
+                    }
+                }
 
-                if model.usesOnlineBasemap {
-                    Picker("数据源", selection: onlineSourceBinding) {
-                        ForEach(TileSourceTemplate.presets) { preset in
-                            Text(preset.name).tag(preset.id)
+                if model.onlineLayer != nil {
+                    Picker("坐标基准", selection: Bindable(model.download).datum) {
+                        ForEach(Datum.allCases) { datum in
+                            Text(datum.shortTitle).tag(datum)
                         }
                     }
-                    .labelsHidden()
                     .pickerStyle(.menu)
+                    .help("在线底图的坐标基准：高德 / 腾讯选 GCJ-02、百度选 BD-09")
+                }
 
-                    if let basemap = model.onlineBasemap {
-                        if basemap.needsKey {
-                            HStack(spacing: 6) {
-                                TextField("密钥 tk", text: Bindable(model.download).key)
-                                    .textFieldStyle(.roundedBorder)
-                                    .onSubmit { model.applyBasemap() }
-                                Button("应用") { model.applyBasemap() }
-                                    .controlSize(.small)
-                            }
-                        }
-                        Picker("坐标基准", selection: Bindable(model.download).datum) {
-                            ForEach(Datum.allCases) { datum in
-                                Text(datum.shortTitle).tag(datum)
-                            }
-                        }
-                        .pickerStyle(.menu)
-                        .help("底图所在的大地基准：高德 / 腾讯选 GCJ-02、百度选 BD-09，选错会整体差几百米")
-
-                        if basemap.datum != .wgs84 {
-                            Text("已按 \(basemap.datum.shortTitle) 对齐：\(basemap.offsetText(at: model.viewport.center))")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-
-                        opacityRow("底图不透明度", value: $model.onlineLayerOpacity)
-                        if let reason = basemap.invalidReason {
-                            Label(reason, systemImage: "exclamationmark.triangle")
-                                .font(.caption2)
-                                .foregroundStyle(.orange)
-                                .fixedSize(horizontal: false, vertical: true)
-                        } else if !basemap.terms.isEmpty {
-                            Text(basemap.terms)
-                                .font(.caption2)
-                                .foregroundStyle(.tertiary)
-                                .fixedSize(horizontal: false, vertical: true)
+                Menu {
+                    ForEach(TileSourceTemplate.presets) { preset in
+                        Button(preset.name) {
+                            model.download.sourceID = preset.id
+                            model.usesOnlineBasemap = true
                         }
                     }
+                } label: {
+                    Label("添加在线底图", systemImage: "globe")
                 }
 
-                if model.selectedSourceName != nil {
-                    opacityRow("影像不透明度", value: $model.localLayerOpacity)
+                Menu {
+                    if model.datasets.isEmpty && model.rasters.isEmpty {
+                        Text("先在下面打开数据")
+                    }
+                    ForEach(model.rasters) { raster in
+                        Button(raster.name) { model.addLayer(model.makeLayer(raster: raster)) }
+                    }
+                    if !model.datasets.isEmpty { Divider() }
+                    ForEach(model.datasets) { dataset in
+                        Button(dataset.name) { model.addLayer(model.makeLayer(dataset: dataset)) }
+                    }
+                } label: {
+                    Label("添加本地数据为图层", systemImage: "square.stack.3d.up")
                 }
+                .disabled(model.datasets.isEmpty && model.rasters.isEmpty)
             }
 
             Section {
@@ -71,19 +64,23 @@ struct SidebarView: View {
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 } else {
+                    // 点一下 = 把这份数据设为「基准层」（测量与相机以它为准）；
+                    // 想叠加显示就用上面的「添加本地数据为图层」。
                     ForEach(model.datasets) { dataset in
                         DatasetRow(dataset: dataset)
                             .tag(dataset.id)
+                            .help("设为当前数据（基准层）；要叠加显示请用「添加本地数据为图层」")
                     }
                     ForEach(model.rasters) { raster in
                         RasterRow(raster: raster)
                             .tag(raster.id)
+                            .help("设为当前数据（基准层）；要叠加显示请用「添加本地数据为图层」")
                     }
                 }
             } header: {
                 // HIG：边栏底部不放关键操作（窗口下沿常被挡），把入口放到区块标题上。
                 HStack {
-                    Text("数据源")
+                    Text("可用数据")
                     Spacer()
                     Button {
                         model.promptForRaster()
@@ -231,5 +228,69 @@ private struct DatasetRow: View {
             }
         }
         .padding(.vertical, 2)
+    }
+}
+
+/// 一层：名称、显示开关、不透明度、移除。
+private struct LayerRow: View {
+    @Environment(AppModel.self) private var model
+    let layer: MapLayer
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Image(systemName: symbol)
+                    .foregroundStyle(.tint)
+                    .frame(width: 18)
+                Text(layer.name)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                if layer.isAnchor {
+                    Text("基准")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+                Spacer()
+                Button {
+                    model.setVisible(!layer.isVisible, of: layer.id)
+                } label: {
+                    Image(systemName: layer.isVisible ? "eye" : "eye.slash")
+                }
+                .buttonStyle(.plain)
+                .help(layer.isVisible ? "隐藏这一层" : "显示这一层")
+                Button {
+                    model.removeLayer(layer.id)
+                } label: {
+                    Image(systemName: "xmark.circle")
+                }
+                .buttonStyle(.plain)
+                .help("移除这一层")
+            }
+            HStack(spacing: 8) {
+                Slider(value: Binding(
+                    get: { layer.opacity },
+                    set: { model.setOpacity(of: layer.id, to: $0) }
+                ), in: 0...1)
+                .controlSize(.small)
+                Text("\(Int((layer.opacity * 100).rounded()))%")
+                    .font(.caption)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+                    .frame(width: 38, alignment: .trailing)
+            }
+            Text(layer.detail)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+        }
+        .padding(.vertical, 2)
+    }
+
+    private var symbol: String {
+        switch layer.kind {
+        case .dataset: return "square.stack.3d.up"
+        case .raster: return "photo"
+        case .online: return "globe"
+        }
     }
 }

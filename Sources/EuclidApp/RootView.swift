@@ -236,11 +236,11 @@ struct MapControls: View {
         // 同一个角落，视觉上很重。合成一张后角落只剩「控制卡 + 状态栏」两层，也少一层材质。
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 2) {
-                ControlButton(symbol: "minus", help: "缩小") { model.canvas.zoomOut() }
+                ControlButton(symbol: "minus", help: "缩小（⌘-）") { model.canvas.zoomOut() }
                 Divider().frame(height: 18)
-                ControlButton(symbol: "plus", help: "放大") { model.canvas.zoomIn() }
+                ControlButton(symbol: "plus", help: "放大（⌘=）") { model.canvas.zoomIn() }
                 Divider().frame(height: 18)
-                ControlButton(symbol: "arrow.up.left.and.arrow.down.right", help: "适配窗口") {
+                ControlButton(symbol: "arrow.up.left.and.arrow.down.right", help: "适配窗口（⌘0）") {
                     model.canvas.fit()
                 }
                 Divider().frame(height: 18)
@@ -316,8 +316,9 @@ struct EmptyStateView: View {
             Button {
                 model.promptForFolder()
             } label: {
-                Text("选择文件夹…")
+                ShortcutButtonLabel(title: "选择文件夹…", shortcut: "⌘O")
             }
+            .help("选择瓦片目录（⌘O）")
             .controlSize(.large)
             .buttonStyle(.borderedProminent)
             .padding(.top, 4)

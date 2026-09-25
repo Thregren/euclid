@@ -20,20 +20,41 @@ struct ViewportSnapshot: Sendable {
 final class TileCanvasNSView: NSView {
     private let overlay = MeasurementOverlay()
 
-    /// 下层：在线底图（作为参考底图）。
-    private let onlineStack = TileLayerStack()
-    /// 上层：本地影像（正在判读/量测的那份）。
-    private let localStack = TileLayerStack()
-    private var dataset: TileDataset?
+    /// 图层栈：按 `MapLayer.id` 存放，显示顺序由模型给的图层列表决定（列表末尾在最上层）。
+    private var stacks: [String: TileLayerStack] = [:]
+    /// 每一层已经装配过的来源签名：只有来源真的变了才重配（改不透明度、调顺序都不重取图）。
+    private var stackSignatures: [String: String] = [:]
+    /// 当前图层列表（下 → 上）。
+    private var layers: [MapLayer] = []
+
+    /// 基准层：测量、存档、相机尺度都以它为准。
+    private var anchorLayer: MapLayer? { layers.first { $0.isAnchor } ?? layers.last }
+    /// 当前主图层（用来定瓦片边长与层级范围）：优先基准层，否则最上面那层。
+    private var primaryStack: TileLayerStack? {
+        if let anchor = anchorLayer, let stack = stacks[anchor.id], stack.isActive { return stack }
+        return orderedStacks.last { $0.isActive }
+    }
+    /// 模型顺序（下 → 上）的栈。
+    private var orderedStacks: [TileLayerStack] {
+        layers.compactMap { stacks[$0.id] }
+    }
+
+    private func makeStack() -> TileLayerStack {
+        let stack = TileLayerStack()
+        stack.needsSync = { [weak self] in self?.syncLayers() }
+        stack.refreshGridAppearance()
+        return stack
+    }
     /// 适配窗口用的默认范围（数据范围算出来之前 / 在线底图）。
-    private var defaultFitRect: CGRect?
     /// 在线底图的适配范围（没有本地数据时用它对齐窗口）。
-    private var onlineFitRect: CGRect?
     /// 数据集已就位但数据范围还在算：这段时间不铺图（见 `setLocal`）。
     private var awaitingExtent = false
     private var extentRect: CGRect?
     private var zoomBounds: ClosedRange<Double> = 0...30
     private var trackingArea: NSTrackingArea?
+    /// 相机是否已经被放到过一个有意义的视野（用户平移缩放、或按数据范围适配过）。
+    /// 用它区分「首次打开的内容」与「用户自己调好的视野」：前者可以自动适配，后者一律不许动。
+    private var viewWasPositioned = false
 
     private enum DragTarget {
         case pan
@@ -90,12 +111,7 @@ final class TileCanvasNSView: NSView {
         layer?.masksToBounds = true
         layer?.backgroundColor = NSColor.underPageBackgroundColor.cgColor
 
-        // 下层在线底图、上层本地影像；两层共用同一个相机，叠加显示时天然同步。
-        for stack in [onlineStack, localStack] {
-            stack.needsSync = { [weak self] in self?.syncLayers() }
-            stack.refreshGridAppearance()
-            layer?.addSublayer(stack.hostLayer)
-        }
+        // 图层栈按需创建（见 `setLayers`），测量标注常驻最上层。
         layer?.addSublayer(overlay.hostLayer)
     }
 
@@ -127,7 +143,7 @@ final class TileCanvasNSView: NSView {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         layer?.backgroundColor = NSColor.underPageBackgroundColor.cgColor
-        for stack in [onlineStack, localStack] { stack.refreshGridAppearance() }
+        for stack in stacks.values { stack.refreshGridAppearance() }
         CATransaction.commit()
     }
 
@@ -164,104 +180,73 @@ final class TileCanvasNSView: NSView {
             - WebMercator.normalizedY(latitude: WebMercator.maxLatitude)
     )
 
-    /// 本地影像层（上层）。传 nil 表示关掉这一层。
-    func setLocal(dataset: TileDataset?, extent: DatasetExtent?) {
-        guard let dataset else {
-            let previousScale = camera.groundMetersPerPoint
-            let hadContent = localStack.isActive || onlineStack.isActive
-            self.dataset = nil
-            localStack.clear()
-            awaitingExtent = false
-            extentRect = nil
-            defaultFitRect = nil
-            refreshCamera(fitRect: nil, defaultZoomLevel: nil)
-            restoreGroundScale(previousScale, when: hadContent)
-            updateAccessibilityLabel()
-            syncLayers()
-            return
-        }
-        self.dataset = dataset
-        localStack.configure(
-            source: dataset.source,
-            name: dataset.name,
-            tileSize: dataset.layout.tileSize,
-            zoomRange: dataset.zoomRange,
-            followsDisplayScale: false,
-            maximumDataZoom: Double(dataset.zoomRange.upperBound)
-        )
-        extentRect = extent?.worldRect
-        defaultFitRect = extent?.worldRect
-        // 数据范围还没算出来时，相机只能停在数据集之外，此刻铺出来的只会是一屏空占位，
-        // 白读磁盘，而且范围一到画面必然整体跳一次。等 `setExtent` 到了再开始铺。
-        awaitingExtent = extent == nil
-        refreshCamera(fitRect: extent?.worldRect, defaultZoomLevel: nil)
-        updateAccessibilityLabel()
-        syncLayers()
-    }
-
-    /// 本地影像层：单幅影像（GeoTIFF / TIFF / 普通图片）。
+    /// 按图层列表装配画布。列表顺序就是显示顺序（末尾在最上层）。
     ///
-    /// 与瓦片数据集走同一条图层栈，区别只有取图来源：那个按 `<z>/<x>/<y>` 读文件，
-    /// 这个按屏幕需要的像素区域现解。范围与坐标系在读文件头时就已经确定，不必等扫描。
-    func setLocal(raster: RasterDataset?) {
-        guard let raster else {
-            setLocal(dataset: nil, extent: nil)
-            return
-        }
-        dataset = nil
-        localStack.configure(
-            source: raster.source,
-            name: raster.name,
-            tileSize: raster.tileSize,
-            zoomRange: raster.zoomRange,
-            followsDisplayScale: false,
-            maximumDataZoom: raster.maximumDataZoom
-        )
-        extentRect = raster.worldRect
-        defaultFitRect = raster.worldRect
-        awaitingExtent = false
-        refreshCamera(fitRect: raster.worldRect, defaultZoomLevel: nil)
-        updateAccessibilityLabel()
-        syncLayers()
-    }
-
-    /// 在线底图层（下层）。传 nil 表示关掉这一层。
-    func setOnline(basemap: OnlineBasemap?, fitRect: CGRect?) {
-        onlineFitRect = fitRect
-        // 开关底图 / 换源之前，先记下当前的地面比例：重配会改动相机里的瓦片边长，
-        // 直接沿用 zoomLevel 会让画面跳一下（那就是「开关底图把视图重置了」）。
-        let hadContent = onlineStack.isActive || localStack.isActive
+    /// - Parameter focus: 需要「适配窗口」的范围；只有第一次出现内容时才会用它自动适配，
+    ///   之后一律保持用户当前的视野（开关图层不该改变视口）。
+    func setLayers(_ newLayers: [MapLayer], focus: CGRect?) {
+        let hadContent = !stacks.isEmpty
         let previousScale = camera.groundMetersPerPoint
-        guard let basemap, basemap.isValid else {
-            onlineStack.clear()
-            refreshCamera(fitRect: nil, defaultZoomLevel: nil)
-            restoreGroundScale(previousScale, when: hadContent)
-            updateAccessibilityLabel()
-            syncLayers()
-            return
+        layers = newLayers
+
+        // 删掉不再需要的层
+        for (id, stack) in stacks where !newLayers.contains(where: { $0.id == id }) {
+            stack.clear()
+            stack.hostLayer.removeFromSuperlayer()
+            stacks[id] = nil
+            stackSignatures[id] = nil
         }
-        onlineStack.datum = basemap.datum
-        onlineStack.configure(
-            source: basemap.makeSource(),
-            name: basemap.name,
-            tileSize: basemap.tileSize,
-            zoomRange: basemap.zoomRange,
-            followsDisplayScale: true,
-            maximumDataZoom: Double(basemap.zoomRange.upperBound),
-            memoryLimitBytes: 256 * 1024 * 1024,
-            maxConcurrentRequests: 24
-        )
+
+        // 装配或更新每一层
+        for layer in newLayers {
+            let stack = stacks[layer.id] ?? makeStack()
+            if stacks[layer.id] == nil {
+                stacks[layer.id] = stack
+                layer_hostAdd(stack)
+            }
+            if stackSignatures[layer.id] != layer.sourceKey {
+                stack.configure(
+                    source: layer.source,
+                    name: layer.name,
+                    tileSize: layer.tileSize,
+                    zoomRange: layer.zoomRange,
+                    followsDisplayScale: layer.followsDisplayScale,
+                    maximumDataZoom: layer.maximumDataZoom,
+                    memoryLimitBytes: layer.memoryLimitBytes,
+                    maxConcurrentRequests: layer.maxConcurrentRequests
+                )
+                stackSignatures[layer.id] = layer.sourceKey
+            }
+            stack.opacity = layer.isVisible ? layer.opacity : 0
+            stack.hostLayer.isHidden = !layer.isVisible
+        }
+
+        // 层序：按列表重新挂一遍（下 → 上），始终在测量标注之下
+        for layer in newLayers {
+            guard let stack = stacks[layer.id] else { continue }
+            stack.hostLayer.removeFromSuperlayer()
+            layer_hostAdd(stack)
+        }
+
+        // 本地数据集的范围还没算出来时先不铺图：此时相机只能停在数据之外，
+        // 铺出来只会是一屏空占位并白读磁盘（范围一到画面还要整体跳一次）。
+        awaitingExtent = layers.contains { $0.kind == .dataset && $0.fitRect == nil }
+
         updateAccessibilityLabel()
+        let focusRect = focus ?? anchorLayer?.fitRect
         if hadContent {
-            // 已经有东西在看：保持当前视野，只是把这一层挂上/换掉。
+            // 已经有内容在看：保持当前视野，只把图层换了。
             refreshCamera(fitRect: nil, defaultZoomLevel: nil)
             restoreGroundScale(previousScale, when: true)
         } else {
-            // 第一次打开在线底图：给一个完整的世界视图（世界范围的中心是 0°,0°）。
-            refreshCamera(fitRect: fitRect ?? Self.worldRect, defaultZoomLevel: 2)
+            refreshCamera(fitRect: focusRect, defaultZoomLevel: focusRect == nil ? 2 : nil)
         }
         syncLayers()
     }
+
+    /// 相机是否已经被放到过一个有意义的视野（用户平移缩放、或按范围适配过）。
+    /// 用它区分「首次出现的内容」与「用户调好的视野」：前者可以自动适配，后者一律不许动。
+    private func markViewPositioned() { viewWasPositioned = true }
 
     /// 重配图层之后把地面比例套回去（`condition` 为假时不动，让首次适配生效）。
     private func restoreGroundScale(_ scale: Double, when condition: Bool) {
@@ -269,21 +254,20 @@ final class TileCanvasNSView: NSView {
         camera = camera.settingGroundMetersPerPoint(scale).clamped(zoomLevelRange: zoomBounds)
     }
 
-    /// 两层的不透明度：把上层影像淡下去就能看到下层的路网做对照。
-    func setLayerOpacity(local: Double, online: Double) {
-        localStack.opacity = local
-        onlineStack.opacity = online
+    /// 把图层栈插到测量标注之下。
+    private func layer_hostAdd(_ stack: TileLayerStack) {
+        layer?.insertSublayer(stack.hostLayer, below: overlay.hostLayer)
     }
 
     /// 依据当前激活的图层重配相机（瓦片边长、缩放上下限，以及可选的窗口适配）。
     private func refreshCamera(fitRect: CGRect?, defaultZoomLevel: Double?) {
         camera.displayScale = displayScale
         camera.viewportSize = bounds.size
-        // 相机里的瓦片边长跟着「上层」走：本地影像按设备像素 1:1，只有在线时才按地图约定。
-        let primary = localStack.isActive ? localStack : onlineStack
-        camera.tilePixelSize = primary.isActive ? primary.cameraTileSize(displayScale: displayScale) : 512
+        // 相机里的瓦片边长跟着主图层走：本地影像按设备像素 1:1，在线才按地图约定。
+        let primary = primaryStack
+        camera.tilePixelSize = primary.map { $0.cameraTileSize(displayScale: displayScale) } ?? 512
 
-        let rect = fitRect ?? (localStack.isActive ? defaultFitRect : nil) ?? onlineFitRect
+        let rect = fitRect ?? (primaryStack != nil ? layers.first(where: { $0.isAnchor })?.fitRect : nil)
         let fitCamera = rect.map {
             MapCamera.fitting(
                 $0,
@@ -294,54 +278,57 @@ final class TileCanvasNSView: NSView {
             )
         } ?? camera.settingZoomLevel(defaultZoomLevel ?? camera.zoomLevel)
 
-        // 上下限取两层的并集：更深的源决定能放多大，浅的那层靠祖先贴图兜底。
-        // 两层都没装配时给一个宽松范围，免得算成空区间（`ClosedRange` 会直接崩）。
+        // 上下限取两层（多图层后是全部图层）的并集：更深的源决定能放多大，浅的那层靠祖先贴图兜底。
+        // 没有图层时给一个宽松范围，免得算成空区间（`ClosedRange` 会直接崩）。
         var upper = 26.0
         var hasActive = false
-        for stack in [onlineStack, localStack] where stack.isActive {
+        for stack in stacks.values where stack.isActive {
             upper = hasActive ? max(upper, stack.zoomLevelRange.upperBound) : stack.zoomLevelRange.upperBound
             hasActive = true
         }
-        let lower = min(max(-2, fitCamera.zoomLevel - 1.2), upper - 0.001)
+        // 只有「真的要重新适配视野」时才按适配层级算下限；否则沿用原下限（否则每开关一次底图，
+        // 能缩小的范围就被当前相机重新收紧一次，看起来就像视野被改动了）。
+        let lower = rect == nil
+            ? min(zoomBounds.lowerBound, upper - 0.001)
+            : min(max(-2, fitCamera.zoomLevel - 1.2), upper - 0.001)
         zoomBounds = lower...upper
         camera = fitCamera.clamped(zoomLevelRange: zoomBounds)
     }
 
     /// 画布是自绘的，给读屏一个可读的名字与当前层级。
     private func updateAccessibilityLabel() {
-        let name = localStack.isActive ? localStack.name : (onlineStack.isActive ? onlineStack.name : "")
+        let name = anchorLayer?.name ?? orderedStacks.last?.name ?? ""
+        let layerCount = orderedStacks.filter(\.isActive).count
         guard !name.isEmpty else {
             setAccessibilityLabel("地图画布，暂无内容")
             setAccessibilityValue(nil)
             return
         }
-        let overlay = (localStack.isActive && onlineStack.isActive) ? "，叠加在线底图" : ""
-        setAccessibilityLabel("地图画布：\(name)\(overlay)")
+        setAccessibilityLabel("地图画布：\(name)" + (layerCount > 1 ? "（\(layerCount) 个图层）" : ""))
         setAccessibilityValue("z\(currentDataZoom)")
     }
 
     /// 本地数据范围算好之后对齐窗口（只影响本地层，不打断已经铺好的其他层）。
     func setExtent(_ extent: DatasetExtent?) {
-        guard dataset != nil else { return }
+        guard layers.contains(where: { $0.kind == .dataset }) else { return }
         awaitingExtent = false
         extentRect = extent?.worldRect
-        defaultFitRect = extent?.worldRect ?? defaultFitRect
         // 范围算失败（nil）也要同步一次，让画面退回默认视图，而不是一直空着。
         guard let extent else {
             syncLayers()
             return
         }
+        markViewPositioned()
         refreshCamera(fitRect: extent.worldRect, defaultZoomLevel: nil)
         syncLayers()
     }
 
     /// 适配窗口：优先本地数据范围，其次在线底图范围。
     func fitToData() {
-        guard localStack.isActive || onlineStack.isActive else { return }
+        markViewPositioned()
+        guard orderedStacks.contains(where: { $0.isActive }) else { return }
         guard !awaitingExtent || extentRect != nil else { return }
-        let rect = (localStack.isActive ? (extentRect ?? defaultFitRect) : nil)
-            ?? onlineFitRect
-            ?? Self.worldRect
+        let rect = anchorLayer?.fitRect ?? extentRect ?? layers.last(where: { $0.fitRect != nil })?.fitRect ?? Self.worldRect
         camera = MapCamera.fitting(
             rect,
             viewportSize: bounds.size,
@@ -354,12 +341,14 @@ final class TileCanvasNSView: NSView {
 
     /// 缩放到指定的世界范围。
     func fitToWorldRect(_ rect: CGRect, padding: Double = 56) {
+        markViewPositioned()
         camera = camera.fitting(rect, padding: padding).clamped(zoomLevelRange: zoomBounds)
         syncLayers()
     }
 
     /// 把相机移动到指定地理坐标（保持当前层级）。
     func goTo(_ coordinate: GeoCoordinate) {
+        markViewPositioned()
         camera.center = WebMercator.normalized(coordinate)
         camera = camera.clamped(zoomLevelRange: zoomBounds)
         syncLayers()
@@ -389,18 +378,20 @@ final class TileCanvasNSView: NSView {
     // MARK: - 缩放控制
 
     func zoomIn(anchor: CGPoint? = nil) {
+        markViewPositioned()
         camera = camera.zoomed(by: 1.6, anchorViewPoint: anchor, zoomLevelRange: zoomBounds)
         syncLayers()
     }
 
     func zoomOut(anchor: CGPoint? = nil) {
+        markViewPositioned()
         camera = camera.zoomed(by: 1 / 1.6, anchorViewPoint: anchor, zoomLevelRange: zoomBounds)
         syncLayers()
     }
 
     func zoomToActualSize() {
-        let primary = localStack.isActive ? localStack : onlineStack
-        guard primary.isActive else { return }
+        markViewPositioned()
+        guard let primary = primaryStack else { return }
         camera = camera.settingZoomLevel(
             primary.maximumDataZoom,
             zoomLevelRange: zoomBounds
@@ -422,7 +413,7 @@ final class TileCanvasNSView: NSView {
         camera = camera.clamped(zoomLevelRange: zoomBounds)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        for stack in [onlineStack, localStack] { stack.hostLayer.frame = bounds }
+        for stack in stacks.values { stack.hostLayer.frame = bounds }
         CATransaction.commit()
         syncLayers()
     }
@@ -440,7 +431,7 @@ final class TileCanvasNSView: NSView {
             let zoom = camera.zoomLevel
             camera = camera.settingZoomLevel(zoom).clamped(zoomLevelRange: zoomBounds)
         }
-        for stack in [onlineStack, localStack] { stack.setContentsScale(CGFloat(scale)) }
+        for stack in stacks.values { stack.setContentsScale(CGFloat(scale)) }
         overlay.setContentsScale(CGFloat(scale))
         refreshOverlay()
         syncLayers()
@@ -448,8 +439,7 @@ final class TileCanvasNSView: NSView {
 
     /// 当前主图层（上层）正在渲染的整数层级。
     private var currentDataZoom: Int {
-        let primary = localStack.isActive ? localStack : onlineStack
-        guard primary.isActive else { return 0 }
+        guard let primary = primaryStack else { return 0 }
         return primary.dataZoom(for: camera)
     }
 
@@ -457,24 +447,25 @@ final class TileCanvasNSView: NSView {
     private func syncLayers() {
         guard bounds.width > 1, bounds.height > 1 else { return }
         camera.viewportSize = bounds.size
-        for stack in [onlineStack, localStack] { stack.updateSortCenter(camera.center) }
+        for stack in stacks.values { stack.updateSortCenter(camera.center) }
 
-        let active = localStack.isActive || onlineStack.isActive
-        guard active, !awaitingExtent else {
-            _ = onlineStack.sync(camera: camera, viewportSize: bounds.size, displayScale: displayScale, showGrid: false)
-            _ = localStack.sync(camera: camera, viewportSize: bounds.size, displayScale: displayScale, showGrid: false)
+        let activeStacks = orderedStacks.filter { $0.isActive }
+        guard !activeStacks.isEmpty, !awaitingExtent else {
+            for stack in stacks.values {
+                _ = stack.sync(camera: camera, viewportSize: bounds.size, displayScale: displayScale, showGrid: false)
+            }
             refreshOverlay()
             reportViewport(visibleTiles: 0)
             return
         }
 
-        // 网格画在最上面那层（你正在判读的那份瓦片）。
-        let gridOwner = localStack.isActive ? localStack : onlineStack
+        // 网格画在基准层（你正在判读的那份瓦片）上。
+        let gridOwner = anchorLayer.flatMap { stacks[$0.id] } ?? activeStacks.last!
         var frames: [TileLayerFrame] = []
         var visibleTiles = 0
         var loadedTiles = 0
         var missingTiles = 0
-        for stack in [onlineStack, localStack] where stack.isActive {
+        for stack in orderedStacks where stack.isActive {
             let frame = stack.sync(
                 camera: camera,
                 viewportSize: bounds.size,
@@ -565,17 +556,17 @@ final class TileCanvasNSView: NSView {
         context.translateBy(x: 0, y: bounds.height)
         context.scaleBy(x: 1, y: -1)
         let overlayWasHidden = overlay.hostLayer.isHidden
-        let gridStates = [onlineStack, localStack].map { $0.gridLayer.isHidden }
+        let gridStates = stacks.values.map { $0.gridLayer.isHidden }
         overlay.hostLayer.isHidden = !includingMeasurements
-        onlineStack.gridLayer.isHidden = true
-        localStack.gridLayer.isHidden = true
+        for stack in stacks.values { stack.gridLayer.isHidden = true }
         let rendered: CGImage? = overlay.withLabelsUprightForOffscreenRender {
             layer?.render(in: context)
             return context.makeImage()
         }
         overlay.hostLayer.isHidden = overlayWasHidden
-        onlineStack.gridLayer.isHidden = gridStates[0]
-        localStack.gridLayer.isHidden = gridStates[1]
+        for (index, stack) in stacks.values.enumerated() where index < gridStates.count {
+            stack.gridLayer.isHidden = gridStates[index]
+        }
         return rendered
     }
 
@@ -652,6 +643,7 @@ final class TileCanvasNSView: NSView {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        markViewPositioned()
         let point = convert(event.locationInWindow, from: nil)
         switch dragTarget {
         case .vertex(let measurementID, let index):
@@ -715,6 +707,7 @@ final class TileCanvasNSView: NSView {
     }
 
     override func otherMouseDragged(with event: NSEvent) {
+        markViewPositioned()
         guard event.buttonNumber == 2, let last = middleDragLastPoint else {
             super.otherMouseDragged(with: event)
             return
@@ -846,6 +839,7 @@ final class TileCanvasNSView: NSView {
     /// - 触摸板双指滚动：平移，按住 ⌘ 时改为缩放；
     /// - 触摸板捏合走 `magnify(with:)`，双击走 `smartMagnify(with:)`。
     override func scrollWheel(with event: NSEvent) {
+        markViewPositioned()
         let point = convert(event.locationInWindow, from: nil)
         let precise = event.hasPreciseScrollingDeltas
         let wantsZoom = !precise || event.modifierFlags.contains(.command)
@@ -865,6 +859,7 @@ final class TileCanvasNSView: NSView {
     }
 
     override func magnify(with event: NSEvent) {
+        markViewPositioned()
         let point = convert(event.locationInWindow, from: nil)
         let factor = 1 + event.magnification
         guard factor > 0.05 else { return }

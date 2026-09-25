@@ -101,6 +101,7 @@ struct Euclid: App {
             Button("从文件载入测量…") {
                 model.loadMeasurementsFromFile()
             }
+            .keyboardShortcut("o", modifiers: [.command, .option])
             Button("在访达中显示测量自动存档") {
                 model.revealMeasurementArchive()
             }
@@ -148,6 +149,9 @@ struct Euclid: App {
                 model.dropPointAtCursor()
             }
             .disabled(!model.hasMapContent)
+            Button("复制指针坐标") { model.copyCursorCoordinate() }
+                .keyboardShortcut("c", modifiers: [.command, .option])
+                .disabled(model.measurements.cursorInfo == nil)
             Divider()
             Button("结束当前测量") {
                 model.measurements.finishDraft()

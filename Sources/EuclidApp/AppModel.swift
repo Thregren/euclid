@@ -35,6 +35,41 @@ final class ViewportState {
     }
 }
 
+/// 画布上的一层：本地数据集、单幅影像或在线源。
+///
+/// 图层自己带齐「怎么取图」的全部参数（来源、瓦片边长、层级范围、显示约定），
+/// 画布只按这个列表装配，因此图层数量与种类都不必在画布里写死。
+struct MapLayer: Identifiable {
+    enum Kind: String {
+        case dataset
+        case raster
+        case online
+    }
+
+    var id: String
+    var kind: Kind
+    var name: String
+    /// 取图来源。
+    var source: any TileImageSource
+    /// 来源签名：只有它变了才重新装配这一层（改不透明度、调顺序都不该重取图）。
+    var sourceKey: String
+    var tileSize: Int
+    var zoomRange: ClosedRange<Int>
+    /// 在线底图按地图约定（瓦片铺满自身像素数），本地影像按设备像素 1:1。
+    var followsDisplayScale: Bool
+    var maximumDataZoom: Double
+    var memoryLimitBytes: Int
+    var maxConcurrentRequests: Int
+    /// 适配窗口用的范围（本地数据 / 影像才有）。
+    var fitRect: CGRect?
+    /// 是不是「基准层」：测量、存档、相机尺度、适配窗口都以它为准。
+    var isAnchor: Bool
+    var opacity: Double = 1
+    var isVisible = true
+    /// 给界面看的副标题（层级范围、像素尺寸之类）。
+    var detail: String
+}
+
 /// SwiftUI 与 AppKit 画布之间的命令通道。
 @MainActor
 @Observable
@@ -56,38 +91,14 @@ final class CanvasController {
         view?.measurementStore = measurements
     }
 
-    func set(dataset: TileDataset?, extent: DatasetExtent?) {
+    /// 按图层列表装配画布（多图层）。
+    func set(layers: [MapLayer], focus: CGRect?) {
         let apply: () -> Void = { [weak self] in
             guard let self else { return }
-            self.view?.setLocal(dataset: dataset, extent: extent)
+            self.view?.setLayers(layers, focus: focus)
         }
         pending = apply
         apply()
-    }
-
-    /// 装配（或关掉）单幅影像图层。
-    func set(raster: RasterDataset?) {
-        let apply: () -> Void = { [weak self] in
-            guard let self else { return }
-            self.view?.setLocal(raster: raster)
-        }
-        pending = apply
-        apply()
-    }
-
-    /// 装配（或关掉）在线底图层。
-    func set(online basemap: OnlineBasemap?, fitRect: CGRect?) {
-        let apply: () -> Void = { [weak self] in
-            guard let self else { return }
-            self.view?.setOnline(basemap: basemap, fitRect: fitRect)
-        }
-        pending = apply
-        apply()
-    }
-
-    /// 两条图层的不透明度。
-    func setLayerOpacity(local: Double, online: Double) {
-        view?.setLayerOpacity(local: local, online: online)
     }
 
     func updateExtent(_ extent: DatasetExtent?) {
@@ -151,15 +162,145 @@ final class AppModel {
         didSet { applyBasemap() }
     }
 
-    /// 本地影像的不透明度：调低就能透过它看到下层的在线底图，用来核对配准。
-    var localLayerOpacity: Double = 1 {
-        didSet { canvas.setLayerOpacity(local: localLayerOpacity, online: onlineLayerOpacity) }
+    /// 画布上的图层（下 → 上）。标记 `isAnchor` 的那层是测量、存档与相机尺度的依据。
+    ///
+    /// 图层的种类与数量都不写死：在线底图、本地瓦片数据集、单幅影像都可以叠，
+    /// 每层各有一条不透明度。
+    private(set) var layers: [MapLayer] = []
+
+    /// 基准层（本地来源）。
+    var anchorLayer: MapLayer? { layers.first { $0.isAnchor } }
+    /// 最上面那层在线底图（界面上的「底图」指的就是它）。
+    var onlineLayer: MapLayer? { layers.last { $0.kind == .online } }
+
+    /// 基准层的不透明度（侧栏「影像不透明度」、检查器里显示的就是它）。
+    var localLayerOpacity: Double {
+        get { anchorLayer?.opacity ?? 1 }
+        set { setOpacity(of: anchorLayer?.id, to: newValue) }
     }
 
     /// 在线底图的不透明度。
-    var onlineLayerOpacity: Double = 1 {
-        didSet { canvas.setLayerOpacity(local: localLayerOpacity, online: onlineLayerOpacity) }
+    var onlineLayerOpacity: Double {
+        get { onlineLayer?.opacity ?? 1 }
+        set { setOpacity(of: onlineLayer?.id, to: newValue) }
     }
+
+    // MARK: - 图层操作
+
+    /// 改某一层的不透明度。
+    func setOpacity(of id: String?, to value: Double) {
+        guard let id, let index = layers.firstIndex(where: { $0.id == id }) else { return }
+        layers[index].opacity = min(max(value, 0), 1)
+        pushLayers()
+    }
+
+    /// 显示 / 隐藏某一层。
+    func setVisible(_ visible: Bool, of id: String) {
+        guard let index = layers.firstIndex(where: { $0.id == id }) else { return }
+        layers[index].isVisible = visible
+        pushLayers()
+    }
+
+    /// 移除某一层。基准层被移除时清掉当前选中项。
+    func removeLayer(_ id: String) {
+        guard let index = layers.firstIndex(where: { $0.id == id }) else { return }
+        let removed = layers.remove(at: index)
+        if removed.isAnchor {
+            selectedSourceID = nil
+            appliedLocalDatasetID = nil
+            extent = nil
+            measurements.clearAll()
+            canvas.refreshOverlay()
+        }
+        if removed.kind == .online, layers.last(where: { $0.kind == .online }) == nil {
+            usesOnlineBasemap = false
+        }
+        pushLayers()
+    }
+
+    /// 调整叠放次序（列表末尾在最上面）。
+    func moveLayer(_ id: String, up: Bool) {
+        guard let index = layers.firstIndex(where: { $0.id == id }) else { return }
+        let target = up ? index + 1 : index - 1
+        guard layers.indices.contains(target) else { return }
+        layers.swapAt(index, target)
+        pushLayers()
+    }
+
+    /// 直接加一层（侧栏「添加本地数据 / 添加在线底图」用）。
+    func addLayer(_ layer: MapLayer) {
+        layers.append(layer)
+        pushLayers()
+        setStatus("已添加图层：\(layer.name)", autoClearAfter: 5)
+    }
+
+    /// 把图层列表推给画布。
+    private func pushLayers() {
+        canvas.set(layers: layers, focus: anchorLayer?.fitRect)
+    }
+
+    /// 由本地来源造一层。
+    func makeLayer(dataset: TileDataset) -> MapLayer {
+        MapLayer(
+            id: dataset.id,
+            kind: .dataset,
+            name: dataset.name,
+            source: dataset.source,
+            sourceKey: "dataset|\(dataset.id)|\(dataset.layout.tileSize)",
+            tileSize: dataset.layout.tileSize,
+            zoomRange: dataset.zoomRange,
+            followsDisplayScale: false,
+            maximumDataZoom: Double(dataset.zoomRange.upperBound),
+            memoryLimitBytes: 512 * 1024 * 1024,
+            maxConcurrentRequests: 8,
+            fitRect: extent?.worldRect,
+            isAnchor: true,
+            detail: "z\(dataset.zoomRange.lowerBound)–z\(dataset.zoomRange.upperBound) · \(dataset.layout.tileSize)px"
+        )
+    }
+
+    /// 由单幅影像造一层。
+    func makeLayer(raster: RasterDataset) -> MapLayer {
+        MapLayer(
+            id: raster.id,
+            kind: .raster,
+            name: raster.name,
+            source: raster.source,
+            sourceKey: "raster|\(raster.id)",
+            tileSize: raster.tileSize,
+            zoomRange: raster.zoomRange,
+            followsDisplayScale: false,
+            maximumDataZoom: raster.maximumDataZoom,
+            memoryLimitBytes: 512 * 1024 * 1024,
+            maxConcurrentRequests: 8,
+            fitRect: raster.worldRect,
+            isAnchor: true,
+            detail: "\(raster.pixelSizeText) · \(raster.isGeoreferenced ? raster.crsName : "未配准")"
+        )
+    }
+
+    /// 由在线底图配置造一层。
+    func makeLayer(basemap: OnlineBasemap) -> MapLayer {
+        MapLayer(
+            id: Self.onlineLayerID,
+            kind: .online,
+            name: basemap.name,
+            source: basemap.makeSource(),
+            sourceKey: "\(basemap.template.id)|\(basemap.template.urlTemplate)|\(basemap.key)|\(basemap.datum.rawValue)",
+            tileSize: basemap.tileSize,
+            zoomRange: basemap.zoomRange,
+            followsDisplayScale: true,
+            maximumDataZoom: Double(basemap.zoomRange.upperBound),
+            memoryLimitBytes: 256 * 1024 * 1024,
+            maxConcurrentRequests: 24,
+            fitRect: extent?.worldRect,
+            isAnchor: false,
+            detail: "在线 · z0–z\(basemap.zoomRange.upperBound)\(basemap.datum == .wgs84 ? "" : " · \(basemap.datum.shortTitle)")"
+        )
+    }
+
+    /// 界面上的在线底图层固定用这个 id（切换源就是替换这一层）。
+    static let onlineLayerID = "online"
 
     let viewport = ViewportState()
     let canvas = CanvasController()
@@ -200,19 +341,28 @@ final class AppModel {
         applyOnlineLayer(force: true)
     }
 
-    /// 装配本地图层。只在数据集真的换了才重装，避免切换底图时把本地层也重取一遍。
+    /// 重建「基准本地层」：只替换标记为 anchor 的那一层，用户另外添加的图层保持不动。
     func applyLocalLayer(force: Bool = false) {
         guard force || selectedSourceID != appliedLocalDatasetID else { return }
         appliedLocalDatasetID = selectedSourceID
+        let previousOpacity = anchorLayer?.opacity ?? 1
+        let previousVisibility = anchorLayer?.isVisible ?? true
+        layers.removeAll { $0.isAnchor }
+        var newLayer: MapLayer?
         if let raster = selectedRaster {
-            canvas.set(raster: raster)
-        } else {
-            canvas.set(dataset: selectedDataset, extent: extent)
+            newLayer = makeLayer(raster: raster)
+        } else if let dataset = selectedDataset {
+            newLayer = makeLayer(dataset: dataset)
         }
-        canvas.setLayerOpacity(local: localLayerOpacity, online: onlineLayerOpacity)
+        if var layer = newLayer {
+            layer.opacity = previousOpacity
+            layer.isVisible = previousVisibility
+            layers.insert(layer, at: 0)   // 本地影像放最下层，参考底图叠在它上面
+        }
+        pushLayers()
     }
 
-    /// 装配在线图层。签名没变就不重装。
+    /// 重建「在线底图层」：签名没变就不动。
     func applyOnlineLayer(force: Bool = false) {
         let basemap = onlineBasemap
         let signature = basemap.map {
@@ -222,15 +372,23 @@ final class AppModel {
         guard force || signature != appliedOnlineSignature else { return }
         appliedOnlineSignature = signature
 
+        let previousOpacity = onlineLayer?.opacity ?? 1
+        let previousVisibility = onlineLayer?.isVisible ?? true
+        layers.removeAll { $0.kind == .online && $0.id == Self.onlineLayerID }
+
         guard let basemap, basemap.invalidReason == nil else {
-            canvas.set(online: nil, fitRect: nil)
             if let reason = basemap?.invalidReason {
                 setStatus(reason, autoClearAfter: 6)
             }
+            pushLayers()
             return
         }
-        canvas.set(online: basemap, fitRect: extent?.worldRect)
-        canvas.setLayerOpacity(local: localLayerOpacity, online: onlineLayerOpacity)
+        var layer = makeLayer(basemap: basemap)
+        layer.opacity = previousOpacity
+        layer.isVisible = previousVisibility
+        layers.append(layer)
+        pushLayers()
+
         var message = "底图：\(basemap.name)"
         if !basemap.attribution.isEmpty { message += " · \(basemap.attribution)" }
         // 偏移基准要说清方向与量级：使用者一眼就能判断基准选得对不对。
@@ -537,6 +695,9 @@ final class AppModel {
             isResolvingExtent = false
             AppModel.trace("extent done \(String(describing: result?.tileCount))")
             extent = result
+            if let result, let index = layers.firstIndex(where: { $0.isAnchor }) {
+                layers[index].fitRect = result.worldRect
+            }
             canvas.updateExtent(result)
             if result == nil {
                 setStatus("未能确定数据范围，已按默认层级显示", autoClearAfter: 6)
@@ -665,6 +826,18 @@ extension AppModel {
     func goToCoordinate(longitude: Double, latitude: Double) {
         let clampedLatitude = min(max(latitude, -89.9), 89.9)
         canvas.goTo(GeoCoordinate(longitude: longitude, latitude: clampedLatitude))
+    }
+
+    /// 复制指针所在坐标（检查器按钮与「工具」菜单共用，快捷键 ⌥⌘C）。
+    func copyCursorCoordinate() {
+        guard let cursor = measurements.cursorInfo else {
+            setStatus("把指针移到地图上再复制坐标")
+            return
+        }
+        copyToClipboard(
+            CoordinateText.decimal(cursor.coordinate, precision: 7),
+            message: "已复制坐标"
+        )
     }
 
     /// 把指针位置记成一个点（快捷键 P）。与「点坐标」工具共用同一份测量数据。
