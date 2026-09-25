@@ -188,6 +188,10 @@ enum DebugBasemapScript {
             if let key = ProcessInfo.processInfo.environment["EUCLID_DEBUG_BASEMAP_KEY"] {
                 model.download.key = key
             }
+            if let raw = ProcessInfo.processInfo.environment["EUCLID_DEBUG_DATUM"],
+               let datum = Datum(rawValue: raw.lowercased()) {
+                model.download.datum = datum
+            }
             if let raw = ProcessInfo.processInfo.environment["EUCLID_DEBUG_LOCAL_OPACITY"],
                let value = Double(raw) {
                 model.localLayerOpacity = min(max(value, 0), 1)
@@ -213,6 +217,27 @@ enum DebugBasemapScript {
             let after = "[basemap] 4 秒后：可见=\(model.viewport.visibleTiles) 已载入=\(model.viewport.loadedTiles) "
                 + "层级=\(model.viewport.dataZoom) 状态=\(model.statusMessage ?? "无")\n"
             FileHandle.standardError.write(Data(after.utf8))
+
+            // 再等一会儿让底图铺满，然后专门记一帧「切换底图之后」的画面。
+            // 缩放脚本的时序都落在切换之前，核对叠加对齐时需要一个切换后的稳定帧。
+            try? await Task.sleep(for: .seconds(6))
+            model.canvas.snapshot(index: 90)
+            let settled = "[basemap] 切换后定格：可见=\(model.viewport.visibleTiles) 已载入=\(model.viewport.loadedTiles) "
+                + "层级=\(model.viewport.dataZoom)\n"
+            FileHandle.standardError.write(Data(settled.utf8))
+
+            // `EUCLID_DEBUG_DATUM_SWITCH=<基准>`：底图铺好之后再改一次基准，
+            // 用来核对「只改基准也要重新装配图层」（改完再定格一帧对比）。
+            guard let switchRaw = ProcessInfo.processInfo.environment["EUCLID_DEBUG_DATUM_SWITCH"],
+                  let switched = Datum(rawValue: switchRaw.lowercased()) else { return }
+            model.download.datum = switched
+            let applied = "[basemap] 切换到基准 \(switched.shortTitle)，图层已重装：\(model.onlineBasemap?.datum.shortTitle ?? "无")\n"
+            FileHandle.standardError.write(Data(applied.utf8))
+            try? await Task.sleep(for: .seconds(4))
+            model.canvas.snapshot(index: 91)
+            let afterSwitch = "[basemap] 换基准后定格：可见=\(model.viewport.visibleTiles) 已载入=\(model.viewport.loadedTiles) "
+                + "状态=\(model.statusMessage ?? "无")\n"
+            FileHandle.standardError.write(Data(afterSwitch.utf8))
         }
     }
 }

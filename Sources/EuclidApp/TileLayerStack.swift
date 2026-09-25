@@ -11,6 +11,8 @@ struct TileLayerFrame {
     var fallback: Int
     var missing: Int
     var tileDisplaySize: CGFloat
+    /// 该图层基准相对 WGS84 的偏移（米，东/北），WGS84 时为 0。
+    var datumOffsetMeters: CGPoint = .zero
 }
 
 /// 一条瓦片图层栈：一个数据源对应一个宿主图层，外加「换层级留旧图顶着」那一整套。
@@ -36,6 +38,10 @@ final class TileLayerStack {
     var opacity: Double = 1 {
         didSet { hostLayer.opacity = Float(min(max(opacity, 0), 1)) }
     }
+
+    /// 数据源的坐标基准。WGS84 之外（GCJ-02 / BD-09）的源，瓦片编号与图形都要按偏移对齐，
+    /// 否则和 WGS84 的正射影像叠加时会差几百米。
+    var datum: Datum = .wgs84
 
     private var provider: TileProvider?
     private var baseTileSize: Double = 512
@@ -177,8 +183,11 @@ final class TileLayerStack {
         }
 
         let zoom = dataZoom(for: camera)
-        guard let columns = camera.tileColumnRange(zoom: zoom),
-              let rows = camera.tileRowRange(zoom: zoom) else {
+        // 取图行列按「偏移后的相机」算：得到的编号是该基准下的瓦片编号。
+        let offset = worldOffset(for: camera)
+        let rangeCamera = self.rangeCamera(camera, offset: offset)
+        guard let columns = rangeCamera.tileColumnRange(zoom: zoom),
+              let rows = rangeCamera.tileRowRange(zoom: zoom) else {
             return nil
         }
         let total = columns.count * rows.count
@@ -231,7 +240,11 @@ final class TileLayerStack {
         for tile in needed {
             let worldX = Double(tile.x) / Double(1 << zoom)
             let worldY = Double(tile.y) / Double(1 << zoom)
-            let origin = camera.layerPoint(forWorldPoint: CGPoint(x: worldX, y: worldY))
+            // 图形本身按偏移后的位置落位，于是该基准的栅格与工作基准的坐标对齐。
+            let origin = camera.layerPoint(forWorldPoint: CGPoint(
+                x: worldX + offset.x,
+                y: worldY + offset.y
+            ))
             let frame = CGRect(x: origin.x, y: origin.y, width: tileDisplaySize, height: tileDisplaySize)
 
             let layer: CALayer
@@ -260,9 +273,9 @@ final class TileLayerStack {
 
         requestMissingTiles(needed: needed, provider: provider)
         applyFallbackImages(needed: needed, provider: provider)
-        updateBackdropFrames(camera: camera)
+        updateBackdropFrames(camera: camera, offset: offset)
         dropBackdropIfSettled(needed: needed)
-        renderGrid(camera: camera, zoom: zoom, visible: showGrid)
+        renderGrid(camera: rangeCamera, offset: offset, zoom: zoom, visible: showGrid)
 
         let frame = TileLayerFrame(
             name: name,
@@ -271,10 +284,35 @@ final class TileLayerStack {
             loaded: layerImageSource.filter { $0.key == $0.value }.count,
             fallback: layerImageSource.count - layerImageSource.filter { $0.key == $0.value }.count,
             missing: missingTiles.count,
-            tileDisplaySize: tileDisplaySize
+            tileDisplaySize: tileDisplaySize,
+            datumOffsetMeters: datumOffsetMeters(for: camera, offset: offset)
         )
-        prefetchSurroundingTiles(camera: camera, needed: needed)
+        prefetchSurroundingTiles(camera: rangeCamera, needed: needed)
         return frame
+    }
+
+    /// 该图层数据源基准相对工作基准（WGS84）的归一化世界偏移。
+    private func worldOffset(for camera: MapCamera) -> CGPoint {
+        guard datum != .wgs84 else { return .zero }
+        let center = WebMercator.coordinate(fromNormalized: camera.center)
+        let shifted = WebMercator.normalized(datum.fromWGS84(center))
+        return CGPoint(x: shifted.x - camera.center.x, y: shifted.y - camera.center.y)
+    }
+
+    /// 算取图行列时用的相机：把中心按偏移移回去，于是行列范围落在该基准的瓦片网格上。
+    private func rangeCamera(_ camera: MapCamera, offset: CGPoint) -> MapCamera {
+        guard offset != .zero else { return camera }
+        var shifted = camera
+        shifted.center = CGPoint(x: camera.center.x - offset.x, y: camera.center.y - offset.y)
+        return shifted
+    }
+
+    /// 基准偏移的米制写法（日志与界面提示用）。
+    private func datumOffsetMeters(for camera: MapCamera, offset: CGPoint) -> CGPoint {
+        guard datum != .wgs84, offset != .zero else { return .zero }
+        let center = WebMercator.coordinate(fromNormalized: camera.center)
+        let ground = WebMercator.groundMetersPerWorldUnit(latitude: center.latitude)
+        return CGPoint(x: offset.x * ground, y: offset.y * ground)
     }
 
     /// 当前相机对应的整数层级（夹到数据源范围内的取值）。
@@ -338,7 +376,7 @@ final class TileLayerStack {
     // MARK: - 祖先贴图兜底
 
     /// 背景层跟着相机走，缩放平移时始终保持与当前层级对齐。
-    private func updateBackdropFrames(camera: MapCamera) {
+    private func updateBackdropFrames(camera: MapCamera, offset: CGPoint) {
         guard !backdropLayers.isEmpty else { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -346,8 +384,8 @@ final class TileLayerStack {
             let count = Double(1 << tile.zoom)
             let size = CGFloat(camera.pixelsPerWorldUnit / count)
             let origin = camera.layerPoint(forWorldPoint: CGPoint(
-                x: Double(tile.x) / count,
-                y: Double(tile.y) / count
+                x: Double(tile.x) / count + offset.x,
+                y: Double(tile.y) / count + offset.y
             ))
             layer.frame = CGRect(x: origin.x, y: origin.y, width: size, height: size)
         }
@@ -548,7 +586,7 @@ final class TileLayerStack {
         }
     }
 
-    private func renderGrid(camera: MapCamera, zoom: Int, visible: Bool) {
+    private func renderGrid(camera: MapCamera, offset: CGPoint, zoom: Int, visible: Bool) {
         guard visible,
               let columns = camera.tileColumnRange(zoom: zoom),
               let rows = camera.tileRowRange(zoom: zoom) else {
@@ -559,12 +597,18 @@ final class TileLayerStack {
         let path = CGMutablePath()
         let count = Double(1 << zoom)
         for column in columns.lowerBound...columns.upperBound + 1 {
-            let x = camera.layerPoint(forWorldPoint: CGPoint(x: Double(column) / count, y: 0)).x
+            let x = camera.layerPoint(forWorldPoint: CGPoint(
+                x: Double(column) / count + offset.x,
+                y: offset.y
+            )).x
             path.move(to: CGPoint(x: x, y: 0))
             path.addLine(to: CGPoint(x: x, y: camera.viewportSize.height))
         }
         for row in rows.lowerBound...rows.upperBound + 1 {
-            let y = camera.layerPoint(forWorldPoint: CGPoint(x: 0, y: Double(row) / count)).y
+            let y = camera.layerPoint(forWorldPoint: CGPoint(
+                x: offset.x,
+                y: Double(row) / count + offset.y
+            )).y
             path.move(to: CGPoint(x: 0, y: y))
             path.addLine(to: CGPoint(x: camera.viewportSize.width, y: y))
         }

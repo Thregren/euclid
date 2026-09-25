@@ -50,6 +50,10 @@ struct InspectorView: View {
                         .truncationMode(.middle)
                 }
                 LabeledContent("层级", value: "z0 – z\(basemap.zoomRange.upperBound)")
+                LabeledContent("坐标基准", value: basemap.datum.title)
+                if basemap.datum != .wgs84 {
+                    LabeledContent("对齐偏移", value: basemap.offsetText(at: model.viewport.center))
+                }
                 if !basemap.attribution.isEmpty {
                     LabeledContent("版权", value: basemap.attribution)
                 }

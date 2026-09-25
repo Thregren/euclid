@@ -911,6 +911,96 @@ do {
     expect(cancelled.downloaded > 0, "取消前应已经落下一部分瓦片")
 }
 
+do {
+    // 偏移基准下的下载计划：瓦片编号要按该基准的网格算。
+    let bounds = GeoBounds(west: 119.30, south: 25.68, east: 119.32, north: 25.70)
+    let plain = try TileDownloadPlan(bounds: bounds, zoomRange: 16...16)
+    let shifted = try TileDownloadPlan(bounds: bounds, zoomRange: 16...16, datum: .gcj02)
+    expect(plain.datum == .wgs84, "默认基准应为 WGS84")
+    expect(shifted.datum == .gcj02, "计划应记录数据源基准")
+    expect(plain.bounds == bounds, "计划记录的范围应仍是用户给的 WGS84 范围")
+    let plainRange = plain.ranges[0]
+    let shiftedRange = shifted.ranges[0]
+    expect(plainRange != shiftedRange, "GCJ-02 计划的瓦片范围应与 WGS84 不同")
+    print("    z16 范围：WGS84 列 \(plainRange.columns) 行 \(plainRange.rows) / "
+        + "GCJ-02 列 \(shiftedRange.columns) 行 \(shiftedRange.rows)")
+    expect(shiftedRange.columns.lowerBound >= plainRange.columns.lowerBound, "GCJ-02 应向东北方向平移列号")
+    expect(shiftedRange.rows.lowerBound <= plainRange.rows.lowerBound, "GCJ-02 应向东北方向平移行号")
+}
+
+section("坐标基准（GCJ-02 / BD-09）")
+
+do {
+    // 境外不做偏移：东京、伦敦、纽约都应与输入完全一致。
+    for coordinate in [
+        GeoCoordinate(longitude: 139.6917, latitude: 35.6895),
+        GeoCoordinate(longitude: -0.1276, latitude: 51.5072),
+        GeoCoordinate(longitude: -74.0060, latitude: 40.7128),
+    ] {
+        let shifted = Datum.gcj02.fromWGS84(coordinate)
+        expectClose(shifted.longitude, coordinate.longitude, accuracy: 1e-12, "境外经度不应偏移")
+        expectClose(shifted.latitude, coordinate.latitude, accuracy: 1e-12, "境外纬度不应偏移")
+    }
+
+    // 境内偏移量级：城区应在百米级，且不应超过 1 km。
+    for coordinate in [
+        GeoCoordinate(longitude: 116.3974, latitude: 39.9093),   // 北京
+        GeoCoordinate(longitude: 121.4737, latitude: 31.2304),   // 上海
+        GeoCoordinate(longitude: 113.2644, latitude: 23.1291),   // 广州
+        GeoCoordinate(longitude: 119.2965, latitude: 26.0745),   // 福州
+    ] {
+        let magnitude = Datum.gcj02.offsetMetersMagnitude(at: coordinate)
+        expect(magnitude > 80 && magnitude < 1000, "GCJ-02 偏移应在百米量级（实际 \(Int(magnitude)) m）")
+    }
+
+    // 往返：WGS84 → GCJ-02 → WGS84，误差应在厘米级（1e-7° ≈ 1.1 cm）。
+    for coordinate in [
+        GeoCoordinate(longitude: 116.3974, latitude: 39.9093),
+        GeoCoordinate(longitude: 119.2965, latitude: 26.0745),
+        GeoCoordinate(longitude: 87.6168, latitude: 43.8256),    // 乌鲁木齐
+    ] {
+        let gcj = Datum.gcj02.fromWGS84(coordinate)
+        let back = Datum.gcj02.toWGS84(gcj)
+        expectClose(back.longitude, coordinate.longitude, accuracy: 1e-7, "GCJ-02 经度往返")
+        expectClose(back.latitude, coordinate.latitude, accuracy: 1e-7, "GCJ-02 纬度往返")
+
+        let bd = Datum.bd09.fromWGS84(coordinate)
+        let backBD = Datum.bd09.toWGS84(bd)
+        expectClose(backBD.longitude, coordinate.longitude, accuracy: 1e-6, "BD-09 经度往返")
+        expectClose(backBD.latitude, coordinate.latitude, accuracy: 1e-6, "BD-09 纬度往返")
+    }
+
+    // 三档基准的一致性：WGS84 不动，GCJ-02 偏移，BD-09 在 GCJ-02 基础上再偏一点。
+    let beijing = GeoCoordinate(longitude: 116.3974, latitude: 39.9093)
+    expect(Datum.wgs84.fromWGS84(beijing) == beijing, "WGS84 基准应为恒等变换")
+    let gcj = Datum.gcj02.fromWGS84(beijing)
+    let bd = Datum.bd09.fromWGS84(beijing)
+    let gcjToBD = DatumShift.gcj02ToBD09(gcj)
+    expectClose(bd.longitude, gcjToBD.longitude, accuracy: 1e-12, "BD-09 应等于 GCJ-02 再偏移")
+    expectClose(bd.latitude, gcjToBD.latitude, accuracy: 1e-12, "BD-09 纬度应与 GCJ-02 偏移一致")
+
+    // 世界坐标偏移（叠加对齐用）：方向合理、量级与米制偏移一致。
+    let worldBase = WebMercator.normalized(beijing)
+    let worldShifted = WebMercator.normalized(Datum.gcj02.fromWGS84(beijing))
+    let worldOffset = CGPoint(x: worldShifted.x - worldBase.x, y: worldShifted.y - worldBase.y)
+    let groundMeters = WebMercator.groundMetersPerWorldUnit(latitude: beijing.latitude)
+    let shiftedMeters = (worldOffset.x * worldOffset.x + worldOffset.y * worldOffset.y).squareRoot() * groundMeters
+    let offsetMeters = Datum.gcj02.offsetMetersMagnitude(at: beijing)
+    expectClose(shiftedMeters, offsetMeters, accuracy: 1, "世界坐标偏移应与米制偏移一致")
+    let offsetVector = Datum.gcj02.offsetMeters(at: beijing)
+    expect(offsetVector.x > 0, "北京一带 GCJ-02 应向东北偏（东向分量为正）")
+
+    // 与公开流传的实现对照：WGS84(116.404, 39.915) 的 GCJ-02 常见结果为 (116.410244, 39.916404)。
+    let reference = Datum.gcj02.fromWGS84(GeoCoordinate(longitude: 116.404, latitude: 39.915))
+    print(String(format: "    WGS84(116.404, 39.915) → GCJ-02(%.6f, %.6f)", reference.longitude, reference.latitude))
+    expectClose(reference.longitude, 116.410244, accuracy: 3e-5, "GCJ-02 经度应与公开实现一致")
+    expectClose(reference.latitude, 39.916404, accuracy: 3e-5, "GCJ-02 纬度应与公开实现一致")
+
+    // 基准的标题与短名要齐（界面直接用）。
+    expect(Datum.allCases.count == 3, "应有三档基准")
+    expect(Datum.allCases.allSatisfy { !$0.title.isEmpty && !$0.shortTitle.isEmpty }, "每档基准都应有名称")
+}
+
 section("在线取图与内存缓存")
 
 /// 造一张最小可解码的 PNG，用于缓存与解码路径的自检。

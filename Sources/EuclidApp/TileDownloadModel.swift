@@ -25,6 +25,14 @@ final class TileDownloadModel {
     var attribution: String = ""
     var terms: String = ""
     var key: String = ""
+    /// 数据源的坐标基准：高德 / 腾讯选 GCJ-02，百度选 BD-09。
+    var datum: Datum = .wgs84 {
+        didSet {
+            guard datum != oldValue else { return }
+            // 基准变了，正在看的在线底图要重新装配一次，否则画面还是旧偏移。
+            onSourceChanged?()
+        }
+    }
 
     var bounds = GeoBounds(west: -180, south: -85, east: 180, north: 85)
     var minimumZoom = 12
@@ -191,7 +199,7 @@ final class TileDownloadModel {
     /// 当前参数下的下载计划；参数不合法时给出原因。
     var planResult: Result<TileDownloadPlan, TileDownloadError> {
         do {
-            return .success(try TileDownloadPlan(bounds: bounds, zoomRange: zoomRange))
+            return .success(try TileDownloadPlan(bounds: bounds, zoomRange: zoomRange, datum: datum))
         } catch let error as TileDownloadError {
             return .failure(error)
         } catch {
@@ -250,6 +258,7 @@ final class TileDownloadModel {
             fileExtension: fileExtension,
             subdomains: subdomains,
             key: key.isEmpty ? nil : key,
+            datum: datum,
             overwriteExisting: overwriteExisting,
             concurrency: concurrency,
             requestsPerSecond: requestsPerSecond,

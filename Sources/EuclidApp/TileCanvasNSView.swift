@@ -202,6 +202,7 @@ final class TileCanvasNSView: NSView {
             syncLayers()
             return
         }
+        onlineStack.datum = basemap.datum
         onlineStack.configure(
             source: basemap.makeSource(),
             name: basemap.name,
@@ -439,13 +440,20 @@ final class TileCanvasNSView: NSView {
     /// 调试用：`EUCLID_TRACE_VIEW=1` 时把每次渲染的关键数字打到 stderr。
     static func traceView(layer: TileLayerFrame, camera: MapCamera, zoomBounds: ClosedRange<Double>) {
         guard ProcessInfo.processInfo.environment["EUCLID_TRACE_VIEW"] != nil else { return }
-        let line = String(
-            format: "[view] %@ z=%.2f 层级=%d 范围=%.2f…%.2f 需要=%d 已载入=%d 祖先兜底=%d 缺片=%d 瓦片边长=%.0fpt 中心=(%.5f,%.5f)\n",
+        var line = String(
+            format: "[view] %@ z=%.2f 层级=%d 范围=%.2f…%.2f 需要=%d 已载入=%d 祖先兜底=%d 缺片=%d 瓦片边长=%.0fpt 中心=(%.5f,%.5f)",
             layer.name, camera.zoomLevel, layer.zoom,
             zoomBounds.lowerBound, zoomBounds.upperBound,
             layer.needed, layer.loaded, layer.fallback, layer.missing,
             layer.tileDisplaySize, camera.center.x, camera.center.y
         )
+        if layer.datumOffsetMeters != .zero {
+            line += String(
+                format: " 基准偏移=(东 %.0fm, 北 %.0fm)",
+                layer.datumOffsetMeters.x, layer.datumOffsetMeters.y
+            )
+        }
+        line += "\n"
         FileHandle.standardError.write(Data(line.utf8))
     }
     func writeDebugSnapshot(index: Int) {

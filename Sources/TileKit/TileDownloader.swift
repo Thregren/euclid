@@ -94,6 +94,8 @@ public struct TileDownloadOptions: Sendable {
     public var urlTemplate: String
     public var subdomains: [String]
     public var key: String?
+    /// 数据源的坐标基准（影响落盘清单与提示；瓦片编号由计划决定）。
+    public var datum: Datum
     public var fileExtension: String
     /// 落盘布局：默认 `<z>/<x>/<y>.<ext>`，与 WebODM 输出一致，下载完可以直接用本程序打开。
     public var layout: TileLayout
@@ -117,6 +119,7 @@ public struct TileDownloadOptions: Sendable {
         fileExtension: String = "png",
         subdomains: [String] = [],
         key: String? = nil,
+        datum: Datum = .wgs84,
         layout: TileLayout = .webODM,
         overwriteExisting: Bool = false,
         concurrency: Int = 6,
@@ -133,6 +136,7 @@ public struct TileDownloadOptions: Sendable {
         self.fileExtension = fileExtension
         self.subdomains = subdomains
         self.key = key
+        self.datum = datum
         self.layout = layout
         self.overwriteExisting = overwriteExisting
         self.concurrency = max(1, concurrency)
@@ -445,6 +449,7 @@ public struct TileDownloader: Sendable {
             urlTemplate: options.urlTemplate,
             attribution: options.attribution,
             terms: options.terms,
+            datum: plan.datum,
             bounds: plan.bounds,
             zoomRange: plan.zoomRange,
             fileExtension: options.fileExtension,
@@ -470,6 +475,9 @@ public struct TileDownloader: Sendable {
         if !manifest.attribution.isEmpty { lines.append("- 版权/归属：\(manifest.attribution)") }
         lines.append("- 范围：\(plan.bounds.displayText)")
         lines.append("- 层级：z\(plan.zoomRange.lowerBound)–z\(plan.zoomRange.upperBound)")
+        if plan.datum != .wgs84 {
+            lines.append("- 坐标基准：\(plan.datum.title)（瓦片编号按该基准）")
+        }
         lines.append("- 瓦片：计划 \(plan.totalTileCount) 张，落地 \(summary.downloaded) 张，"
             + "跳过 \(summary.skipped)，缺片 \(summary.missing)，失败 \(summary.failed)")
         if !manifest.terms.isEmpty {
@@ -488,6 +496,8 @@ public struct DownloadManifest: Codable, Sendable {
     public var urlTemplate: String
     public var attribution: String
     public var terms: String
+    /// 旧清单里可能没有这一项。
+    public var datum: Datum?
     public var bounds: GeoBounds
     public var zoomRange: ClosedRange<Int>
     public var fileExtension: String

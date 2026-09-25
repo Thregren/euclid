@@ -255,24 +255,47 @@ public struct TileRange: Hashable, Sendable {
 /// 只保存每层的范围而不是逐个瓦片，超大范围也不会先把内存吃满；
 /// 具体瓦片在下载时逐层展开。
 public struct TileDownloadPlan: Hashable, Sendable {
+    /// 用户给的范围（工作基准 WGS84）。
     public let bounds: GeoBounds
+    /// 数据源所用的坐标基准。
+    public let datum: Datum
     public let zoomRange: ClosedRange<Int>
     public let ranges: [TileRange]
 
-    public init(bounds: GeoBounds, zoomRange: ClosedRange<Int>) throws {
+    public init(bounds: GeoBounds, zoomRange: ClosedRange<Int>, datum: Datum = .wgs84) throws {
         guard bounds.isValid else { throw TileDownloadError.invalidBounds }
         guard zoomRange.lowerBound >= 0, zoomRange.upperBound <= 30,
               zoomRange.lowerBound <= zoomRange.upperBound else {
             throw TileDownloadError.invalidZoomRange
         }
+        // 数据源若在偏移基准上（GCJ-02 / BD-09），要取的是「该基准下覆盖同一片地面」的瓦片：
+        // 先把范围换算到该基准，再照常算行列范围。
+        let tileBounds = datum == .wgs84 ? bounds : Self.shifted(bounds, to: datum)
         var list: [TileRange] = []
         for zoom in zoomRange {
-            list.append(Self.tileRange(bounds: bounds, zoom: zoom))
+            list.append(Self.tileRange(bounds: tileBounds, zoom: zoom))
         }
         guard !list.isEmpty else { throw TileDownloadError.emptyPlan }
         self.bounds = bounds
+        self.datum = datum
         self.zoomRange = zoomRange
         self.ranges = list
+    }
+
+    /// 把范围按基准偏移后的包围盒（四个角分别换算再取并集）。
+    static func shifted(_ bounds: GeoBounds, to datum: Datum) -> GeoBounds {
+        let corners = [
+            GeoCoordinate(longitude: bounds.west, latitude: bounds.south),
+            GeoCoordinate(longitude: bounds.east, latitude: bounds.south),
+            GeoCoordinate(longitude: bounds.east, latitude: bounds.north),
+            GeoCoordinate(longitude: bounds.west, latitude: bounds.north),
+        ].map { datum.fromWGS84($0) }
+        return GeoBounds(
+            west: corners.map(\.longitude).min() ?? bounds.west,
+            south: corners.map(\.latitude).min() ?? bounds.south,
+            east: corners.map(\.longitude).max() ?? bounds.east,
+            north: corners.map(\.latitude).max() ?? bounds.north
+        )
     }
 
     /// 计算某一层级上被包围盒覆盖的瓦片行列范围。

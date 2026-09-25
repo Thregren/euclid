@@ -8,11 +8,29 @@ import TileKit
 struct OnlineBasemap: Hashable, Sendable {
     var template: TileSourceTemplate
     var key: String
+    /// 数据源的坐标基准：高德 / 腾讯要选 GCJ-02，百度选 BD-09，其余保持 WGS84。
+    var datum: Datum = .wgs84
 
     var name: String { template.name }
     var attribution: String { template.attribution }
     var terms: String { template.terms }
     var needsKey: Bool { template.needsKey }
+    /// 相对 WGS84 的偏移（紧凑写法，检查器用）。
+    func offsetText(at coordinate: GeoCoordinate) -> String {
+        guard datum != .wgs84 else { return "无偏移" }
+        let meters = datum.offsetMeters(at: coordinate)
+        return String(format: "东 %.0f m · 北 %.0f m", meters.x, meters.y)
+    }
+
+    /// 相对 WGS84 的偏移提示（用于界面说明）。
+    func offsetHint(at coordinate: GeoCoordinate) -> String {
+        guard datum != .wgs84 else { return "" }
+        let meters = datum.offsetMeters(at: coordinate)
+        return String(
+            format: "%@ 相对 WGS84 向东 %.0f m、向北 %.0f m",
+            datum.shortTitle, meters.x, meters.y
+        )
+    }
     var tileSize: Int { max(1, template.tileSize) }
     var zoomRange: ClosedRange<Int> { 0...max(0, min(30, template.maximumZoom)) }
 

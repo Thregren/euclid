@@ -30,6 +30,21 @@ struct SidebarView: View {
                                     .controlSize(.small)
                             }
                         }
+                        Picker("坐标基准", selection: Bindable(model.download).datum) {
+                            ForEach(Datum.allCases) { datum in
+                                Text(datum.shortTitle).tag(datum)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        .help("底图所在的大地基准：高德 / 腾讯选 GCJ-02、百度选 BD-09，选错会整体差几百米")
+
+                        if basemap.datum != .wgs84 {
+                            Text("已按 \(basemap.datum.shortTitle) 对齐：\(basemap.offsetText(at: model.viewport.center))")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+
                         opacityRow("底图不透明度", value: $model.onlineLayerOpacity)
                         if let reason = basemap.invalidReason {
                             Label(reason, systemImage: "exclamationmark.triangle")

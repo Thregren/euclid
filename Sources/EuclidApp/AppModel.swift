@@ -145,7 +145,7 @@ final class AppModel {
     /// 当前在线底图；用本地数据时为 nil。
     var onlineBasemap: OnlineBasemap? {
         guard usesOnlineBasemap else { return nil }
-        return OnlineBasemap(template: download.currentTemplate, key: download.key)
+        return OnlineBasemap(template: download.currentTemplate, key: download.key, datum: download.datum)
     }
 
     /// 界面上是否有可看的内容（本地数据集或在线底图）。
@@ -180,7 +180,8 @@ final class AppModel {
     func applyOnlineLayer(force: Bool = false) {
         let basemap = onlineBasemap
         let signature = basemap.map {
-            "\($0.template.id)|\($0.template.urlTemplate)|\($0.key)"
+            // 基准要进签名：只改基准（模板与密钥都没动）时也得重装图层，否则偏移不会生效。
+            "\($0.template.id)|\($0.template.urlTemplate)|\($0.key)|\($0.datum.rawValue)"
         }
         guard force || signature != appliedOnlineSignature else { return }
         appliedOnlineSignature = signature
@@ -194,8 +195,13 @@ final class AppModel {
         }
         canvas.set(online: basemap, fitRect: extent?.worldRect)
         canvas.setLayerOpacity(local: localLayerOpacity, online: onlineLayerOpacity)
-        let suffix = basemap.attribution.isEmpty ? "" : " · \(basemap.attribution)"
-        setStatus("底图：\(basemap.name)\(suffix)", autoClearAfter: 5)
+        var message = "底图：\(basemap.name)"
+        if !basemap.attribution.isEmpty { message += " · \(basemap.attribution)" }
+        // 偏移基准要说清方向与量级：使用者一眼就能判断基准选得对不对。
+        if basemap.datum != .wgs84 {
+            message += " · " + basemap.offsetHint(at: viewport.center)
+        }
+        setStatus(message, autoClearAfter: 5)
     }
 
     var selectedDataset: TileDataset? {
