@@ -6,9 +6,10 @@ struct InspectorView: View {
 
     var body: some View {
         Form {
-            if model.selectedDataset != nil {
+            if model.hasMapContent {
                 CursorCoordinateSection()
                 MeasurementSection()
+                basemapSection
                 datasetSection
                 if let extent = model.extent {
                     extentSection(extent)
@@ -19,7 +20,7 @@ struct InspectorView: View {
                     ContentUnavailableView(
                         "未选择数据集",
                         systemImage: "square.stack.3d.up.slash",
-                        description: Text("打开一个瓦片目录后，这里会显示坐标、测量结果与数据集信息。")
+                        description: Text("打开一个瓦片目录，或在侧栏切到在线底图，这里会显示坐标、测量结果与数据源信息。")
                     )
                 }
             }
@@ -30,6 +31,30 @@ struct InspectorView: View {
     }
 
     // MARK: - 数据集信息
+
+    /// 在线底图信息；用本地数据时不显示。
+    @ViewBuilder
+    private var basemapSection: some View {
+        if let basemap = model.onlineBasemap {
+            Section("在线底图") {
+                LabeledContent("数据源") {
+                    Text(basemap.name)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                LabeledContent("层级", value: "z0 – z\(basemap.zoomRange.upperBound)")
+                if !basemap.attribution.isEmpty {
+                    LabeledContent("版权", value: basemap.attribution)
+                }
+                if !basemap.terms.isEmpty {
+                    Text(basemap.terms)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
 
     @ViewBuilder
     private var datasetSection: some View {

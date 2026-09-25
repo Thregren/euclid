@@ -39,15 +39,13 @@ final class ViewportState {
 @Observable
 final class CanvasController {
     private weak var view: TileCanvasNSView?
-    private var pendingDataset: TileDataset?
-    private var pendingExtent: DatasetExtent?
+    /// 视图还没建好时挂起最后一次装配，`attach` 后立刻补上。
+    private var pending: (() -> Void)?
 
     func attach(_ view: TileCanvasNSView) {
         self.view = view
         view.measurementStore = measurements
-        if let pendingDataset {
-            view.configure(dataset: pendingDataset, extent: pendingExtent)
-        }
+        pending?()
     }
 
     private weak var measurements: MeasurementStore?
@@ -58,13 +56,25 @@ final class CanvasController {
     }
 
     func set(dataset: TileDataset?, extent: DatasetExtent?) {
-        pendingDataset = dataset
-        pendingExtent = extent
-        view?.configure(dataset: dataset, extent: extent)
+        let apply: () -> Void = { [weak self] in
+            guard let self else { return }
+            self.view?.configure(dataset: dataset, extent: extent)
+        }
+        pending = apply
+        apply()
+    }
+
+    /// 切到在线底图。
+    func set(online basemap: OnlineBasemap, fitRect: CGRect?) {
+        let apply: () -> Void = { [weak self] in
+            guard let self else { return }
+            self.view?.configure(online: basemap, fitRect: fitRect)
+        }
+        pending = apply
+        apply()
     }
 
     func updateExtent(_ extent: DatasetExtent?) {
-        pendingExtent = extent
         view?.setExtent(extent)
     }
 
@@ -76,8 +86,11 @@ final class CanvasController {
     func refreshOverlay() { view?.refreshOverlay() }
     func goTo(_ coordinate: GeoCoordinate) { view?.goTo(coordinate) }
     func fit() { view?.fitToData() }
+    func visibleBounds() -> GeoBounds? { view?.visibleGeoBounds() }
     func zoomIn() { view?.zoomIn() }
     func zoomOut(anchor: CGPoint? = nil) { view?.zoomOut(anchor: anchor) }
+    /// 调试用：把画布离屏渲染成 PNG（见 `EUCLID_DEBUG_SNAPSHOT`）。
+    func snapshot(index: Int) { view?.writeDebugSnapshot(index: index) }
     func actualSize() { view?.zoomToActualSize() }
 }
 
@@ -100,10 +113,46 @@ final class AppModel {
     var showTileGrid = false {
         didSet { canvas.setTileGrid(showTileGrid) }
     }
+    /// 在线瓦片下载面板是否展开。
+    var showDownloadSheet = false
+    /// 是否用在线底图。与下载面板共用同一套源参数（预设、模板、密钥），两处永远一致。
+    var usesOnlineBasemap = false {
+        didSet { applyBasemap() }
+    }
 
     let viewport = ViewportState()
     let canvas = CanvasController()
     let measurements = MeasurementStore()
+    let download = TileDownloadModel()
+
+    /// 当前在线底图；用本地数据时为 nil。
+    var onlineBasemap: OnlineBasemap? {
+        guard usesOnlineBasemap else { return nil }
+        return OnlineBasemap(template: download.currentTemplate, key: download.key)
+    }
+
+    /// 界面上是否有可看的内容（本地数据集或在线底图）。
+    var hasMapContent: Bool { selectedDataset != nil || onlineBasemap != nil }
+
+    /// 当前底图的显示名。
+    var basemapName: String {
+        onlineBasemap?.name ?? selectedDataset?.name ?? "未打开"
+    }
+
+    /// 按当前选择刷新画布。
+    func applyBasemap() {
+        guard let basemap = onlineBasemap else {
+            canvas.set(dataset: selectedDataset, extent: extent)
+            return
+        }
+        if let reason = basemap.invalidReason {
+            setStatus(reason, autoClearAfter: 6)
+            return
+        }
+        canvas.set(online: basemap, fitRect: extent?.worldRect)
+        let suffix = basemap.attribution.isEmpty ? "" : " · \(basemap.attribution)"
+        setStatus("底图：\(basemap.name)\(suffix)", autoClearAfter: 5)
+    }
 
     var selectedDataset: TileDataset? {
         datasets.first { $0.id == selectedDatasetID }
@@ -121,6 +170,13 @@ final class AppModel {
 
     init() {
         canvas.bind(measurements: measurements)
+        download.onStatus = { [weak self] message in
+            self?.setStatus(message, autoClearAfter: 6)
+        }
+        download.onSourceChanged = { [weak self] in
+            guard let self, self.usesOnlineBasemap else { return }
+            self.applyBasemap()
+        }
         measurements.onChange = { [weak self] in
             self?.scheduleArchiveSave()
         }
@@ -259,7 +315,7 @@ final class AppModel {
         let generation = scanGeneration
         AppModel.trace("scan start \(url.path(percentEncoded: false))")
         isScanning = true
-        setStatus(nil)
+        setStatus("正在扫描目录…", autoClearAfter: 0)
         Task {
             let found = await Task.detached(priority: .userInitiated) {
                 DatasetLocator.discover(at: url)
@@ -282,13 +338,16 @@ final class AppModel {
         selectedDatasetID = id
         extent = nil
         guard let dataset = datasets.first(where: { $0.id == id }) else {
-            canvas.set(dataset: nil, extent: nil)
+            usesOnlineBasemap = false
             viewport.reset()
             return
         }
-        canvas.set(dataset: dataset, extent: nil)
+        // 选数据集即回到本地数据底图（`usesOnlineBasemap` 的 didSet 会重装画布）。
+        usesOnlineBasemap = false
         measurements.restore(MeasurementArchive.measurements(for: dataset.rootURL.path(percentEncoded: false)))
         canvas.refreshOverlay()
+        // 数据范围要扫完目录才知道，这期间画布先不铺图（在错误位置铺一屏空占位只会闪）。
+        setStatus("正在读取数据范围…", autoClearAfter: 0)
         Task {
             let result = await Task.detached(priority: .userInitiated) {
                 DatasetLocator.extent(of: dataset)
@@ -297,10 +356,16 @@ final class AppModel {
             AppModel.trace("extent done \(String(describing: result?.tileCount))")
             extent = result
             canvas.updateExtent(result)
+            if result == nil {
+                setStatus("未能确定数据范围，已按默认层级显示", autoClearAfter: 6)
+            } else {
+                setStatus(nil)
+            }
             if let result, DebugFixtures.isEnabled {
                 DebugFixtures.populateMeasurements(in: result, store: measurements)
                 canvas.refreshOverlay()
             }
+            DebugZoomScript.runIfRequested(canvas: canvas)
         }
     }
 

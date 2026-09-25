@@ -30,9 +30,12 @@ actor AsyncLimiter {
     }
 }
 
-/// 瓦片图片供应者：LRU 内存缓存 + 并发解码 + 缺片负缓存。
+/// 瓦片图片供应者：LRU 内存缓存 + 并发取图/解码 + 缺片负缓存。
+///
+/// 来源可以是本地目录，也可以是在线服务（见 `TileImageSource`）；
+/// 对上层来说只有「拿到图 / 这片没有」两种结果。
 public actor TileProvider {
-    private let source: DirectoryTileSource
+    private let source: any TileImageSource
     private let memoryLimitBytes: Int
     private let limiter: AsyncLimiter
 
@@ -42,13 +45,21 @@ public actor TileProvider {
     private var inFlight: [SlippyTile: Task<CGImage?, Never>] = [:]
     private var missingTiles: Set<SlippyTile> = []
 
-    public init(source: DirectoryTileSource, memoryLimitBytes: Int = 512 * 1024 * 1024, maxConcurrentDecodes: Int = 6) {
+    public init(
+        source: any TileImageSource,
+        memoryLimitBytes: Int = 512 * 1024 * 1024,
+        maxConcurrentDecodes: Int = 8
+    ) {
         self.source = source
         self.memoryLimitBytes = memoryLimitBytes
         self.limiter = AsyncLimiter(limit: maxConcurrentDecodes)
     }
 
-    public var dataSource: DirectoryTileSource { source }
+    /// 来源能提供的层级范围，供相机夹取缩放用。
+    public var availableZoomRange: ClosedRange<Int> { source.availableZoomRange }
+
+    /// 当前内存缓存里的瓦片数（状态栏 / 自检用）。
+    public var cachedTileCount: Int { cache.count }
 
     /// 取瓦片图片；不存在时返回 nil。
     public func image(for tile: SlippyTile) async -> CGImage? {
@@ -63,7 +74,7 @@ public actor TileProvider {
         let limiter = self.limiter
         let task = Task.detached(priority: .userInitiated) { () -> CGImage? in
             await limiter.acquire()
-            let data = source.data(for: tile)
+            let data = await source.data(for: tile)
             let image = data.flatMap { ImageDecoder.decode($0) }
             await limiter.release()
             return image
@@ -79,6 +90,26 @@ public actor TileProvider {
             missingTiles.insert(tile)
         }
         return image
+    }
+
+    /// 预取一批瓦片（通常是当前视野外面一圈），填进内存缓存让接下来的平移更顺。
+    ///
+    /// 命中缓存或已确认缺片的直接跳过；失败不抛出，也不影响调用方。
+    public func prefetch(_ tiles: [SlippyTile]) async {
+        for tile in tiles {
+            if Task.isCancelled { return }
+            if cache[tile] != nil || missingTiles.contains(tile) { continue }
+            _ = await image(for: tile)
+        }
+    }
+
+    /// 清空缓存与负缓存（切换数据源、外部改动过磁盘文件时用）。
+    public func invalidate() {
+        cache.removeAll()
+        recency.removeAll()
+        cachedBytes = 0
+        missingTiles.removeAll()
+        inFlight.removeAll()
     }
 
     // MARK: - 缓存

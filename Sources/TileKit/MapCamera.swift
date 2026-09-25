@@ -6,6 +6,12 @@ import Foundation
 /// 两个坐标系：
 /// - 世界坐标：归一化 Web Mercator，x 向东、y 向南，范围 `0...1`。
 /// - 视图坐标：NSView 坐标，原点在左下角、y 向上（视图未翻转）。
+///
+/// 关于清晰度：`pixelsPerWorldUnit` 是「每个归一化世界单位占多少个视图点」，
+/// `displayScale` 是「一个视图点对应几个设备像素」（Retina 为 2）。
+/// 缩放层级的定义把两者算进去 —— **整数层级时一张瓦片正好铺满它的原始像素数**，
+/// 也就是一个图像像素对应一个设备像素。这样 Retina 上不会把 512px 的瓦片
+/// 拉伸成 1024px 显示，画面才不发虚。
 public struct MapCamera: Sendable, Equatable {
     /// 视图中心对应的世界坐标。
     public var center: CGPoint
@@ -14,28 +20,45 @@ public struct MapCamera: Sendable, Equatable {
     public var viewportSize: CGSize
     /// 该数据集单个瓦片的像素边长。
     public var tilePixelSize: Double
+    /// 一个视图点对应的设备像素数（Retina = 2，普通屏 = 1）。
+    public var displayScale: Double
 
-    public init(center: CGPoint, pixelsPerWorldUnit: Double, viewportSize: CGSize, tilePixelSize: Double) {
+    public init(
+        center: CGPoint,
+        pixelsPerWorldUnit: Double,
+        viewportSize: CGSize,
+        tilePixelSize: Double,
+        displayScale: Double = 1
+    ) {
         self.center = center
         self.pixelsPerWorldUnit = pixelsPerWorldUnit
         self.viewportSize = viewportSize
         self.tilePixelSize = max(1, tilePixelSize)
+        self.displayScale = max(0.25, displayScale)
     }
 
-    public init(center: CGPoint, zoomLevel: Double, viewportSize: CGSize, tilePixelSize: Double) {
+    public init(
+        center: CGPoint,
+        zoomLevel: Double,
+        viewportSize: CGSize,
+        tilePixelSize: Double,
+        displayScale: Double = 1
+    ) {
         let size = max(1, tilePixelSize)
+        let scale = max(0.25, displayScale)
         self.init(
             center: center,
-            pixelsPerWorldUnit: pow(2, zoomLevel) * size,
+            pixelsPerWorldUnit: pow(2, zoomLevel) * size / scale,
             viewportSize: viewportSize,
-            tilePixelSize: size
+            tilePixelSize: size,
+            displayScale: scale
         )
     }
 
     // MARK: - 缩放
 
     public var zoomLevel: Double {
-        log2(pixelsPerWorldUnit / tilePixelSize)
+        log2(pixelsPerWorldUnit * displayScale / tilePixelSize)
     }
 
     /// 以某个视图点为锚点缩放（锚点下的地理坐标保持不变）。
@@ -55,7 +78,7 @@ public struct MapCamera: Sendable, Equatable {
         var camera = self
         let anchor = anchorViewPoint ?? CGPoint(x: viewportSize.width / 2, y: viewportSize.height / 2)
         let anchorWorld = worldPoint(forViewPoint: anchor)
-        camera.pixelsPerWorldUnit = pow(2, target) * tilePixelSize
+        camera.pixelsPerWorldUnit = pow(2, target) * tilePixelSize / displayScale
         let anchorAfter = camera.viewPoint(forWorldPoint: anchorWorld)
         camera.center.x += (anchorAfter.x - anchor.x) / camera.pixelsPerWorldUnit
         camera.center.y -= (anchorAfter.y - anchor.y) / camera.pixelsPerWorldUnit
@@ -121,7 +144,8 @@ public struct MapCamera: Sendable, Equatable {
             worldRect,
             viewportSize: viewportSize,
             padding: padding,
-            tilePixelSize: tilePixelSize
+            tilePixelSize: tilePixelSize,
+            displayScale: displayScale
         )
     }
 
@@ -170,7 +194,8 @@ public struct MapCamera: Sendable, Equatable {
         _ worldRect: CGRect,
         viewportSize: CGSize,
         padding: Double = 24,
-        tilePixelSize: Double
+        tilePixelSize: Double,
+        displayScale: Double = 1
     ) -> MapCamera {
         let availableWidth = max(1, viewportSize.width - padding * 2)
         let availableHeight = max(1, viewportSize.height - padding * 2)
@@ -181,14 +206,15 @@ public struct MapCamera: Sendable, Equatable {
             center: CGPoint(x: worldRect.midX, y: worldRect.midY),
             pixelsPerWorldUnit: scale,
             viewportSize: viewportSize,
-            tilePixelSize: tilePixelSize
+            tilePixelSize: tilePixelSize,
+            displayScale: displayScale
         )
     }
 
     public func clamped(zoomLevelRange: ClosedRange<Double>) -> MapCamera {
         var camera = self
         let zoom = min(max(zoomLevel, zoomLevelRange.lowerBound), zoomLevelRange.upperBound)
-        camera.pixelsPerWorldUnit = pow(2, zoom) * tilePixelSize
+        camera.pixelsPerWorldUnit = pow(2, zoom) * tilePixelSize / displayScale
         return camera
     }
 }

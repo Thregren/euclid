@@ -51,6 +51,10 @@ struct Euclid: App {
                 model.promptForFolder()
             }
             .keyboardShortcut("o", modifiers: .command)
+            Button("下载在线瓦片…") {
+                model.showDownloadSheet = true
+            }
+            .keyboardShortcut("d", modifiers: [.command, .shift])
         }
         CommandGroup(replacing: .undoRedo) {
             Button("撤销") { model.performUndo() }

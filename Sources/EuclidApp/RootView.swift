@@ -19,8 +19,14 @@ struct RootView: View {
                 .inspectorColumnWidth(min: 240, ideal: 280, max: 360)
         }
         .toolbar { toolbarContent }
+        .sheet(isPresented: $model.showDownloadSheet) {
+            DownloadSheet()
+                .environment(model)
+        }
         .task {
             model.activateInitialDataset()
+            DebugDownloadScript.runIfRequested(model: model)
+            DebugBasemapScript.runIfRequested(model: model)
         }
     }
 
@@ -38,6 +44,15 @@ struct RootView: View {
                 Label("打开瓦片目录", systemImage: "folder")
             }
             .help("打开瓦片目录（⌘O）")
+
+            Button {
+                model.showDownloadSheet = true
+            } label: {
+                Label("下载在线瓦片", systemImage: "square.and.arrow.down.on.square")
+            }
+            .help("从在线瓦片源下载指定范围的瓦片（⌘⇧D）")
+
+            basemapMenu
         }
 
         ToolbarItemGroup(placement: .primaryAction) {
@@ -59,7 +74,7 @@ struct RootView: View {
                 Label("缩小", systemImage: "minus.magnifyingglass")
             }
             .help("缩小（⌘-）")
-            .disabled(model.selectedDataset == nil)
+            .disabled(!model.hasMapContent)
 
             Button {
                 model.canvas.zoomIn()
@@ -67,7 +82,7 @@ struct RootView: View {
                 Label("放大", systemImage: "plus.magnifyingglass")
             }
             .help("放大（⌘=）")
-            .disabled(model.selectedDataset == nil)
+            .disabled(!model.hasMapContent)
 
             Button {
                 model.canvas.fit()
@@ -75,7 +90,7 @@ struct RootView: View {
                 Label("适配窗口", systemImage: "arrow.up.left.and.arrow.down.right")
             }
             .help("适配窗口（⌘0）")
-            .disabled(model.selectedDataset == nil)
+            .disabled(!model.hasMapContent)
 
             Toggle(isOn: Bindable(model).showTileGrid) {
                 Label("瓦片网格", systemImage: "grid")
@@ -87,6 +102,35 @@ struct RootView: View {
             }
             .help("显示检查器（⌘⌥I）")
         }
+    }
+
+    /// 底图切换：本地数据集或某个在线瓦片源。
+    private var basemapMenu: some View {
+        Menu {
+            Picker("底图", selection: Bindable(model).usesOnlineBasemap) {
+                Text("本地数据").tag(false)
+                Text("在线底图").tag(true)
+            }
+            .pickerStyle(.inline)
+            Divider()
+            Picker("在线数据源", selection: Binding(
+                get: { model.download.sourceID },
+                set: { id in
+                    model.download.sourceID = id
+                    model.usesOnlineBasemap = true
+                }
+            )) {
+                ForEach(TileSourceTemplate.presets) { preset in
+                    Text(preset.name).tag(preset.id)
+                }
+            }
+            .pickerStyle(.inline)
+            Divider()
+            Button("下载在线瓦片…") { model.showDownloadSheet = true }
+        } label: {
+            Label(model.basemapName, systemImage: model.onlineBasemap == nil ? "square.stack.3d.up" : "globe")
+        }
+        .help("切换底图：本地数据集或在线瓦片源")
     }
 
     private var toolPicker: some View {
@@ -150,7 +194,7 @@ struct MapScreen: View {
             )
             .ignoresSafeArea(edges: .bottom)
 
-            if model.selectedDataset != nil {
+            if model.hasMapContent {
                 MapControls()
                     .padding(.leading, 16)
                     .padding(.bottom, 16)
@@ -171,7 +215,7 @@ struct MapScreen: View {
             }
         }
         .overlay {
-            if model.selectedDataset == nil {
+            if !model.hasMapContent {
                 EmptyStateView()
             }
         }

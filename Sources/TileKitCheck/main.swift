@@ -1,5 +1,6 @@
 import CoreGraphics
 import Foundation
+import ImageIO
 import TileKit
 
 // 本机没有 XCTest（未安装 Xcode），因此用一个自带断言的最小校验程序。
@@ -137,6 +138,42 @@ let movedUp = camera.translated(byViewDelta: CGPoint(x: 0, y: 100))
 expect(movedUp.center.y > camera.center.y, "内容上移时相机中心南移")
 
 let fitRect = CGRect(x: 0.3, y: 0.4, width: 0.001, height: 0.0008)
+
+// Retina：整数层级时一张瓦片应当正好铺满它的原始像素数（1 图像像素 = 1 设备像素），
+// 否则会把 512px 的瓦片拉成 1024px 显示，画面发虚。
+let retina = MapCamera(
+    center: CGPoint(x: 0.5, y: 0.5),
+    zoomLevel: 15,
+    viewportSize: CGSize(width: 800, height: 600),
+    tilePixelSize: 512,
+    displayScale: 2
+)
+let retinaTilePoints = retina.pixelsPerWorldUnit / Double(1 << 15)
+expectClose(retinaTilePoints, 256, accuracy: 1e-9, "Retina 上整数层级的瓦片占 256 点")
+expectClose(retinaTilePoints * retina.displayScale, 512, accuracy: 1e-9, "Retina 上瓦片 1:1 对应设备像素")
+expectClose(retina.zoomLevel, 15, accuracy: 1e-9, "带设备像素比的层级往返一致")
+let retinaZoomed = retina.zoomed(by: 1.6, zoomLevelRange: 10...20)
+expectClose(retinaZoomed.zoomLevel, 15 + log2(1.6), accuracy: 1e-9, "带设备像素比缩放后层级正确")
+expectClose(retinaZoomed.displayScale, 2, accuracy: 1e-12, "缩放后设备像素比保留")
+// 普通屏上仍然按 512 点铺一张瓦片。
+let plain = MapCamera(
+    center: CGPoint(x: 0.5, y: 0.5),
+    zoomLevel: 15,
+    viewportSize: CGSize(width: 800, height: 600),
+    tilePixelSize: 512
+)
+expectClose(plain.pixelsPerWorldUnit / Double(1 << 15), 512, accuracy: 1e-9, "普通屏整数层级瓦片占 512 点")
+
+// 换屏幕后只改比例尺、不改倍率：视图范围不变，但按新的设备像素比换算。
+let switched = MapCamera(
+    center: retina.center,
+    pixelsPerWorldUnit: pow(2, 15) * 512 / 1,
+    viewportSize: retina.viewportSize,
+    tilePixelSize: 512,
+    displayScale: 1
+)
+expectClose(switched.zoomLevel, 15, accuracy: 1e-9, "普通屏相机层级一致")
+
 let fitCamera = MapCamera.fitting(
     fitRect,
     viewportSize: CGSize(width: 1000, height: 700),
@@ -549,6 +586,437 @@ if CommandLine.arguments.count > 1 {
         expect(source.fileCandidates(for: mid).count == dataset.layout.fileExtensions.count, "\(dataset.name) 生成候选路径")
     }
     expect(discovered.count >= 1, "应在测试目录中找到至少 1 个数据集")
+}
+
+// MARK: - 在线瓦片下载
+
+section("下载计划与模板")
+
+do {
+    // 整幅世界在 z0 上只有一片。
+    let world = GeoBounds(west: -180, south: -85.0511, east: 180, north: 85.0511)
+    let worldPlan = try TileDownloadPlan(bounds: world, zoomRange: 0...0)
+    expect(worldPlan.totalTileCount == 1, "z0 全世界应为 1 片")
+    expect(worldPlan.ranges[0].columns == 0...0 && worldPlan.ranges[0].rows == 0...0, "z0 行列范围应为 0…0")
+
+    // 东半球北半部在 z1 上是 (x=1, y=0) 这一片。
+    let northEast = GeoBounds(west: 0, south: 0, east: 180, north: 85)
+    let halfPlan = try TileDownloadPlan(bounds: northEast, zoomRange: 1...1)
+    expect(halfPlan.ranges[0].columns == 1...1, "z1 东半球列号应为 1")
+    expect(halfPlan.ranges[0].rows == 0...0, "z1 北半球行号应为 0")
+
+    // 边界正好落在瓦片边界上时不该多取一圈。
+    let tileRect = SlippyTile(zoom: 2, x: 1, y: 1).worldRect
+    let exact = GeoBounds(normalizedRect: tileRect)
+    let exactPlan = try TileDownloadPlan(bounds: exact, zoomRange: 2...2)
+    expect(exactPlan.ranges[0].columns == 1...1, "边界对齐时只应取 1 列")
+    expect(exactPlan.ranges[0].rows == 1...1, "边界对齐时只应取 1 行")
+    expectClose(exact.west, WebMercator.coordinate(fromNormalized: CGPoint(x: 0.25, y: 0.25)).longitude,
+                accuracy: 1e-9, "包围盒西边界")
+
+    // 层级越深，覆盖同一范围需要的瓦片越多；每层瓦片数应严格递增。
+    let city = GeoBounds(west: 119.30, south: 25.68, east: 119.52, north: 25.86)
+    let plan = try TileDownloadPlan(bounds: city, zoomRange: 12...16)
+    var previous = 0
+    for range in plan.ranges {
+        expect(range.count > previous, "z\(range.zoom) 的瓦片数应比上一层多")
+        previous = range.count
+    }
+    expect(plan.totalTileCount == plan.ranges.reduce(0) { $0 + $1.count }, "总数应等于各层之和")
+    expect(plan.ranges.map(\.zoom) == [12, 13, 14, 15, 16], "各层应按升序展开")
+
+    // 展开顺序从范围中心开始，中途取消时中间区域先可用。
+    let firstTile = plan.tiles(for: plan.ranges[0])[0]
+    let centerColumn = (plan.ranges[0].columns.lowerBound + plan.ranges[0].columns.upperBound) / 2
+    let centerRow = (plan.ranges[0].rows.lowerBound + plan.ranges[0].rows.upperBound) / 2
+    expect(firstTile == SlippyTile(zoom: 12, x: centerColumn, y: centerRow), "第一片应从范围中心开始")
+    expect(Set(plan.allTiles()).count == plan.totalTileCount, "展开的瓦片不应重复")
+
+    expect((try? TileDownloadPlan(bounds: GeoBounds(west: 10, south: 10, east: 5, north: 20), zoomRange: 1...2)) == nil, "西 > 东的包围盒应被拒绝")
+    expect((try? TileDownloadPlan(bounds: world, zoomRange: 28...31)) == nil, "超过 z30 的层级应被拒绝")
+}
+
+do {
+    let tile = SlippyTile(zoom: 14, x: 8000, y: 6000)
+    let xyz = try TileURLTemplate.url(for: tile, template: "https://host.test/{z}/{x}/{y}.png")
+    expect(xyz.absoluteString == "https://host.test/14/8000/6000.png", "XYZ 模板渲染")
+
+    let tmsTile = SlippyTile(zoom: 2, x: 1, y: 1)
+    let tms = try TileURLTemplate.url(for: tmsTile, template: "https://host.test/{z}/{x}/{-y}.png")
+    expect(tms.absoluteString == "https://host.test/2/1/2.png", "TMS 行号渲染")
+
+    let tianditu = try TileURLTemplate.url(
+        for: tile,
+        template: TileSourceTemplate.tiandituImagery.urlTemplate,
+        subdomains: TileSourceTemplate.tiandituImagery.subdomains,
+        key: "abc123"
+    )
+    let text = tianditu.absoluteString
+    expect(text.contains("TILEMATRIX=14") && text.contains("TILEROW=6000") && text.contains("TILECOL=8000"),
+           "WMTS KVP 模板应映射到 z/x/y")
+    expect(text.contains("tk=abc123"), "密钥应写入 URL")
+    expect(TileSourceTemplate.tiandituImagery.subdomains.contains { text.contains("//t\($0).") }, "子域轮转应命中预设列表")
+    expect(TileSourceTemplate.tiandituImagery.needsKey, "天地图预设应标记为需要密钥")
+
+    var keyError: TileDownloadError?
+    do {
+        _ = try TileURLTemplate.url(for: tile, template: TileSourceTemplate.tiandituImagery.urlTemplate, key: nil)
+    } catch let error as TileDownloadError {
+        keyError = error
+    }
+    expect(keyError == .missingKey, "缺少密钥时应报 missingKey")
+
+    var placeholderError: TileDownloadError?
+    do {
+        _ = try TileURLTemplate.url(for: tile, template: "https://host.test/{z}/{x}/{y}/{w}.png")
+    } catch let error as TileDownloadError {
+        placeholderError = error
+    }
+    if case .unknownPlaceholder = placeholderError {} else {
+        expect(false, "未知占位符应被拒绝")
+    }
+
+    var schemeError: TileDownloadError?
+    do {
+        _ = try TileURLTemplate.url(for: tile, template: "ftp://host.test/{z}/{x}/{y}.png")
+    } catch let error as TileDownloadError {
+        schemeError = error
+    }
+    if case .invalidTemplate = schemeError {} else {
+        expect(false, "非 http(s) 模板应被拒绝")
+    }
+
+    var emptyError: TileDownloadError?
+    do {
+        _ = try TileURLTemplate.url(for: tile, template: "   ")
+    } catch let error as TileDownloadError {
+        emptyError = error
+    }
+    expect(emptyError == .emptyTemplate, "空模板应报 emptyTemplate")
+}
+
+section("瓦片下载（假取图通道）")
+
+/// 按 URL 返回预设结果的假取图通道，同时记录调用次数与并发峰值。
+actor FakeTileFetcher: TileFetching {
+    enum Response: Sendable {
+        case ok(Data)
+        case status(Int)
+        /// 前 `failures` 次返回 `code`，之后成功。
+        case flaky(failures: Int, code: Int, data: Data)
+        case transport(String)
+    }
+
+    private var responses: [String: Response]
+    private var calls: [String: Int] = [:]
+    private var inFlight = 0
+    private var peakInFlight = 0
+    private var total = 0
+    private let delay: TimeInterval
+    private let defaultResponse: Response
+
+    init(
+        responses: [String: Response],
+        defaultResponse: Response = .status(404),
+        delay: TimeInterval = 0
+    ) {
+        self.responses = responses
+        self.defaultResponse = defaultResponse
+        self.delay = delay
+    }
+
+    func fetch(_ request: TileRequest) async throws -> TileFetchResult {
+        total += 1
+        inFlight += 1
+        peakInFlight = max(peakInFlight, inFlight)
+        defer { inFlight -= 1 }
+
+        let key = request.url.absoluteString
+        calls[key, default: 0] += 1
+        if delay > 0 { try? await Task.sleep(for: .seconds(delay)) }
+
+        switch responses[key] ?? defaultResponse {
+        case .ok(let data):
+            return TileFetchResult(data: data, statusCode: 200)
+        case .status(let code):
+            throw TileFetchError.httpStatus(code)
+        case .transport(let message):
+            throw TileFetchError.transport(message)
+        case .flaky(let failures, let code, let data):
+            if calls[key, default: 0] <= failures {
+                throw TileFetchError.httpStatus(code)
+            }
+            return TileFetchResult(data: data, statusCode: 200)
+        }
+    }
+
+    func callCount(for url: URL) -> Int { calls[url.absoluteString] ?? 0 }
+    func statistics() -> (total: Int, peakInFlight: Int) { (total, peakInFlight) }
+}
+
+actor ProgressCollector {
+    private var events: [TileDownloadProgress] = []
+    func record(_ progress: TileDownloadProgress) { events.append(progress) }
+    func snapshot() -> [TileDownloadProgress] { events }
+}
+
+do {
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: "euclid-download-check-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let bounds = GeoBounds(west: 119.30, south: 25.68, east: 119.52, north: 25.86)
+    let plan = try TileDownloadPlan(bounds: bounds, zoomRange: 12...13)
+    let tiles = plan.allTiles()
+    let template = "https://tiles.test/{z}/{x}/{y}.png"
+    let payload = Data("tile".utf8)
+
+    // 挑三片做异常样本：一片缺片、一片一直失败、一片先失败两次再成功。
+    let missingTile = tiles[1]
+    let failingTile = tiles[3]
+    let flakyTile = tiles[5]
+    func url(_ tile: SlippyTile) -> URL {
+        try! TileURLTemplate.url(for: tile, template: template)
+    }
+    var responses: [String: FakeTileFetcher.Response] = [:]
+    responses[url(missingTile).absoluteString] = .status(404)
+    responses[url(failingTile).absoluteString] = .status(500)
+    responses[url(flakyTile).absoluteString] = .flaky(failures: 2, code: 503, data: payload)
+
+    // 默认返回正常瓦片，只有上面挑出来的三片走异常分支；
+    // 加一点点延时，并发峰值才看得出来（否则瞬时返回会把并发掩盖掉）。
+    let fetcher = FakeTileFetcher(responses: responses, defaultResponse: .ok(payload), delay: 0.01)
+    let downloader = TileDownloader(fetcher: fetcher)
+    let collector = ProgressCollector()
+    let options = TileDownloadOptions(
+        urlTemplate: template,
+        outputDirectory: root,
+        concurrency: 4,
+        requestsPerSecond: 0,
+        retryLimit: 2,
+        sourceName: "自检假源",
+        attribution: "© 自检",
+        terms: "仅用于自检"
+    )
+
+    let summary = try await downloader.run(plan: plan, options: options) { progress in
+        // 回调是 @Sendable 的，交给 actor 收集，避免跨线程访问测试计数器。
+        Task { await collector.record(progress) }
+    }
+
+    print("    计划 \(plan.totalTileCount) 片：成功 \(summary.downloaded)、跳过 \(summary.skipped)、"
+        + "缺片 \(summary.missing)、失败 \(summary.failed)")
+    // 三片样本里：404 计为缺片、一直 500 的计为失败，先失败后成功的第三片最终仍然落盘。
+    expect(summary.downloaded == tiles.count - 2, "除缺片与失败各一片外都应下载成功（实际 \(summary.downloaded) / \(tiles.count)）")
+    expect(summary.missing == 1, "404 应计为缺片")
+    expect(summary.failed == 1, "一直失败的那片应计为失败")
+    expect(summary.bytes == summary.downloaded * payload.count, "字节数应等于成功瓦片之和")
+    expect(!summary.cancelled, "正常结束不应标记为取消")
+    expect(summary.failures.count == 1, "失败样例应被记录")
+
+    let flakyCalls = await fetcher.callCount(for: url(flakyTile))
+    expect(flakyCalls == 3, "前两次失败后第三次成功（实际 \(flakyCalls) 次）")
+    let failingCalls = await fetcher.callCount(for: url(failingTile))
+    expect(failingCalls == 3, "重试上限 2 表示最多请求 3 次（实际 \(failingCalls) 次）")
+
+    let statistics = await fetcher.statistics()
+    expect(statistics.peakInFlight <= 4, "并发峰值不应超过设定值（实际 \(statistics.peakInFlight)）")
+    expect(statistics.peakInFlight >= 2, "并发调度应真的并行取图")
+
+    // 落盘路径应是 <z>/<x>/<y>.png。
+    let sampleTile = tiles[0]
+    let samplePath = root.appending(path: "12/\(sampleTile.x)/\(sampleTile.y).png")
+    expect(FileManager.default.fileExists(atPath: samplePath.path(percentEncoded: false)), "瓦片应写到 <z>/<x>/<y>.png")
+
+    let progressEvents = await collector.snapshot()
+    expect(progressEvents.first?.total == plan.totalTileCount, "首个进度事件应带上总数")
+    expect(progressEvents.map(\.completed) == progressEvents.map(\.completed).sorted(), "进度应单调递增")
+    expect(progressEvents.last?.completed == plan.totalTileCount, "最后一个进度事件应完成全部瓦片")
+
+    // 落盘清单：source.json 可解码，attribution.txt 带上条款。
+    let manifestURL = root.appending(path: "source.json")
+    if let data = try? Data(contentsOf: manifestURL) {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let manifest = try? decoder.decode(DownloadManifest.self, from: data)
+        expect(manifest?.tileCount == plan.totalTileCount, "清单应记录计划瓦片数")
+        expect(manifest?.sourceName == "自检假源", "清单应记录数据源名称")
+        expect(manifest?.zoomRange == 12...13, "清单应记录层级范围")
+    } else {
+        expect(false, "应写出 source.json")
+    }
+    let attribution = (try? String(contentsOf: root.appending(path: "attribution.txt"), encoding: .utf8)) ?? ""
+    expect(attribution.contains("自检假源") && attribution.contains("仅用于自检"), "attribution.txt 应带上来源与条款")
+
+    // 下载结果应能被本程序的目录嗅探直接识别成数据集。
+    if let dataset = DatasetLocator.makeDataset(at: root) {
+        expect(dataset.zoomRange == 12...13, "下载目录应被识别为 z12–z13 数据集")
+    } else {
+        expect(false, "下载目录应能被识别为数据集")
+    }
+
+    // 第二次运行默认跳过已存在的瓦片，且不再发请求。
+    let beforeSecondRun = await fetcher.statistics().total
+    let second = try await downloader.run(plan: plan, options: options)
+    let afterSecondRun = await fetcher.statistics().total
+    expect(second.skipped == summary.downloaded, "已存在的瓦片应被跳过")
+    expect(second.downloaded == 0, "已有文件时不应重复下载")
+    expect(second.missing == 1 && second.failed == 1, "缺片与失败的那两片会再次尝试")
+    expect(afterSecondRun - beforeSecondRun <= 4, "跳过时不应重新请求已有瓦片")
+
+    // 换一种落盘布局：yFirst + TMS 行序。
+    let transposedRoot = root.appending(path: "transposed")
+    var layout = TileLayout.webODM
+    layout.directoryAxis = .yFirst
+    layout.rowOrigin = .south
+    var transposed = options
+    transposed.layout = layout
+    transposed.outputDirectory = transposedRoot
+    transposed.overwriteExisting = true
+    _ = try await downloader.run(plan: plan, options: transposed)
+    let transposedTile = tiles[0]
+    let row = (1 << transposedTile.zoom) - 1 - transposedTile.y
+    let transposedPath = transposedRoot.appending(path: "\(transposedTile.zoom)/\(row)/\(transposedTile.x).png")
+    expect(FileManager.default.fileExists(atPath: transposedPath.path(percentEncoded: false)), "yFirst + TMS 布局应写成 <z>/<行>/<列>.png")
+}
+
+do {
+    // 取消：慢速取图，跑一小会儿就取消，应尽快停下并标记 cancelled。
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: "euclid-download-cancel-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let plan = try TileDownloadPlan(
+        bounds: GeoBounds(west: 119.0, south: 25.4, east: 119.9, north: 26.1),
+        zoomRange: 12...12
+    )
+    expect(plan.totalTileCount > 8, "取消测试的范围应包含足够多的瓦片")
+
+    let fetcher = FakeTileFetcher(responses: [:], defaultResponse: .ok(Data("tile".utf8)), delay: 0.05)
+    let downloader = TileDownloader(fetcher: fetcher)
+    let options = TileDownloadOptions(
+        urlTemplate: "https://tiles.test/{z}/{x}/{y}.png",
+        outputDirectory: root,
+        concurrency: 4,
+        requestsPerSecond: 0,
+        retryLimit: 0,
+        writesManifest: false
+    )
+    let task = Task { try await downloader.run(plan: plan, options: options) }
+    try? await Task.sleep(for: .seconds(0.2))
+    task.cancel()
+    let cancelled = try await task.value
+    expect(cancelled.cancelled, "取消后应标记 cancelled")
+    expect(cancelled.downloaded < plan.totalTileCount, "取消后不应下载完所有瓦片")
+    expect(cancelled.downloaded > 0, "取消前应已经落下一部分瓦片")
+}
+
+section("在线取图与内存缓存")
+
+/// 造一张最小可解码的 PNG，用于缓存与解码路径的自检。
+func makeCheckPNG(size: Int = 8) -> Data? {
+    guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+          let context = CGContext(
+              data: nil,
+              width: size,
+              height: size,
+              bitsPerComponent: 8,
+              bytesPerRow: 0,
+              space: space,
+              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+          ),
+          let image = context.makeImage() else { return nil }
+    let data = NSMutableData()
+    guard let destination = CGImageDestinationCreateWithData(data, "public.png" as CFString, 1, nil) else {
+        return nil
+    }
+    CGImageDestinationAddImage(destination, image, nil)
+    guard CGImageDestinationFinalize(destination) else { return nil }
+    return data as Data
+}
+
+do {
+    // 在线来源：模板渲染、失败重试、层级越界、缺密钥判定。
+    let template = TileSourceTemplate(
+        id: "check-online",
+        name: "自检在线源",
+        urlTemplate: "https://tiles.test/{z}/{x}/{y}.png",
+        fileExtension: "png",
+        maximumZoom: 10,
+        tileSize: 256
+    )
+    let payload = Data("tile".utf8)
+    let tile = SlippyTile(zoom: 8, x: 12, y: 34)
+    let url = try TileURLTemplate.url(for: tile, template: template.urlTemplate)
+    let fetcher = FakeTileFetcher(
+        responses: [url.absoluteString: .flaky(failures: 1, code: 503, data: payload)],
+        defaultResponse: .status(404)
+    )
+    let source = RemoteTileSource(template: template, key: nil, fetcher: fetcher, retryLimit: 1)
+    expect(source.availableZoomRange == 0...10, "在线源层级范围应取自模板")
+    expect(source.isValid, "模板非空时应判定为可用")
+    expect(await source.data(for: tile) == payload, "先 503 后成功：应重试一次并拿到数据")
+    expect(await fetcher.callCount(for: url) == 2, "重试后总请求数应为 2")
+    expect(await source.data(for: SlippyTile(zoom: 11, x: 1, y: 1)) == nil, "超出层级范围应直接返回 nil")
+    expect(await source.data(for: SlippyTile(zoom: 9, x: 1, y: 1)) == nil, "404 应视为没有这一片")
+    expect(!RemoteTileSource(template: TileSourceTemplate.tiandituImagery, key: nil).isValid, "缺密钥的源应判定为不可用")
+    expect(RemoteTileSource(template: TileSourceTemplate.tiandituImagery, key: "abc").isValid, "填了密钥即可用")
+    expect(TileSourceTemplate.presets.allSatisfy { !$0.name.isEmpty }, "每个预设都应有名字")
+    expect(TileSourceTemplate.presets.filter(\.needsKey).allSatisfy { !$0.terms.isEmpty },
+           "需要密钥的预设都应写明使用条款")
+}
+
+do {
+    // 本地目录 + TileProvider：解码、缓存命中、缺片负缓存、预取、失效。
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: "euclid-provider-check-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    guard let png = makeCheckPNG() else {
+        expect(false, "应能生成自检用的 PNG")
+        exit(1)
+    }
+    let layout = TileLayout.webODM
+    let present = SlippyTile(zoom: 8, x: 1, y: 2)
+    let absent = SlippyTile(zoom: 8, x: 9, y: 9)
+    let prefetched = [SlippyTile(zoom: 8, x: 1, y: 3), SlippyTile(zoom: 8, x: 2, y: 2)]
+
+    func write(_ tile: SlippyTile) {
+        let url = root.appending(path: layout.relativePath(for: tile, fileExtension: "png"))
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? png.write(to: url)
+    }
+    func remove(_ tile: SlippyTile) {
+        let url = root.appending(path: layout.relativePath(for: tile, fileExtension: "png"))
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    write(present)
+    let provider = TileProvider(
+        source: DirectoryTileSource(rootURL: root, layout: layout, zoomRange: 8...10),
+        maxConcurrentDecodes: 2
+    )
+    expect(await provider.availableZoomRange == 8...10, "供应者应转发来源的层级范围")
+
+    let image = await provider.image(for: present)
+    expect(image != nil, "本地瓦片应能解码")
+    expect(image?.width == 8, "解码后的图片尺寸应与文件一致")
+    expect(await provider.cachedTileCount == 1, "取过的瓦片应进入内存缓存")
+
+    remove(present)
+    expect(await provider.image(for: present) != nil, "文件删掉后仍应命中内存缓存")
+
+    expect(await provider.image(for: absent) == nil, "不存在的瓦片应返回 nil")
+    write(absent)
+    expect(await provider.image(for: absent) == nil, "缺片会记入负缓存，重建文件前不再回读")
+
+    prefetched.forEach(write)
+    await provider.prefetch(prefetched)
+    expect(await provider.cachedTileCount == 3, "预取应把瓦片放进缓存")
+
+    await provider.invalidate()
+    expect(await provider.cachedTileCount == 0, "失效后缓存应为空")
+    expect(await provider.image(for: absent) != nil, "缓存失效后应重新读取（这时文件已存在）")
 }
 
 // MARK: - 汇总

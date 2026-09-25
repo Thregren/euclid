@@ -3,7 +3,7 @@ import Foundation
 import ImageIO
 
 /// 以散文件目录形式存放的瓦片数据源。
-public struct DirectoryTileSource: Sendable {
+public struct DirectoryTileSource: TileImageSource {
     public let rootURL: URL
     public let layout: TileLayout
     public let zoomRange: ClosedRange<Int>
@@ -24,8 +24,8 @@ public struct DirectoryTileSource: Sendable {
         }
     }
 
-    /// 读取瓦片原始数据；瓦片不存在时返回 nil。会阻塞调用线程，请在后台调用。
-    public func data(for tile: SlippyTile) -> Data? {
+    /// 读取瓦片原始数据；瓦片不存在时返回 nil。**会阻塞调用线程**，请在后台调用。
+    public func blockingData(for tile: SlippyTile) -> Data? {
         for url in fileCandidates(for: tile) {
             if let data = try? Data(contentsOf: url, options: .mappedIfSafe), !data.isEmpty {
                 return data
@@ -34,6 +34,12 @@ public struct DirectoryTileSource: Sendable {
         return nil
     }
 
+    public var availableZoomRange: ClosedRange<Int> { zoomRange }
+
+    /// 协议实现：`TileProvider` 已经在后台任务里调用，这里直接做阻塞读取。
+    public func data(for tile: SlippyTile) async -> Data? {
+        blockingData(for: tile)
+    }
 }
 
 /// 轻量的图片解码工具。

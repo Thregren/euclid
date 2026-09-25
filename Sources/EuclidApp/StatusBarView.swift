@@ -1,67 +1,25 @@
 import SwiftUI
 import TileKit
 
+/// 底部状态栏：当前底图、指针坐标、比例尺、层级、瓦片数、提示与下载进度。
 struct StatusBarView: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
         HStack(spacing: 14) {
-            if let dataset = model.selectedDataset {
-                Label(dataset.name, systemImage: "square.stack.3d.up")
-                    .font(.system(size: 11))
-                    .lineLimit(1)
+            sourceLabel
 
+            if model.hasMapContent {
                 Divider().frame(height: 12)
-
-                if let cursor = model.measurements.cursorInfo {
-                    Label(CoordinateText.decimal(cursor.coordinate), systemImage: "scope")
-                        .font(.system(size: 11))
-                        .monospacedDigit()
-                    Text(CoordinateText.dms(cursor.coordinate))
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                        .monospacedDigit()
-                } else {
-                    Text("移动指针查看坐标")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.tertiary)
-                }
-
+                coordinateReadout
                 Spacer(minLength: 8)
-
-                Text(String(format: "%.3f m/px", model.viewport.metersPerPoint))
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
-
-                Text("z\(model.viewport.dataZoom)")
-                    .font(.system(size: 11, weight: .medium))
-                    .monospacedDigit()
-
-                Text("\(model.viewport.visibleTiles) 片")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
-
-                if !model.measurements.measurements.isEmpty {
-                    Divider().frame(height: 12)
-                    Text("\(model.measurements.measurements.count) 条测量")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                        .monospacedDigit()
-                }
-
-                if let statusMessage = model.statusMessage {
-                    Divider().frame(height: 12)
-                    Text(statusMessage)
-                        .font(.system(size: 11))
-                        .foregroundStyle(.tint)
-                        .lineLimit(1)
-                }
+                readout(String(format: "%.3f m/px", model.viewport.metersPerPoint))
+                readout("z\(model.viewport.dataZoom)", weight: .medium)
+                readout("\(model.viewport.visibleTiles) 片")
+                measurementCount
+                statusMessage
+                downloadProgress
             } else {
-                Text(model.statusMessage ?? "就绪")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
                 Spacer()
             }
         }
@@ -72,6 +30,84 @@ struct StatusBarView: View {
             Rectangle()
                 .fill(.separator.opacity(0.6))
                 .frame(height: 0.5)
+        }
+    }
+
+    // MARK: - 左端：当前看的是什么
+
+    @ViewBuilder
+    private var sourceLabel: some View {
+        if let basemap = model.onlineBasemap {
+            Label(basemap.name, systemImage: "globe")
+                .font(.system(size: 11))
+                .lineLimit(1)
+                .help(basemap.attribution)
+        } else if let dataset = model.selectedDataset {
+            Label(dataset.name, systemImage: "square.stack.3d.up")
+                .font(.system(size: 11))
+                .lineLimit(1)
+        } else {
+            Text(model.statusMessage ?? "就绪")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: - 中间：坐标读取
+
+    @ViewBuilder
+    private var coordinateReadout: some View {
+        if let cursor = model.measurements.cursorInfo {
+            Label(CoordinateText.decimal(cursor.coordinate), systemImage: "scope")
+                .font(.system(size: 11))
+                .monospacedDigit()
+            Text(CoordinateText.dms(cursor.coordinate))
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+        } else {
+            Text("移动指针查看坐标")
+                .font(.system(size: 11))
+                .foregroundStyle(.tertiary)
+        }
+    }
+
+    // MARK: - 右端：读数与提示
+
+    private func readout(_ text: String, weight: Font.Weight = .regular) -> some View {
+        Text(text)
+            .font(.system(size: 11, weight: weight))
+            .foregroundStyle(weight == .medium ? .primary : .secondary)
+            .monospacedDigit()
+    }
+
+    @ViewBuilder
+    private var measurementCount: some View {
+        if !model.measurements.measurements.isEmpty {
+            Divider().frame(height: 12)
+            readout("\(model.measurements.measurements.count) 条测量")
+        }
+    }
+
+    @ViewBuilder
+    private var statusMessage: some View {
+        if let message = model.statusMessage, model.hasMapContent {
+            Divider().frame(height: 12)
+            Text(message)
+                .font(.system(size: 11))
+                .foregroundStyle(.tint)
+                .lineLimit(1)
+        }
+    }
+
+    @ViewBuilder
+    private var downloadProgress: some View {
+        if model.download.isRunning, let progress = model.download.progress {
+            Divider().frame(height: 12)
+            Label("下载 \(progress.completed)/\(progress.total)", systemImage: "arrow.down.circle")
+                .font(.system(size: 11, weight: .medium))
+                .monospacedDigit()
+                .foregroundStyle(.tint)
         }
     }
 }

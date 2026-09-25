@@ -5,7 +5,51 @@ struct SidebarView: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
+        @Bindable var model = model
+
         List(selection: selection) {
+            Section("底图") {
+                Picker("底图", selection: $model.usesOnlineBasemap) {
+                    Text("本地数据").tag(false)
+                    Text("在线底图").tag(true)
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+
+                if model.usesOnlineBasemap {
+                    Picker("数据源", selection: onlineSourceBinding) {
+                        ForEach(TileSourceTemplate.presets) { preset in
+                            Text(preset.name).tag(preset.id)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+
+                    if let basemap = model.onlineBasemap {
+                        if basemap.needsKey {
+                            HStack(spacing: 6) {
+                                TextField("密钥 tk", text: Bindable(model.download).key)
+                                    .textFieldStyle(.roundedBorder)
+                                    .onSubmit { model.applyBasemap() }
+                                Button("应用") { model.applyBasemap() }
+                                    .controlSize(.small)
+                            }
+                        }
+                        if let reason = basemap.invalidReason {
+                            Label(reason, systemImage: "exclamationmark.triangle")
+                                .font(.caption2)
+                                .foregroundStyle(.orange)
+                                .fixedSize(horizontal: false, vertical: true)
+                        } else if !basemap.terms.isEmpty {
+                            Text(basemap.terms)
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+            }
+
             Section("数据源") {
                 if model.datasets.isEmpty {
                     Text(model.isScanning ? "正在扫描…" : "尚未打开数据集")
@@ -72,6 +116,17 @@ struct SidebarView: View {
                 .background(.bar)
             }
         }
+    }
+
+    /// 选在线数据源时顺带打开在线底图，省一步；下载面板与这里共用同一个 `sourceID`。
+    private var onlineSourceBinding: Binding<String> {
+        Binding(
+            get: { model.download.sourceID },
+            set: { id in
+                model.download.sourceID = id
+                model.usesOnlineBasemap = true
+            }
+        )
     }
 
     private var selection: Binding<TileDataset.ID?> {

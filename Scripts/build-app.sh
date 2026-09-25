@@ -17,6 +17,8 @@ if ! swift --version >/dev/null 2>&1; then
 fi
 
 CONFIG="${CONFIG:-release}"
+# UNIVERSAL=1 时产出 arm64 + x86_64 通用二进制（需要 Xcode 工具链，编译时间约翻倍）
+UNIVERSAL="${UNIVERSAL:-0}"
 PRODUCT="Euclid"
 EXECUTABLE="Euclid"
 APP_NAME="尺规"
@@ -26,10 +28,20 @@ APP="$DIST/$APP_NAME.app"
 # 需要时可通过 SWIFT_BUILD_FLAGS 追加参数，例如 --disable-sandbox
 read -r -a EXTRA_FLAGS <<< "${SWIFT_BUILD_FLAGS:-}"
 
-echo "==> 编译（${CONFIG}）"
-swift build -c "$CONFIG" --product "$PRODUCT" "${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"}"
+BUILD_ARGS=(-c "$CONFIG" --product "$PRODUCT")
+ARCH_LABEL=""
+if [ "$UNIVERSAL" = "1" ]; then
+    BUILD_ARGS+=(--arch arm64 --arch x86_64)
+    ARCH_LABEL=", 通用二进制"
+fi
+if [ "${#EXTRA_FLAGS[@]}" -gt 0 ]; then
+    BUILD_ARGS+=("${EXTRA_FLAGS[@]}")
+fi
 
-BIN_PATH="$(swift build -c "$CONFIG" --product "$PRODUCT" --show-bin-path "${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"}")"
+echo "==> 编译（${CONFIG}${ARCH_LABEL}）"
+swift build "${BUILD_ARGS[@]}"
+
+BIN_PATH="$(swift build "${BUILD_ARGS[@]}" --show-bin-path)"
 
 echo "==> 组装 $APP"
 rm -rf "$APP"
