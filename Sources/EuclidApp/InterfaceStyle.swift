@@ -11,13 +11,25 @@ enum InterfaceStyle {
     /// 浮层面板（图层 / 检查器 / 工具条）的圆角：比控制层更大一圈。
     static let panelCornerRadius: CGFloat = 12
     /// 左侧「图层」面板的宽度。
-    static let layersPanelWidth: CGFloat = 236
+    ///
+    /// 252 点：缩略图、13 点的名称、11 点的来源说明、不透明度与勾选框排下来刚好都放得下
+    /// （11 点下副标题需要约 90 点宽，窄了就会把「512px」这类信息截掉）。
+    static let layersPanelWidth: CGFloat = 252
     /// 右侧检查器面板的宽度。
     static let inspectorPanelWidth: CGFloat = 292
     /// 最右侧工具条的宽度。
-    static let toolStripWidth: CGFloat = 44
+    static let toolStripWidth: CGFloat = 46
     /// 控件最小点击高度（macOS 指针输入下仍保证可点）。
-    static let controlHeight: CGFloat = 24
+    ///
+    /// HIG 对按钮给的通行要求是点击区域至少 44×44 点（任何输入方式都适用）；
+    /// macOS 上系统控件的实际高度在 20–28 点之间，画布上的浮层控件再撑到 44 会明显失衡，
+    /// 因此取 26 点高（比系统默认控件还大一点），并由外层留白补足可点范围。
+    static let controlHeight: CGFloat = 26
+    /// 只画一个图标的按钮（勾选框、标题行的 ＋ / ⧉ / ⋯）的可点边长。
+    ///
+    /// 图标本身 13–14 点就够看，但点击区域按 HIG 的取向放大到 24 点，
+    /// 免得「看得见却点不着」。
+    static let iconButtonHitSize: CGFloat = 24
 
     /// 「减少动态效果」是否开启：开启后不做淡入淡出等装饰性动画。
     static var reducesMotion: Bool {

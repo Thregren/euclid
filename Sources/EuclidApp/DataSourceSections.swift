@@ -108,7 +108,7 @@ struct OnlineBasemapSection: View {
                     }
                 }
                 Text("天地图等数据源需要开发者密钥；密钥只放在内存里，退出程序后需要重填。")
-                    .font(.caption)
+                    .font(.subheadline)
                     .foregroundStyle(.secondary)
             }
 
@@ -125,14 +125,14 @@ struct OnlineBasemapSection: View {
                         basemap.offsetHint(at: model.viewport.center),
                         systemImage: "arrow.left.arrow.right"
                     )
-                    .font(.caption)
+                    .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 }
                 if !basemap.attribution.isEmpty {
                     Text(basemap.attribution)
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
@@ -182,7 +182,7 @@ struct RecentDataSection: View {
                                   ? "folder.fill"
                                   : "clock.arrow.circlepath")
                         }
-                        .font(.callout)
+                        .font(.body)
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(model.rootFolder == url ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
@@ -211,13 +211,13 @@ private struct DataSourceRow: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Text(detail)
-                    .font(.caption)
+                    .font(.subheadline)
                     .foregroundStyle(.secondary)
             }
             Spacer(minLength: 4)
             if isSelected {
                 Image(systemName: "checkmark")
-                    .font(.caption.weight(.semibold))
+                    .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.tint)
                     .help("这是当前的基准层")
             }

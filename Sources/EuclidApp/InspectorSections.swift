@@ -16,9 +16,9 @@ struct ShortcutButtonLabel: View {
                 Text(title)
             }
             Text(shortcut)
-                .font(.caption)
+                .font(.subheadline)
                 .monospacedDigit()
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.secondary)
         }
     }
 }
@@ -157,8 +157,8 @@ struct MeasurementSection: View {
                 }
                 .controlSize(.small)
                 Text("改动按数据集 / 影像自动存档，下次打开自动恢复；也可以另存为文件带走。")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
         } header: {
@@ -317,7 +317,7 @@ struct MeasurementSection: View {
                                 .textSelection(.enabled)
                             Spacer()
                         }
-                        .font(.caption)
+                        .font(.subheadline)
                     }
                 }
             }
@@ -337,13 +337,14 @@ struct MeasurementSection: View {
                                 .foregroundStyle(.secondary)
                                 .monospacedDigit()
                             Text(MeasureFormat.compass(segment.bearing))
-                                .foregroundStyle(.tertiary)
+                                .foregroundStyle(.secondary)
                             if let turn = segment.turn {
                                 Text(String(format: "转角 %+.0f°", turn))
-                                    .foregroundStyle(.quaternary)
+                                    // 三级/四级色在浅色下只有 1.9:1 / 1.3:1，数据不能用它们。
+                                    .foregroundStyle(.secondary)
                             }
                         }
-                        .font(.caption)
+                        .font(.subheadline)
                     }
                 }
             }
@@ -422,8 +423,8 @@ struct RadiusField: View {
             }
             .controlSize(.small)
             Text("拖动地图上的半径点，或在这里输入精确半径")
-                .font(.caption)
-                .foregroundStyle(.tertiary)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -474,7 +475,7 @@ struct MeasurementStyleEditor: View {
                 HStack(spacing: 8) {
                     Slider(value: widthBinding, in: 0.5...6)
                     Text(String(format: "%.1f", MeasurementPalette.lineWidth(of: measurement)))
-                        .font(.caption)
+                        .font(.subheadline)
                         .monospacedDigit()
                         .foregroundStyle(.secondary)
                         .frame(width: 26, alignment: .trailing)
@@ -488,7 +489,7 @@ struct MeasurementStyleEditor: View {
                     HStack(spacing: 8) {
                         Slider(value: fillOpacityBinding, in: 0...1)
                         Text("\(Int((MeasurementPalette.fillOpacity(of: measurement) * 100).rounded()))%")
-                            .font(.caption)
+                            .font(.subheadline)
                             .monospacedDigit()
                             .foregroundStyle(.secondary)
                             .frame(width: 34, alignment: .trailing)
@@ -496,8 +497,8 @@ struct MeasurementStyleEditor: View {
                 }
             } else {
                 Text("折线与点没有填充；填充颜色与不透明度对测面积和多边形／圆生效")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
             }
 
             HStack(spacing: 8) {

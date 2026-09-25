@@ -27,7 +27,7 @@ struct TileExportSheet: View {
                     formatSection
                     if let reason = export.blockingReason, !export.isRunning {
                         Label(reason, systemImage: "exclamationmark.triangle")
-                            .font(.caption)
+                            .font(.subheadline)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
@@ -80,17 +80,17 @@ struct TileExportSheet: View {
                 if let raster = export.raster {
                     Text("\(raster.pixelSizeText) px · \(raster.crsName)"
                         + (raster.isGeoreferenced ? "" : " · 未配准（生成的瓦片会按 1 像素 = 1 米摆放）"))
-                        .font(.caption)
+                        .font(.subheadline)
                         .foregroundStyle(.secondary)
                     if let gsd = raster.groundSampleDistance {
                         Text(gsd >= 1
                             ? String(format: "地面分辨率 %.2f 米/像素（最大层级建议 ≤ %d）", gsd, export.maximumZoomLimit)
                             : String(format: "地面分辨率 %.1f 厘米/像素（最大层级建议 ≤ %d）", gsd * 100, export.maximumZoomLimit))
-                            .font(.caption)
+                            .font(.subheadline)
                             .foregroundStyle(.secondary)
                     }
                 } else if let error = export.sourceError {
-                    Text(error).font(.caption).foregroundStyle(.orange)
+                    Text(error).font(.subheadline).foregroundStyle(.orange)
                 }
             }
         }
@@ -103,7 +103,7 @@ struct TileExportSheet: View {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 8) {
                     Text(export.outputDirectory?.path(percentEncoded: false) ?? "未选择")
-                        .font(.caption)
+                        .font(.subheadline)
                         .lineLimit(2)
                         .truncationMode(.middle)
                     Spacer()
@@ -114,8 +114,8 @@ struct TileExportSheet: View {
                     .toggleStyle(.checkbox)
                     .help("默认跳过已存在的瓦片，中断后可以接着跑")
                 Text("落成 `<z>/<x>/<y>.<ext>`，生成完可以直接用本程序打开离线浏览。")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
@@ -134,8 +134,8 @@ struct TileExportSheet: View {
                     .font(.callout)
                     .monospacedDigit()
                 Text("层级每多一级，瓦片数大约翻两番。上限取「一个影像像素对一个瓦片像素」的那一级。")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
@@ -172,8 +172,8 @@ struct TileExportSheet: View {
                     }
                 } else {
                     Text("PNG 无损、保留透明区（无数据的地方不会变成白底），体积约为 JPEG 的八倍。")
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
@@ -210,19 +210,19 @@ struct TileExportSheet: View {
                     Text(summary.cancelled ? "已停止" : "已生成")
                         .font(.callout.weight(.medium))
                     Text("写出 \(summary.written) 张 · 跳过 \(summary.skipped) 张 · 失败 \(summary.failed) 张")
-                        .font(.caption)
+                        .font(.subheadline)
                         .foregroundStyle(.secondary)
                     Text(String(
                         format: "%.1f MB，用时 %.1f 秒",
                         Double(summary.bytes) / 1_000_000, summary.elapsed
                     ))
-                    .font(.caption)
+                    .font(.subheadline)
                     .foregroundStyle(.secondary)
                 }
             }
         } else if let error = export.errorMessage {
             Label(error, systemImage: "exclamationmark.triangle")
-                .font(.caption)
+                .font(.subheadline)
                 .foregroundStyle(.orange)
                 .fixedSize(horizontal: false, vertical: true)
         }

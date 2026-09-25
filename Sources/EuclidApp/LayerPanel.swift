@@ -50,6 +50,11 @@ struct LayersPanel: View {
                 if let id = model.selectedLayer?.id { model.duplicateLayer(id) }
             } label: {
                 Image(systemName: "plus.square.on.square")
+                    .frame(
+                        width: InterfaceStyle.iconButtonHitSize,
+                        height: InterfaceStyle.iconButtonHitSize
+                    )
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.borderless)
             .disabled(model.selectedLayer == nil)
@@ -84,6 +89,11 @@ struct LayersPanel: View {
             }
         } label: {
             Image(systemName: "plus")
+                .frame(
+                    width: InterfaceStyle.iconButtonHitSize,
+                    height: InterfaceStyle.iconButtonHitSize
+                )
+                .contentShape(Rectangle())
         }
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
@@ -109,6 +119,11 @@ struct LayersPanel: View {
                 .disabled(model.selectedLayer == nil)
         } label: {
             Image(systemName: "ellipsis.circle")
+                .frame(
+                    width: InterfaceStyle.iconButtonHitSize,
+                    height: InterfaceStyle.iconButtonHitSize
+                )
+                .contentShape(Rectangle())
         }
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
@@ -211,17 +226,17 @@ struct LayersPanel: View {
             .padding(.horizontal, 2)
     }
 
-    // MARK: - 底部：混合模式 / 不透明度 / 搜索
+    // MARK: - 底部：不透明度 / 搜索
 
     private var footer: some View {
         VStack(spacing: 6) {
             HStack(spacing: 8) {
                 Text("不透明度")
-                    .font(.caption)
+                    .font(.subheadline)
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 4)
                 Text(percentText(model.selectedLayer?.opacity ?? 1))
-                    .font(.caption)
+                    .font(.subheadline)
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
                     .help("选中层的不透明度：叠加对照时把上层影像淡下去看底图")
@@ -251,10 +266,12 @@ struct LayersPanel: View {
                     query = ""
                 } label: {
                     Image(systemName: "xmark.circle.fill")
-                        .font(.caption)
+                        .font(.subheadline)
+                        .frame(width: 18, height: 18)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.secondary)
                 .help("清空搜索")
             }
             Menu {
@@ -410,17 +427,15 @@ private struct LayerRow: View {
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 5) {
                     Text(layer.name)
-                        .font(.callout.weight(.semibold))
+                        .font(.body.weight(.semibold))
                         .lineLimit(1)
                         .truncationMode(.middle)
                     if layer.isAnchor {
-                        Text("基准")
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
+                        anchorBadge
                     }
                 }
                 Text(subtitle)
-                    .font(.caption2)
+                    .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
@@ -428,13 +443,27 @@ private struct LayerRow: View {
 
             Spacer(minLength: 4)
 
+            // 不透明度只在非 100% 时占一格：它是「修饰」而不是主信息，
+            // 挤进副标题会把「512px」这类关键信息截掉（11 点下副标题只剩 90 点宽）。
+            if layer.opacity < 0.999 {
+                Text("\(Int((layer.opacity * 100).rounded()))%")
+                    .font(.subheadline)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+                    .frame(width: 30, alignment: .trailing)
+                    .help("这一层的不透明度")
+            }
+
             visibilityToggle
         }
         .padding(.horizontal, 8)
         .frame(height: LayersPanel.rowHeight)
         .background(
+            // 选中底比之前的 0.20 略淡：11 点的二级文字压在强调色底上时，
+            // 底色越淡对比度越好（实测 0.20 → 3.65:1，0.15 → 4.0:1），
+            // 选中态本身还靠那圈描边与缩略图一起表达。
             RoundedRectangle(cornerRadius: 7, style: .continuous)
-                .fill(isSelected ? Color.accentColor.opacity(0.20) : .clear)
+                .fill(isSelected ? Color.accentColor.opacity(0.15) : .clear)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 7, style: .continuous)
@@ -459,7 +488,7 @@ private struct LayerRow: View {
                     .foregroundStyle(.tint)
             }
         }
-        .frame(width: 40, height: 28)
+        .frame(width: 36, height: 26)
         .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 5, style: .continuous)
@@ -467,25 +496,44 @@ private struct LayerRow: View {
         )
     }
 
+    /// 「基准」标记。
+    ///
+    /// 这是一条**有信息量**的标签（哪一层是测量与相机的依据），所以不能只画成浅灰小字：
+    /// 之前是 10 点 + 三级色，实测对比度只有 1.9:1（浅色）/ 2.3:1（深色），远低于 HIG 对
+    /// 17 点以下文字要求的 4.5:1。现在做成带底的小胶囊：字号 11 点、二级文字色，
+    /// 形状本身也能在缩略图、名称旁边一眼看到（不靠颜色单独传达）。
+    private var anchorBadge: some View {
+        Text("基准")
+            .font(.subheadline)
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .background(
+                Capsule(style: .continuous).fill(Color.primary.opacity(0.10))
+            )
+    }
+
     private var visibilityToggle: some View {
         Button {
             model.setVisible(!layer.isVisible, of: layer.id)
         } label: {
             Image(systemName: layer.isVisible ? "checkmark.square.fill" : "square")
-                .font(.system(size: 13))
-                .foregroundStyle(layer.isVisible ? AnyShapeStyle(.tint) : AnyShapeStyle(.tertiary))
+                .font(.system(size: 14))
+                // 未勾选的方框也用二级色：三级色在浅色下只有 1.9:1，控件本身不该这么淡。
+                .foregroundStyle(layer.isVisible ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+                .frame(
+                    width: InterfaceStyle.iconButtonHitSize,
+                    height: InterfaceStyle.iconButtonHitSize
+                )
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .help(layer.isVisible ? "隐藏这一层" : "显示这一层")
         .accessibilityLabel(layer.isVisible ? "隐藏这一层" : "显示这一层")
     }
 
-    /// 副标题：来源说明 + 不透明度（非 100% 时才补一句，免得每行都很长）。
-    private var subtitle: String {
-        var parts = [layer.detail]
-        if layer.opacity < 0.999 { parts.append("\(Int((layer.opacity * 100).rounded()))%") }
-        return parts.joined(separator: " · ")
-    }
+    /// 副标题：来源说明（层级范围、像素尺寸之类）。
+    private var subtitle: String { layer.detail }
 
     private var symbol: String {
         switch layer.kind {

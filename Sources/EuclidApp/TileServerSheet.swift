@@ -22,7 +22,7 @@ struct TileServerSheet: View {
                     VStack(alignment: .leading, spacing: 8) {
                         HStack(spacing: 8) {
                             Text(server.rootURL?.path(percentEncoded: false) ?? "未选择")
-                                .font(.caption)
+                                .font(.subheadline)
                                 .lineLimit(2)
                                 .truncationMode(.middle)
                             Spacer()
@@ -37,8 +37,8 @@ struct TileServerSheet: View {
                                 .frame(width: 80)
                                 .disabled(server.isRunning)
                             Text("（默认 8766；被占用会提示换一个）")
-                                .font(.caption)
-                                .foregroundStyle(.tertiary)
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -59,17 +59,17 @@ struct TileServerSheet: View {
                         }
                         Text("在别的工具里填这一行即可（OSM 在线编辑器：背景设置 → 自定义 → 粘贴）。"
                             + "只监听 127.0.0.1，别的机器连不上；服务是只读的，只响应瓦片路径。")
-                            .font(.caption)
+                            .font(.subheadline)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                         if server.isRunning {
                             Label("正在提供：\(server.rootName) · 已响应 \(server.servedRequests) 次请求",
                                   systemImage: "checkmark.circle")
-                                .font(.caption)
+                                .font(.subheadline)
                                 .foregroundStyle(.secondary)
                         } else if let error = server.errorMessage {
                             Label(error, systemImage: "exclamationmark.triangle")
-                                .font(.caption)
+                                .font(.subheadline)
                                 .foregroundStyle(.orange)
                         }
                     }

@@ -48,7 +48,7 @@ struct DownloadSheet: View {
                 Text("下载在线瓦片")
                     .font(.headline)
                 Text("按范围与层级取图，落成本程序可直接打开的 <z>/<x>/<y> 目录")
-                    .font(.caption)
+                    .font(.subheadline)
                     .foregroundStyle(.secondary)
             }
             Spacer()
@@ -91,7 +91,7 @@ struct DownloadSheet: View {
                     GridRow {
                         label("")
                         Text("密钥只保存在内存里，退出程序后需要重新填写。")
-                            .font(.caption)
+                            .font(.subheadline)
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -103,7 +103,7 @@ struct DownloadSheet: View {
                         .font(.subheadline)
                         .foregroundStyle(.orange)
                     Text(download.terms)
-                        .font(.caption)
+                        .font(.subheadline)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -150,7 +150,7 @@ struct DownloadSheet: View {
             }
             if !download.bounds.isValid {
                 Text("范围无效：需要西 < 东、南 < 北，且纬度在 ±90 以内。")
-                    .font(.caption)
+                    .font(.subheadline)
                     .foregroundStyle(.red)
             }
         }
@@ -194,15 +194,15 @@ struct DownloadSheet: View {
                 }
                 Spacer()
                 Text("该数据源上限 z\(download.maximumZoomLimit)")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
                 Button("复制瓦片清单") { model.download.copyTileList() }
                     .controlSize(.small)
                     .disabled(download.tileCount == 0)
             }
             if download.tileCount > TileDownloader.defaultTileLimit {
                 Text("数量超过单次上限（\(TileDownloader.defaultTileLimit) 张），请缩小范围或降低层级。")
-                    .font(.caption)
+                    .font(.subheadline)
                     .foregroundStyle(.red)
             }
         }
@@ -291,7 +291,7 @@ struct DownloadSheet: View {
                         .foregroundStyle(.secondary)
                     if let failure = summary.failures.first {
                         Text("示例失败：\(failure)")
-                            .font(.caption)
+                            .font(.subheadline)
                             .foregroundStyle(.orange)
                             .lineLimit(2)
                     }
@@ -332,7 +332,7 @@ struct DownloadSheet: View {
             Spacer()
             if let reason = download.blockingReason, !download.isRunning {
                 Text(reason)
-                    .font(.caption)
+                    .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }

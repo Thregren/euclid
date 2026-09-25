@@ -92,7 +92,8 @@ struct StatusBarView: View {
             if model.measurements.tool.hint(draftCount: model.measurements.draft.count) == nil {
                 Text("移动指针查看坐标")
                     .font(.subheadline)
-                    .foregroundStyle(.tertiary)
+                    // 三级色在浅色下只有 1.9:1 对比度（实测），状态栏这种小字一律用二级色。
+                    .foregroundStyle(.secondary)
             }
         }
     }

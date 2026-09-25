@@ -323,8 +323,8 @@ struct ToolStrip: View {
             model.measurements.tool = tool
         } label: {
             Image(systemName: tool.symbolName)
-                .font(.system(size: 15, weight: .medium))
-                .frame(width: 30, height: 30)
+                .font(.system(size: 16, weight: .medium))
+                .frame(width: 34, height: 34)
                 .foregroundStyle(isActive ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
                 .background(
                     RoundedRectangle(cornerRadius: 7, style: .continuous)
@@ -347,8 +347,8 @@ struct ToolStrip: View {
     ) -> some View {
         Button(action: action) {
             Image(systemName: symbol)
-                .font(.system(size: 15, weight: .medium))
-                .frame(width: 30, height: 30)
+                .font(.system(size: 16, weight: .medium))
+                .frame(width: 34, height: 34)
                 .foregroundStyle(isOn ? AnyShapeStyle(.tint) : AnyShapeStyle(.primary))
                 .background(
                     RoundedRectangle(cornerRadius: 7, style: .continuous)
@@ -379,7 +379,7 @@ struct ControlButton: View {
         Button(action: action) {
             Image(systemName: symbol)
                 .font(.body.weight(.medium))
-                .frame(width: 28, height: InterfaceStyle.controlHeight)
+                .frame(width: 30, height: InterfaceStyle.controlHeight)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
