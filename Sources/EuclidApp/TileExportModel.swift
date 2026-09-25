@@ -33,6 +33,8 @@ final class TileExportModel {
     var onStatus: ((String) -> Void)?
 
     private var task: Task<Void, Never>?
+    /// 上一次按哪幅影像预填过参数：换影像时才重算层级与输出目录。
+    private var preparedSourceID: String?
 
     var tileSizeOptions: [Int] { [512, 256] }
 
@@ -75,22 +77,25 @@ final class TileExportModel {
         if raster == nil { return sourceError ?? "请先选择一幅影像（GeoTIFF / TIFF）" }
         if outputDirectory == nil { return "请选择输出目录" }
         if plan == nil { return "这个层级范围里没有瓦片，请调大最大层级" }
-        if tileCount > 500_000 { return "瓦片太多（\(tileCount) 张），请缩小层级范围" }
+        if tileCount > tilePyramidTileLimit { return "瓦片太多（\(tileCount) 张），请缩小层级范围" }
         return nil
     }
 
     // MARK: - 参数装配
 
     /// 打开面板时按当前影像与当前视图预填一次。
-    func prepare(source: RasterDataset?, outputDirectory currentOutput: URL?, currentZoom: Int) {
-        if raster == nil, let source {
+    /// 打开面板时按当前影像预填一次；换了一幅影像会重新预填。
+    func prepare(source: RasterDataset?, outputDirectory currentOutput: URL?) {
+        if let source, source.id != preparedSourceID {
+            preparedSourceID = source.id
             raster = source
             sourceURL = source.fileURL
-            applySuggestedZooms(currentZoom: currentZoom)
-        }
-        if outputDirectory == nil {
+            sourceError = nil
+            applySuggestedZooms()
             outputDirectory = currentOutput ?? Self.restoredOutputDirectory()
-                ?? source?.fileURL.deletingLastPathComponent().appending(path: "\(source?.name ?? "tiles")-tiles")
+                ?? source.fileURL.deletingLastPathComponent().appending(path: "\(source.name)-tiles")
+        } else if outputDirectory == nil {
+            outputDirectory = currentOutput ?? Self.restoredOutputDirectory()
         }
     }
 
@@ -108,21 +113,18 @@ final class TileExportModel {
                 return
             }
             raster = loaded
-            applySuggestedZooms(currentZoom: nil)
-            if outputDirectory == nil {
-                outputDirectory = url.deletingLastPathComponent().appending(path: "\(loaded.name)-tiles")
-            }
+            preparedSourceID = loaded.id
+            applySuggestedZooms()
+            outputDirectory = url.deletingLastPathComponent().appending(path: "\(loaded.name)-tiles")
         }
     }
 
-    private func applySuggestedZooms(currentZoom: Int?) {
+    /// 默认层级：上限取「一个影像像素对一个瓦片像素」那一级，往前 3 级。
+    private func applySuggestedZooms() {
         guard let raster else { return }
         let suggested = TilePyramidExporter.suggestedZoomRange(for: raster)
         maximumZoom = suggested.upperBound
-        minimumZoom = min(suggested.lowerBound, max(0, currentZoom ?? suggested.lowerBound))
-        if let currentZoom, currentZoom <= suggested.upperBound, currentZoom >= suggested.lowerBound {
-            minimumZoom = currentZoom
-        }
+        minimumZoom = suggested.lowerBound
     }
 
     func chooseSource() {

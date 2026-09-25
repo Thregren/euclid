@@ -45,18 +45,29 @@ struct TileExportSheet: View {
         .onAppear {
             export.prepare(
                 source: model.selectedRaster,
-                outputDirectory: export.outputDirectory,
-                currentZoom: model.viewport.dataZoom
+                outputDirectory: export.outputDirectory
             )
         }
     }
 
     // MARK: - 分区
 
+    /// 分区外框：内容左对齐铺满、上下留一点，避免每个分区各写一遍。
+    private func section<Content: View>(
+        _ title: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        GroupBox(title) {
+            content()
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 2)
+        }
+    }
+
     @ViewBuilder
     private var sourceSection: some View {
         @Bindable var export = model.tileExport
-        GroupBox("影像") {
+        section("影像") {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 8) {
                     Text(export.sourceURL?.lastPathComponent ?? "未选择")
@@ -82,15 +93,13 @@ struct TileExportSheet: View {
                     Text(error).font(.caption).foregroundStyle(.orange)
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.vertical, 2)
         }
     }
 
     @ViewBuilder
     private var outputSection: some View {
         @Bindable var export = model.tileExport
-        GroupBox("输出") {
+        section("输出") {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 8) {
                     Text(export.outputDirectory?.path(percentEncoded: false) ?? "未选择")
@@ -109,15 +118,13 @@ struct TileExportSheet: View {
                     .foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.vertical, 2)
         }
     }
 
     @ViewBuilder
     private var rangeSection: some View {
         @Bindable var export = model.tileExport
-        GroupBox("层级与规模") {
+        section("层级与规模") {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 12) {
                     Stepper("最小层级 z\(export.minimumZoom)", value: $export.minimumZoom, in: 0...export.maximumZoomLimit)
@@ -131,15 +138,13 @@ struct TileExportSheet: View {
                     .foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.vertical, 2)
         }
     }
 
     @ViewBuilder
     private var formatSection: some View {
         @Bindable var export = model.tileExport
-        GroupBox("瓦片") {
+        section("瓦片") {
             VStack(alignment: .leading, spacing: 10) {
                 Picker("尺寸", selection: $export.tileSize) {
                     Text("512 像素（默认，本地浏览 1:1）").tag(512)
@@ -172,8 +177,6 @@ struct TileExportSheet: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.vertical, 2)
         }
     }
 
@@ -181,7 +184,7 @@ struct TileExportSheet: View {
     private var progressSection: some View {
         let export = model.tileExport
         if export.isRunning, let progress = export.progress {
-            GroupBox("进度") {
+            section("进度") {
                 VStack(alignment: .leading, spacing: 8) {
                     ProgressView(value: progress.fraction)
                     HStack(spacing: 12) {
@@ -200,11 +203,9 @@ struct TileExportSheet: View {
                     }
                     .font(.callout)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.vertical, 2)
             }
         } else if let summary = export.summary {
-            GroupBox("完成") {
+            section("完成") {
                 VStack(alignment: .leading, spacing: 6) {
                     Text(summary.cancelled ? "已停止" : "已生成")
                         .font(.callout.weight(.medium))
@@ -218,8 +219,6 @@ struct TileExportSheet: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.vertical, 2)
             }
         } else if let error = export.errorMessage {
             Label(error, systemImage: "exclamationmark.triangle")

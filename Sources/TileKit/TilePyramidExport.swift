@@ -111,17 +111,22 @@ public struct TilePyramidSummary: Sendable {
 
 public enum TilePyramidError: Error, CustomStringConvertible {
     case emptyRange
+    case tooManyTiles(Int)
     case cannotCreateDirectory(String)
     case cannotWrite(String)
 
     public var description: String {
         switch self {
         case .emptyRange: return "层级范围里没有任何瓦片"
+        case .tooManyTiles(let count): return "瓦片太多（\(count) 张），请缩小层级范围或范围"
         case .cannotCreateDirectory(let path): return "建不了输出目录：\(path)"
         case .cannotWrite(let path): return "写不了文件：\(path)"
         }
     }
 }
+
+/// 单次生成的安全上限：再多就该先调小范围，而不是让磁盘和 CPU 空转。
+public let tilePyramidTileLimit = 1_000_000
 
 /// 把单幅影像切成各级瓦片：`<输出目录>/<z>/<x>/<y>.<ext>`。
 ///
@@ -168,6 +173,7 @@ public struct TilePyramidExporter: Sendable {
     ) async throws -> TilePyramidSummary {
         let total = plan.totalTileCount
         guard total > 0 else { throw TilePyramidError.emptyRange }
+        guard total <= tilePyramidTileLimit else { throw TilePyramidError.tooManyTiles(total) }
 
         let manager = FileManager.default
         do {
@@ -217,10 +223,7 @@ public struct TilePyramidExporter: Sendable {
                     completed: completed, total: total, written: written,
                     skipped: skipped, failed: failed, bytes: bytes, zoom: lastZoom
                 ))
-                onProgress?(TilePyramidProgress(
-                    completed: completed, total: total, written: written,
-                    skipped: skipped, failed: failed, bytes: bytes, zoom: lastZoom
-                ))
+                onProgress?(await counter.snapshot())
             }
 
             var inFlight = 0

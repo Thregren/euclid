@@ -291,6 +291,56 @@ enum DebugAppearanceScript {
     }
 }
 
+/// 开发调试用的瓦片生成脚本。
+///
+/// `EUCLID_DEBUG_TILE_EXPORT="<输出目录>|<zmin>|<zmax>|<尺寸>|<jpg|png>[|<质量>]"` 时
+/// 无人值守跑一次生成并把结果打到 stderr；`EUCLID_DEBUG_TILE_EXPORT_SHEET=1` 只打开面板，便于截图。
+@MainActor
+enum DebugTileExportScript {
+    static var sheetRequested: Bool {
+        ProcessInfo.processInfo.environment["EUCLID_DEBUG_TILE_EXPORT_SHEET"] != nil
+    }
+
+    static func runIfRequested(model: AppModel) {
+        if sheetRequested {
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(6))
+                model.promptForTileExport()
+            }
+        }
+        guard let raw = ProcessInfo.processInfo.environment["EUCLID_DEBUG_TILE_EXPORT"] else { return }
+        let parts = raw.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
+        guard parts.count >= 5, let minimum = Int(parts[1]),
+              let maximum = Int(parts[2]), let size = Int(parts[3]) else {
+            FileHandle.standardError.write(Data("[tiles] 参数应为 输出目录|zmin|zmax|尺寸|格式[|质量]\n".utf8))
+            return
+        }
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(8))
+            let export = model.tileExport
+            export.prepare(source: model.selectedRaster, outputDirectory: URL(fileURLWithPath: parts[0]))
+            export.minimumZoom = minimum
+            export.maximumZoom = maximum
+            export.tileSize = size
+            export.format = parts[4].lowercased() == "png" ? .png : .jpeg
+            if parts.count >= 6, let quality = Double(parts[5]) { export.quality = quality }
+            export.onStatus = { message in
+                FileHandle.standardError.write(Data(("[tiles] " + message + "\n").utf8))
+            }
+            export.start()
+            while export.isRunning { try? await Task.sleep(for: .milliseconds(200)) }
+            let summary = export.summary
+            let line = String(
+                format: "[tiles] 结束：写出=%d 跳过=%d 失败=%d 字节=%d 用时=%.1fs 取消=%@\n",
+                summary?.written ?? -1, summary?.skipped ?? -1, summary?.failed ?? -1,
+                summary?.bytes ?? -1, summary?.elapsed ?? -1,
+                (summary?.cancelled ?? true) ? "是" : "否"
+            )
+            FileHandle.standardError.write(Data(line.utf8))
+        }
+    }
+}
+
 /// 开发调试用的出图脚本。
 ///
 /// `EUCLID_DEBUG_EXPORT_VIEW=<输出路径>` 时，启动十几秒后（数据范围与底图都安定下来）

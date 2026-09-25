@@ -33,6 +33,7 @@ struct RootView: View {
             DebugDownloadScript.runIfRequested(model: model)
             DebugBasemapScript.runIfRequested(model: model)
             DebugExportScript.runIfRequested(model: model)
+            DebugTileExportScript.runIfRequested(model: model)
         }
     }
 
