@@ -92,33 +92,109 @@ cd euclid
 - ⌘⇧C 直接复制当前视图到剪贴板
 - 测量结果支持 Excel / GeoJSON / KML / CSV 与剪贴板复制
 
-## 架构
+## 软件架构
+
+### 分层与依赖
+
+整仓约 13,600 行 Swift，分三层，依赖方向严格单向：`TileKit` 不认识界面，
+`EuclidApp` 只消费 `TileKit`，因此投影、取图、测量、导出、TIFF 解码全都可以脱离界面测试。
 
 ```
-┌──────────────────── EuclidApp（可执行，UI 层）────────────────────┐
-│  SwiftUI 外壳                        AppKit 画布                  │
-│  ├ RootView / SidebarView             └ TileCanvasNSView          │
-│  ├ InspectorView（坐标 / 测量 / 数据源）  ├ TileLayerStack ×2       │
-│  ├ StatusBarView / ScaleBarView           │  （在线底图 / 本地影像）│
-│  └ MapControls / ViewExporter             └ MeasurementOverlay    │
+┌──────────────────── EuclidApp（可执行，UI 层）─────────────────────┐
+│  SwiftUI 外壳                         AppKit 画布                  │
+│  ├ RootView / SidebarView              └ TileCanvasNSView          │
+│  ├ InspectorView（坐标 / 测量 / 数据源）   ├ TileLayerStack ×2        │
+│  ├ StatusBarView / ScaleBarView            │  （在线底图 / 本地影像） │
+│  └ MapControls / DownloadSheet             └ MeasurementOverlay     │
+│  ViewExporter（出图合成）                                           │
 │  状态：AppModel · ViewportState · MeasurementStore · TileDownloadModel │
-└───────────────────────────────┬───────────────────────────────────┘
+└───────────────────────────────┬────────────────────────────────────┘
                                 │ 单向依赖
-┌───────────────────────────────▼───────────────────────────────────┐
-│                     TileKit（核心库，无 UI 依赖，可单测）           │
-│  GeoCoordinate / WebMercator    投影与坐标换算                     │
-│  SlippyTile / TileLayout        瓦片标识与磁盘布局                 │
-│  DatasetDiscovery               瓦片数据集嗅探与覆盖范围            │
-│  TileProvider                   actor：LRU 缓存 + 并发闸门 + 负缓存 │
-│  MapCamera                      视图变换、缩放锚点、可见瓦片范围    │
-│  TIFF / TIFFDecoder             单幅 TIFF 解析与按区域解码         │
-│  GeoTIFF / Projection           地理参考与投影换算（UTM / 高斯克吕格）│
-│  Geodesy / Measurement          测地线距离、面积、测量模型          │
-│  MeasurementExport / XLSX       导出格式与零依赖 OOXML 生成         │
-└───────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────▼────────────────────────────────────┐
+│                     TileKit（核心库，无 UI 依赖，可单测）            │
+│  GeoCoordinate / WebMercator     投影与坐标换算                      │
+│  SlippyTile / TileLayout         瓦片标识与磁盘布局                  │
+│  DatasetDiscovery                瓦片数据集嗅探与覆盖范围             │
+│  TileImageSource 及其实现         取图通道：目录 / 远程 / 单幅影像     │
+│  TileProvider                     actor：LRU 缓存 + 并发闸门 + 负缓存 │
+│  MapCamera                       视图变换、缩放锚点、可见瓦片范围     │
+│  TIFF / TIFFDecoder              单幅 TIFF 解析与按区域解码          │
+│  GeoTIFF / Projection            地理参考与投影换算（UTM / 高斯克吕格）│
+│  Geodesy / Measurement           测地线距离、面积、测量模型           │
+│  MeasurementExport / XLSX        导出格式与零依赖 OOXML 生成          │
+│  TileSource / TileDownloader     URL 模板与批量下载                  │
+│  Datum                           GCJ-02 / BD-09 基准偏移与互转        │
+└────────────────────────────────────────────────────────────────────┘
+                                ▲
+                  TileKitCheck ─┘ 自带断言的自检（329 项）
 ```
 
-几个关键取舍：
+### 功能模块
+
+**核心库 `TileKit`**
+
+| 模块 | 文件 | 职责与要点 |
+| --- | --- | --- |
+| 坐标与投影 | `GeoCoordinate.swift` | `GeoCoordinate`（WGS84）与 `WebMercator`：归一化世界坐标（0…1、y 向南）↔ 经纬度 ↔ 墨卡托米；另有该纬度上每世界单位的实地米数 |
+| 瓦片标识 | `SlippyTile.swift` | 瓦片对象、`<z>/<x>/<y>` 磁盘布局、行列轴向（x 先 / y 先）、行号零点（XYZ / TMS）、瓦片边长 |
+| 数据集发现 | `DatasetDiscovery.swift` | 向下嗅探瓦片数据集；用「另一种编排是否存在」判定轴向；抽样统计覆盖范围，不全量遍历 |
+| 取图通道 | `TileImageSource.swift`、`DirectoryTileSource.swift`、`RemoteTileSource.swift`、`GeoTIFF.swift` | 统一的「给我这一格」协议，默认实现是「取字节 + `ImageIO` 解码」；单幅影像覆盖成「按区域现解」，省掉一次编解码往返 |
+| 图片供应 | `TileProvider.swift` | actor：按字节限流的 LRU 内存缓存、`AsyncLimiter` 并发闸门（默认 6–8 路解码）、缺片负缓存、在途请求合并 |
+| 相机 | `MapCamera.swift` | 视图 ↔ 世界 ↔ 图层三套坐标的换算、缩放锚点补偿、缩放上下限夹取、可见瓦片行列范围；整数层级时一张瓦片刚好对应它的原始像素 |
+| 单幅影像 | `TIFF.swift`、`TIFFDecoder.swift`、`GeoTIFF.swift`、`Projection.swift` | TIFF / BigTIFF 目录解析（含 IFD 链与 SubIFD 概览）、按区域解压与采样、GeoTIFF 标签 → 像素仿射变换、投影到 WGS84 |
+| 测地计算 | `Geodesy.swift` | Vincenty 反向与直接公式、测地圆采样、球面过剩面积、显示格式化（距离 / 面积 / 方位角） |
+| 测量模型 | `Measurement.swift`、`MeasurementStyle.swift` | 点 / 折线 / 多边形 / 圆四种测量，分段结果与闭合差；带缓存的求值（键为类型 + 顶点，圆另按圆心 + 半径）；与 UI 无关的颜色分量与逐条样式 |
+| 导出 | `MeasurementExport.swift`、`XLSX.swift` | GeoJSON / KML / CSV / Excel；`XLSX` 零依赖生成 OOXML，自带「存储式 ZIP」打包与 CRC32、以及反解校验 |
+| 在线源与下载 | `TileSource.swift`、`TileDownloader.swift` | URL 模板（`{z}` `{x}` `{y}` `{-y}` `{s}` `{key}`）、预设、下载计划（只存每层行列范围）、并发 + 限速 + 重试退避 + 缺片 + 续下 + 落盘清单 |
+| 坐标基准 | `Datum.swift` | WGS84 / GCJ-02 / BD-09 互转（正向多项式拟合、反向迭代逼近）与相对 WGS84 的米制偏移 |
+
+**应用层 `EuclidApp`**
+
+| 模块 | 文件 | 职责与要点 |
+| --- | --- | --- |
+| 入口与菜单 | `EuclidApp.swift` | `@main`、`AppDelegate`（响应拖放打开）、菜单（打开、下载、出图、工具、撤销重做） |
+| 应用状态 | `AppModel.swift` | 状态中枢：数据源列表与选中项、单幅影像载入、装配去抖（签名不变不重装）、状态栏提示、存档调度、出图与导出动作 |
+| 画布桥接 | `TileMapView.swift`、`CanvasController`（在 `AppModel.swift`） | SwiftUI ↔ AppKit 的命令通道：装配图层、设不透明度、适配窗口、取画面像素 |
+| 画布与渲染 | `TileCanvasNSView.swift` | 双图层栈 + 标注层；滚轮 / 中键 / 捏合 / 双击 / 方向键交互；缩放上下限；离屏渲染（调试截图与出图共用） |
+| 图层栈 | `TileLayerStack.swift` | 「一个数据源 ↔ 一个宿主图层」的全套逻辑：换层级留旧图兜底、祖先贴图、同帧接图、缺片负缓存、按中心距离排序取图、空闲预取、瓦片网格、不透明度 |
+| 测量交互 | `MeasurementStore.swift` | 工具状态机（浏览 / 点 / 测距 / 测面积 / 画圆）、草稿与已完成测量、选中、撤销重做（1.5 s 合并窗口）、半径输入、顶点吸附数据 |
+| 标注绘制 | `MeasurementOverlay.swift`、`MeasurementPalette.swift` | 描边 / 填充 / 顶点 / 标注 / 半径辅助线各用图层池复用；圆环采样缓存；深浅色与「减少动态效果」适配；出图前的文字翻转补偿 |
+| 界面 | `RootView.swift`、`SidebarView.swift`、`InspectorView.swift`、`InspectorSections.swift`、`StatusBarView.swift`、`ScaleBarView.swift`、`InterfaceStyle.swift`、`CoordinateText.swift` | 三栏结构、数据源列表与最近打开、检查器分区、状态栏读数、比例尺（与出图共用刻度算法）、语义色与材质 |
+| 底图与下载界面 | `OnlineBasemap.swift`、`TileDownloadModel.swift`、`DownloadSheet.swift` | 在线底图配置与有效性判定；下载面板参数、计划预览、进度与取消 |
+| 出图 | `ViewExporter.swift` | 画面 + 信息栏（数据源、中心坐标、层级、比例尺）合成 PNG，供保存与剪贴板 |
+| 存档 | `MeasurementArchive.swift` | 测量结果按数据集 / 影像路径存到 `~/Library/Application Support/Euclid/` |
+| 调试 | `DebugFixtures.swift` | 环境变量驱动的示例测量、缩放 / 出图 / 底图 / 外观脚本（只影响开发） |
+
+**自检与样本**
+
+| 模块 | 文件 | 职责 |
+| --- | --- | --- |
+| 自检程序 | `Sources/TileKitCheck/main.swift` | 自带断言的检查程序（没有 XCTest 也能跑）：投影、相机、测地、测量、导出、下载、基准、TIFF 解码、投影换算，以及「拿一个数据集 / 影像文件当参数」的体检模式 |
+| 回归样本 | `Fixtures/TIFF/` | 由 **libtiff** 写出的 TIFF（横条 / 分块 × 未压缩 / Deflate / LZW / PackBits）+ 源图 + 生成脚本；定位点取 UTM 中央经线上的整数格点，与真实测区无关 |
+| 脚本 | `Scripts/build-app.sh`、`Scripts/run-checks.sh` | 构建并组装 `.app`（剥离调试信息、检查本机路径残留、ad-hoc 签名）；跑自检 |
+
+### 一次取图的完整链路
+
+1. **相机**算出可见瓦片与整数层级；单幅影像则先把瓦片范围换算成影像像素区域
+2. **图层栈**决定这一帧要哪些格子（与上一帧比对），按「离视图中心近的优先」排序，受并发额度约束派发
+3. **`TileProvider`**（actor）先查内存缓存；未命中才向来源要图——目录来源读文件 + 解码，
+   单幅影像按区域解压采样；同一格的并发请求合并成一次
+4. 结果回主线程装进 `CALayer`（`contents` + `contentsRect`），首次出现淡入；
+   换层级时新图层先透明，由保留的上一层影像顶着，自己的图到了再替换
+5. 自己没有图时用**祖先贴图**兜底；确认「自己没有、祖先也没有」的格子记进 `unresolvedTiles`，
+   避免每帧重试造成空转
+6. 视野安定后**预取**外圈一圈瓦片；测量标注由独立的 `MeasurementOverlay` 图层绘制，
+   用的是同一个 `MapCamera`，因此与影像天然对齐
+
+### 线程与缓存
+
+- **主线程**：全部界面状态与图层装配（`AppModel`、`TileCanvasNSView`、`TileLayerStack` 都是 `@MainActor`）
+- **后台**：`TileProvider` 是 actor，磁盘读取与解码在 `Task.detached` 里执行，
+  并发由 `AsyncLimiter` 限流；单幅影像的区域解码同样在后台
+- **缓存分四层**：瓦片图片的 LRU 内存缓存（按字节限流）→ 缺片负缓存 →
+  TIFF 目录解析缓存（只存几 KB 元数据）→ 测量求值缓存；都不随会话时长无限增长
+
+### 关键设计决策
 
 - **渲染用 CALayer 金字塔而不是 Metal**：平移缩放只改图层 transform，
   由窗口服务器合成，CPU 不参与重绘；要换后端也只影响 `TileCanvasNSView` 一处
@@ -132,8 +208,65 @@ cd euclid
 - **测量求值带缓存**：按「类型 + 顶点」记忆（圆另按「圆心 + 半径」，连 360 点采样一起），
   平移缩放时只取缓存、按新相机换算屏幕位置，不再每帧重算测地线
 
-源码结构：`Sources/TileKit` 核心库、`Sources/EuclidApp` 应用、`Sources/TileKitCheck` 自检、
-`Fixtures/` 自检样本、`Scripts/` 构建脚本。细节见[技术路线](docs/01-技术路线.md)。
+- **加载不闪**：新图层不刷占位色、由上层影像顶着；数据范围算出来之前不铺图；
+  缺图格子只尝试有限次。这三条都是逐帧日志量出来的（见[开发进度](docs/03-进度.md) M6.2）
+- **界面按 HIG 收敛**：语义字号与语义色、控制层浮在内容之上的材质、工具栏只留高频操作
+
+### 源码结构
+
+```
+Sources/TileKit/          核心库（无 UI 依赖）
+  GeoCoordinate.swift       坐标类型、Web Mercator 正反算
+  SlippyTile.swift          瓦片标识、磁盘布局与行号约定
+  DatasetDiscovery.swift    数据集嗅探、布局判定、覆盖范围
+  TileImageSource.swift     取图协议与公共请求头
+  DirectoryTileSource.swift 目录型来源、图片解码
+  RemoteTileSource.swift    在线来源
+  TileProvider.swift        LRU 缓存、并发闸门、负缓存
+  MapCamera.swift           相机变换与可见瓦片
+  TIFF.swift                TIFF / BigTIFF 目录解析（含 GeoTIFF 标签）
+  TIFFDecoder.swift         按区域解码（Deflate / LZW / PackBits / JPEG + Predictor 2）
+  GeoTIFF.swift             地理参考、单幅影像模型与取图来源
+  Projection.swift          经纬度 / Web 墨卡托 / 横轴墨卡托
+  Geodesy.swift             Vincenty 测地线、面积、格式化
+  Measurement.swift         测量模型与求值（带缓存）
+  MeasurementStyle.swift    与 UI 无关的颜色分量与样式
+  MeasurementExport.swift   导出格式
+  XLSX.swift                OOXML 生成 + 存储式 ZIP 打包与校验
+  TileSource.swift          URL 模板、预设、下载计划
+  TileDownloader.swift      批量下载（并发 / 限速 / 重试 / 清单）
+  Datum.swift               GCJ-02 / BD-09 基准互转
+Sources/EuclidApp/        应用层
+  EuclidApp.swift           入口、菜单命令
+  AppModel.swift            应用状态、装配流程、出图与导出动作
+  RootView.swift            窗口结构、工具栏、工具提示
+  SidebarView.swift         数据源列表、位置、最近打开
+  InspectorView.swift       检查器布局
+  InspectorSections.swift   指针坐标与测量分区
+  TileCanvasNSView.swift    AppKit 画布：渲染与交互
+  TileMapView.swift         SwiftUI ↔ AppKit 桥接
+  TileLayerStack.swift      单条瓦片图层栈
+  MeasurementOverlay.swift  测量标注绘制
+  MeasurementStore.swift    测量状态机
+  MeasurementPalette.swift  调色板与样式解析
+  MeasurementArchive.swift  测量存档
+  StatusBarView.swift       底部状态栏
+  ScaleBarView.swift        比例尺（与出图共用刻度算法）
+  CoordinateText.swift      坐标文本格式化
+  DownloadSheet.swift       下载面板
+  TileDownloadModel.swift   下载面板状态
+  OnlineBasemap.swift       在线底图配置
+  ViewExporter.swift        出图合成
+  InterfaceStyle.swift      控件材质与「减少动态效果」判定
+  DebugFixtures.swift       调试脚本（环境变量开启）
+Sources/TileKitCheck/     自检程序
+Fixtures/TIFF/            自检用的 TIFF 回归样本与生成脚本
+Scripts/                  构建与自检脚本
+docs/                     技术路线、构建与运行、开发进度、使用说明
+```
+
+更细的设计取舍（为什么这么选、踩过什么坑）见[技术路线](docs/01-技术路线.md)与
+[开发进度](docs/03-进度.md)。
 
 ## 质量保障
 
