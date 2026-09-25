@@ -1,17 +1,21 @@
 import SwiftUI
 import TileKit
 
+/// 右侧检查器：一块浮在画布上的面板（照 Pixelmator Pro 的右栏）。
+///
+/// 分区顺序也按同一套逻辑：文档（数据源）→ 选中对象（图层属性）→ 任务（测量）→
+/// 读数（指针坐标 / 视图）→ 来源详情（覆盖范围、数据集、最近打开）。
 struct InspectorView: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
         Form {
+            DataSourceSection()
             if model.hasMapContent {
-                // Order follows Pixelmator Pro: document (layers) → selected object → task → readouts → source details.
-                LayerPanel()
                 if let layer = model.selectedLayer {
                     LayerPropertiesSection(layer: layer)
                 }
+                OnlineBasemapSection()
                 MeasurementSection()
                 CursorCoordinateSection()
                 if let extent = model.extent {
@@ -21,26 +25,26 @@ struct InspectorView: View {
                 datasetSection
             } else {
                 Section {
-                    ContentUnavailableView(
-                        "未选择数据集",
-                        systemImage: "square.stack.3d.up.slash",
-                        description: Text("打开一个瓦片目录，或在侧栏切到在线底图，这里会显示坐标、测量结果与数据源信息。")
-                    )
+                    Text("打开一个瓦片目录（⌘O）或单幅影像（⌘⇧O），或用左下角「图层」面板的 ＋ 加一层在线底图；"
+                         + "这里会显示图层属性、测量结果、指针坐标与数据源信息。")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
+            RecentDataSection()
         }
         .formStyle(.grouped)
         .scrollContentBackground(.hidden)
-        .background(.background)
+        .frame(width: InterfaceStyle.inspectorPanelWidth)
+        .frame(maxHeight: .infinity)
+        .clipShape(
+            RoundedRectangle(cornerRadius: InterfaceStyle.panelCornerRadius, style: .continuous)
+        )
+        .panelSurface()
     }
 
     // MARK: - 数据集信息
-
-    /// 图层信息：本地影像与在线底图各自的不透明度与来源。
-    @ViewBuilder
-    private func percent(_ value: Double) -> String {
-        "\(Int((value * 100).rounded()))%"
-    }
 
     @ViewBuilder
     private var datasetSection: some View {

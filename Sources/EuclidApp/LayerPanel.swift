@@ -1,45 +1,63 @@
 import SwiftUI
 import TileKit
+import UniformTypeIdentifiers
 
-/// 右侧「图层」面板。
+/// 左侧「图层」面板。
 ///
-/// 参照 Pixelmator Pro 的做法：标题行右侧成组放「添加 / 复制 / 更多」，
-/// 下面是可拖拽排序、可点选的图层行；选中层的属性（不透明度等）紧跟在下一段。
-struct LayerPanel: View {
+/// 版式照 Pixelmator Pro 的左栏：标题行右侧成组放「添加 / 复制 / 更多」，
+/// 中间是可点选、可**按住拖动排序**的图层行（缩略图 + 名称 + 来源 + 显示开关），
+/// 底部是所选层的混合模式、不透明度，以及按名字过滤的搜索框。
+///
+/// 面板自上而下的顺序 = 图层从最上到最下（画师习惯），模型里存的是「下 → 上」，
+/// 二者的换算只在 `AppModel.panelOrder` / `moveLayer(_:toPanelRow:)` 一处做。
+struct LayersPanel: View {
     @Environment(AppModel.self) private var model
 
+    /// 搜索框里的名字过滤。
+    @State private var query = ""
+    /// 搜索框右侧漏斗按钮的种类过滤。
+    @State private var kindFilter: LayerKindFilter = .all
+    /// 正在被拖动的那一层（拖动期间才认自己的拖放）。
+    @State private var draggingID: String?
+    /// 当前落点提示（插到哪一行、在该行的上半还是下半）。
+    @State private var dropTarget: DropTarget?
+
+    /// 行高：拖动落点判断「上半还是下半」也要用它。
+    static let rowHeight: CGFloat = 46
+
     var body: some View {
-        Section {
-            ForEach(model.layers) { layer in
-                LayerRow(layer: layer, isSelected: layer.id == model.selectedLayerID)
-                    .contentShape(Rectangle())
-                    .onTapGesture { model.selectLayer(layer.id) }
-                    .listRowBackground(
-                        RoundedRectangle(cornerRadius: 6)
-                            .fill(layer.id == model.selectedLayerID ? Color.accentColor.opacity(0.18) : .clear)
-                    )
-            }
-            if model.layers.isEmpty {
-                Text("还没有图层。点标题旁的 ＋ 添加本地数据或在线底图。")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            }
-        } header: {
-            HStack(spacing: 12) {
-                Text("图层")
-                Spacer()
-                addMenu
-                Button {
-                    if let id = model.selectedLayer?.id { model.duplicateLayer(id) }
-                } label: {
-                    Image(systemName: "plus.square.on.square")
-                }
-                .buttonStyle(.borderless)
-                .disabled(model.selectedLayer == nil)
-                .help("复制选中的图层")
-                moreMenu
-            }
+        VStack(spacing: 0) {
+            header
+            Divider()
+            rows
+            Divider()
+            footer
         }
+        .frame(width: InterfaceStyle.layersPanelWidth)
+        .frame(maxHeight: .infinity)
+        .panelSurface()
+    }
+
+    // MARK: - 标题行
+
+    private var header: some View {
+        HStack(spacing: 10) {
+            Text("图层")
+                .font(.headline)
+            Spacer(minLength: 4)
+            addMenu
+            Button {
+                if let id = model.selectedLayer?.id { model.duplicateLayer(id) }
+            } label: {
+                Image(systemName: "plus.square.on.square")
+            }
+            .buttonStyle(.borderless)
+            .disabled(model.selectedLayer == nil)
+            .help("复制选中的图层")
+            moreMenu
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
     }
 
     /// ＋：添加图层（在线底图预设 / 已打开的本地数据 / 直接打开新的）。
@@ -81,6 +99,9 @@ struct LayerPanel: View {
             Button("下移一层") { if let id = model.selectedLayer?.id { model.moveLayer(id, up: false) } }
                 .disabled(!model.canMoveSelectedLayer(up: false))
             Divider()
+            Button("设为基准层") { if let id = model.selectedLayer?.id { model.setAnchorLayer(id) } }
+                .disabled(model.selectedLayer.map { $0.kind == .online } ?? true)
+            Divider()
             Button("全部显示") { model.setAllLayersVisible(true) }
             Button("全部隐藏") { model.setAllLayersVisible(false) }
             Divider()
@@ -94,33 +115,302 @@ struct LayerPanel: View {
         .fixedSize()
         .help("图层排序与显示")
     }
+
+    // MARK: - 图层列表
+
+    private var visibleLayers: [MapLayer] {
+        model.panelOrder.filter { layer in
+            guard kindFilter.matches(layer.kind) else { return false }
+            let trimmed = query.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty else { return true }
+            return layer.name.localizedCaseInsensitiveContains(trimmed)
+        }
+    }
+
+    private var rows: some View {
+        ScrollView {
+            VStack(spacing: 0) {
+                if model.layers.isEmpty {
+                    placeholder("还没有图层。点标题旁的 ＋ 添加本地数据或在线底图。")
+                } else if visibleLayers.isEmpty {
+                    placeholder("没有匹配的图层。")
+                } else {
+                    ForEach(Array(visibleLayers.enumerated()), id: \.element.id) { index, layer in
+                        row(layer, at: index)
+                    }
+                }
+            }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 6)
+        }
+    }
+
+    private func placeholder(_ text: String) -> some View {
+        Text(text)
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .multilineTextAlignment(.leading)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// 一行图层：可点选、可拖动排序（拖到哪一行的上／下半就插到那一侧）。
+    private func row(_ layer: MapLayer, at index: Int) -> some View {
+        LayerRow(
+            layer: layer,
+            isSelected: layer.id == model.selectedLayerID,
+            thumbnail: model.thumbnails.image(for: layer)
+        )
+        .overlay(alignment: .top) {
+            if dropTarget == DropTarget(row: index, above: true) { insertionLine }
+        }
+        .overlay(alignment: .bottom) {
+            if dropTarget == DropTarget(row: index, above: false) { insertionLine }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { model.selectLayer(layer.id) }
+        // 拖动排序：AppKit 的拖放（onDrag / onDrop）比 SwiftUI 的 draggable 更可靠 ——
+        // 后者在带按钮的行里经常起不来。载荷走自定义类型，别的应用拖来的东西一律不认。
+        .onDrag {
+            draggingID = layer.id
+            model.selectLayer(layer.id)
+            return LayerDragPayload.provider(for: layer.id)
+        }
+        .onDrop(
+            of: [LayerDragPayload.contentType],
+            delegate: LayerDropDelegate(
+                row: index,
+                model: model,
+                draggingID: $draggingID,
+                dropTarget: $dropTarget
+            )
+        )
+        .help("按住这一行拖动可以调整叠放顺序（列表最上面 = 画面最上层）")
+        .task(id: thumbnailKey(layer)) {
+            model.thumbnails.request(
+                layer,
+                fallbackCenter: WebMercator.normalized(model.viewport.center),
+                fallbackZoom: model.viewport.dataZoom
+            )
+        }
+    }
+
+    /// 缩略图的取图键：来源 + 覆盖范围是否已知。
+    ///
+    /// 范围还没算出来时先不取，等它到位后键一变，`task` 自然会带着真实范围再取一次。
+    private func thumbnailKey(_ layer: MapLayer) -> String {
+        "\(layer.sourceKey)|\(layer.fitRect == nil ? "unknown" : "known")"
+    }
+
+    private var insertionLine: some View {
+        RoundedRectangle(cornerRadius: 1)
+            .fill(Color.accentColor)
+            .frame(height: 2)
+            .padding(.horizontal, 2)
+    }
+
+    // MARK: - 底部：混合模式 / 不透明度 / 搜索
+
+    private var footer: some View {
+        VStack(spacing: 6) {
+            HStack(spacing: 8) {
+                Text("不透明度")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 4)
+                Text(percentText(model.selectedLayer?.opacity ?? 1))
+                    .font(.caption)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+                    .help("选中层的不透明度：叠加对照时把上层影像淡下去看底图")
+            }
+
+            Slider(value: opacityBinding, in: 0...1)
+                .controlSize(.small)
+
+            searchField
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(Color.primary.opacity(0.05))
+        .disabled(model.selectedLayer == nil)
+    }
+
+    private var searchField: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            TextField("搜索", text: $query)
+                .textFieldStyle(.plain)
+                .font(.callout)
+            if !query.isEmpty {
+                Button {
+                    query = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.caption)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.tertiary)
+                .help("清空搜索")
+            }
+            Menu {
+                Picker("只显示", selection: $kindFilter) {
+                    ForEach(LayerKindFilter.allCases) { filter in
+                        Text(filter.title).tag(filter)
+                    }
+                }
+                .pickerStyle(.inline)
+            } label: {
+                Image(systemName: kindFilter.symbolName)
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .foregroundStyle(kindFilter == .all ? AnyShapeStyle(.secondary) : AnyShapeStyle(.tint))
+            .help("按种类过滤：全部 / 本地数据 / 单幅影像 / 在线底图")
+        }
+        .padding(.horizontal, 7)
+        .padding(.vertical, 4)
+        .background(
+            Color.primary.opacity(0.06),
+            in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+        )
+    }
+
+    // MARK: - 绑定
+
+    private var opacityBinding: Binding<Double> {
+        Binding(
+            get: { model.selectedLayer?.opacity ?? 1 },
+            set: { model.setOpacity(of: model.selectedLayer?.id, to: $0) }
+        )
+    }
+
+    private func percentText(_ value: Double) -> String {
+        "\(Int((value * 100).rounded()))%"
+    }
 }
 
-/// 一行图层：显示开关 + 图标 + 名称 + 基准标记。
+// MARK: - 搜索框里的种类过滤
+
+private enum LayerKindFilter: String, CaseIterable, Identifiable {
+    case all
+    case dataset
+    case raster
+    case online
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .all: return "全部图层"
+        case .dataset: return "本地瓦片目录"
+        case .raster: return "单幅影像"
+        case .online: return "在线底图"
+        }
+    }
+
+    var symbolName: String {
+        switch self {
+        case .all: return "line.3.horizontal.decrease.circle"
+        case .dataset: return "square.stack.3d.up"
+        case .raster: return "photo"
+        case .online: return "globe"
+        }
+    }
+
+    func matches(_ kind: MapLayer.Kind) -> Bool {
+        switch self {
+        case .all: return true
+        case .dataset: return kind == .dataset
+        case .raster: return kind == .raster
+        case .online: return kind == .online
+        }
+    }
+}
+
+// MARK: - 拖动排序
+
+/// 拖动载荷：面板内部自己约定一个前缀。
+///
+/// 走自定义类型（`Resources/Info.plist` 里声明成「导出的类型」）而不是纯文本，
+/// 这样只有本应用自己面板里拖出来的东西才会被接住：文件、文字、图片拖进来都不会误判成图层。
+private enum LayerDragPayload {
+    static let contentType = UTType(exportedAs: "com.thregren.euclid.layer-id")
+
+    static func provider(for id: String) -> NSItemProvider {
+        NSItemProvider(
+            item: Data(id.utf8) as NSData,
+            typeIdentifier: contentType.identifier
+        )
+    }
+}
+
+/// 落点提示：插到第 `row` 行的上方（`above`）还是下方。
+private struct DropTarget: Equatable {
+    var row: Int
+    var above: Bool
+}
+
+/// 图层行的拖放代理：拖动到哪一行的上／下半，就插到那一侧。
+private struct LayerDropDelegate: DropDelegate {
+    let row: Int
+    let model: AppModel
+    @Binding var draggingID: String?
+    @Binding var dropTarget: DropTarget?
+
+    func validateDrop(info: DropInfo) -> Bool {
+        draggingID != nil && info.hasItemsConforming(to: [LayerDragPayload.contentType])
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        guard draggingID != nil else { return nil }
+        dropTarget = DropTarget(row: row, above: isUpperHalf(info))
+        return DropProposal(operation: .move)
+    }
+
+    func dropExited(info: DropInfo) {
+        if dropTarget?.row == row { dropTarget = nil }
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        let above = isUpperHalf(info)
+        defer {
+            dropTarget = nil
+            draggingID = nil
+        }
+        guard let draggingID else { return false }
+        model.moveLayer(draggingID, toPanelRow: above ? row : row + 1)
+        model.selectLayer(draggingID)
+        return true
+    }
+
+    private func isUpperHalf(_ info: DropInfo) -> Bool {
+        info.location.y < LayersPanel.rowHeight / 2
+    }
+}
+
+// MARK: - 一行
+
+/// 一行图层：缩略图 + 名称 + 来源 + 显示开关。
 private struct LayerRow: View {
     @Environment(AppModel.self) private var model
     let layer: MapLayer
     let isSelected: Bool
+    let thumbnail: CGImage?
 
     var body: some View {
-        HStack(spacing: 8) {
-            Button {
-                model.setVisible(!layer.isVisible, of: layer.id)
-            } label: {
-                Image(systemName: layer.isVisible ? "eye" : "eye.slash")
-                    .foregroundStyle(layer.isVisible ? .primary : .tertiary)
-                    .frame(width: 16)
-            }
-            .buttonStyle(.borderless)
-            .help(layer.isVisible ? "隐藏这一层" : "显示这一层")
-
-            Image(systemName: symbol)
-                .foregroundStyle(.tint)
-                .frame(width: 18)
+        HStack(spacing: 9) {
+            thumbnailView
 
             VStack(alignment: .leading, spacing: 1) {
-                HStack(spacing: 6) {
+                HStack(spacing: 5) {
                     Text(layer.name)
+                        .font(.callout.weight(.semibold))
                         .lineLimit(1)
                         .truncationMode(.middle)
                     if layer.isAnchor {
@@ -129,21 +419,72 @@ private struct LayerRow: View {
                             .foregroundStyle(.tertiary)
                     }
                 }
-                Text(layer.detail)
+                Text(subtitle)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+                    .truncationMode(.middle)
             }
 
             Spacer(minLength: 4)
 
-            Text("\(Int((layer.opacity * 100).rounded()))%")
-                .font(.caption)
-                .monospacedDigit()
-                .foregroundStyle(.secondary)
+            visibilityToggle
         }
-        .opacity(layer.isVisible ? 1 : 0.55)
-        .padding(.vertical, 2)
+        .padding(.horizontal, 8)
+        .frame(height: LayersPanel.rowHeight)
+        .background(
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(isSelected ? Color.accentColor.opacity(0.20) : .clear)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .strokeBorder(Color.accentColor.opacity(isSelected ? 0.35 : 0), lineWidth: 1)
+        )
+        .opacity(layer.isVisible ? 1 : 0.5)
+    }
+
+    /// 缩略图：拿到来源里的一张瓦片就画出来，取不到就退回类型图标。
+    private var thumbnailView: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 5, style: .continuous)
+                .fill(Color.primary.opacity(0.07))
+            if let thumbnail {
+                Image(decorative: thumbnail, scale: 1)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .accessibilityHidden(true)
+            } else {
+                Image(systemName: symbol)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.tint)
+            }
+        }
+        .frame(width: 40, height: 28)
+        .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 5, style: .continuous)
+                .strokeBorder(.separator.opacity(0.7), lineWidth: 0.5)
+        )
+    }
+
+    private var visibilityToggle: some View {
+        Button {
+            model.setVisible(!layer.isVisible, of: layer.id)
+        } label: {
+            Image(systemName: layer.isVisible ? "checkmark.square.fill" : "square")
+                .font(.system(size: 13))
+                .foregroundStyle(layer.isVisible ? AnyShapeStyle(.tint) : AnyShapeStyle(.tertiary))
+        }
+        .buttonStyle(.plain)
+        .help(layer.isVisible ? "隐藏这一层" : "显示这一层")
+        .accessibilityLabel(layer.isVisible ? "隐藏这一层" : "显示这一层")
+    }
+
+    /// 副标题：来源说明 + 不透明度（非 100% 时才补一句，免得每行都很长）。
+    private var subtitle: String {
+        var parts = [layer.detail]
+        if layer.opacity < 0.999 { parts.append("\(Int((layer.opacity * 100).rounded()))%") }
+        return parts.joined(separator: " · ")
     }
 
     private var symbol: String {
@@ -155,7 +496,7 @@ private struct LayerRow: View {
     }
 }
 
-/// 选中层的属性：Pixelmator 里跟在图层列表下面那一段。
+/// 选中层的属性：跟在检查器里的「图层属性」那一段。
 struct LayerPropertiesSection: View {
     @Environment(AppModel.self) private var model
     let layer: MapLayer

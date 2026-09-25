@@ -32,13 +32,27 @@ final class MeasurementOverlay {
 
     private var contentsScale: CGFloat = 2
 
+    /// 界面外观：标注上那几个**跟随外观**的语义色（悬停环、标注底色与文字）要用它解析。
+    ///
+    /// 其余颜色（白色光晕、调色板里的描边）是画在影像上的，与界面深浅无关，固定即可。
+    var appearance: NSAppearance = NSAppearance.currentDrawing() {
+        didSet {
+            guard appearance != oldValue else { return }
+            hoverLayer.strokeColor = accentColor
+        }
+    }
+
+    private var accentColor: CGColor {
+        NSColor.controlAccentColor.resolvedCGColor(in: appearance)
+    }
+
     init() {
         hostLayer.isGeometryFlipped = true
         hostLayer.masksToBounds = true
 
         hoverLayer.fillColor = nil
         hoverLayer.lineWidth = 1.5
-        hoverLayer.strokeColor = NSColor.controlAccentColor.cgColor
+        hoverLayer.strokeColor = accentColor
         hoverLayer.isHidden = true
     }
 
@@ -161,7 +175,7 @@ final class MeasurementOverlay {
                 height: radius * 2
             ))
             hoverLayer.path = path
-            hoverLayer.strokeColor = NSColor.controlAccentColor.cgColor
+            hoverLayer.strokeColor = accentColor
             hoverLayer.isHidden = false
             // 移到最上层，保证提示环不被其它标注盖住。
             hostLayer.addSublayer(hoverLayer)
@@ -475,8 +489,11 @@ final class MeasurementOverlay {
         layer.bounds = CGRect(origin: .zero, size: size)
         layer.position = position
         layer.contentsScale = contentsScale
-        layer.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.94).cgColor
-        layer.foregroundColor = NSColor.labelColor.cgColor
+        // 标注底色与文字跟随界面外观：深色下是深底浅字，浅色下是浅底深字。
+        layer.backgroundColor = NSColor.controlBackgroundColor
+            .withAlphaComponent(0.94)
+            .resolvedCGColor(in: appearance)
+        layer.foregroundColor = NSColor.labelColor.resolvedCGColor(in: appearance)
         layer.cornerRadius = 4
         layer.masksToBounds = true
         layer.borderWidth = 0.5

@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import SwiftUI
 import TileKit
 
 /// 开发调试用的示例数据。
@@ -271,6 +272,14 @@ enum DebugWindowScript {
                 ),
                 display: true
             )
+            // 无人值守截图时把它抬到最前，否则会连桌面别的窗口一起拍进去。
+            window.level = .floating
+            window.orderFrontRegardless()
+            NSApplication.shared.activate(ignoringOtherApps: true)
+            DebugAppearanceScript.applyToWindowsIfRequested()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                DebugAppearanceScript.applyToWindowsIfRequested()
+            }
         }
     }
 }
@@ -279,14 +288,203 @@ enum DebugWindowScript {
 ///
 /// `EUCLID_DEBUG_APPEARANCE=dark|light` 时强制指定外观，便于在浅色与深色下各截一次图核对对比度；
 /// 正式使用不设置该变量，外观完全跟随系统。
+///
+/// 两侧都要管：`NSApp.appearance` 管 AppKit 那一半（窗口边框、状态栏、画布里的 CALayer），
+/// SwiftUI 画的面板与文字走的是另一条路（见 `DebugColorSchemeOverride`）。
+/// 只设前者的话截出来是「面板还浅、边框已深」的半深色，核对不了对比度。
 @MainActor
 enum DebugAppearanceScript {
     static func applyIfRequested() {
-        guard let raw = ProcessInfo.processInfo.environment["EUCLID_DEBUG_APPEARANCE"]?.lowercased() else { return }
+        guard let appearance = requested else { return }
+        NSApplication.shared.appearance = appearance
+    }
+
+    /// 把已经开出来的窗口也切成指定外观（SwiftUI 会跟着更新环境里的深浅色）。
+    static func applyToWindowsIfRequested() {
+        guard let appearance = requested else { return }
+        for window in NSApplication.shared.windows {
+            window.appearance = appearance
+        }
+    }
+
+    /// SwiftUI 那一半的环境色（见 `DebugColorSchemeOverride`）。
+    static var requestedColorScheme: ColorScheme? {
+        switch ProcessInfo.processInfo.environment["EUCLID_DEBUG_APPEARANCE"]?.lowercased() {
+        case "dark": return .dark
+        case "light": return .light
+        default: return nil
+        }
+    }
+
+    private static var requested: NSAppearance? {
+        guard let raw = ProcessInfo.processInfo.environment["EUCLID_DEBUG_APPEARANCE"]?.lowercased() else { return nil }
         switch raw {
-        case "dark": NSApplication.shared.appearance = NSAppearance(named: .darkAqua)
-        case "light": NSApplication.shared.appearance = NSAppearance(named: .aqua)
-        default: break
+        case "dark": return NSAppearance(named: .darkAqua)
+        case "light": return NSAppearance(named: .aqua)
+        default: return nil
+        }
+    }
+}
+
+/// 调试用的深浅色覆盖。
+///
+/// 只设 `NSApp.appearance` 的话，只有 AppKit 那一半（窗口边框、状态栏、画布里的 CALayer）
+/// 会变深，SwiftUI 画的面板与文字仍停在浅色，截出来是「半深色」，核对不了对比度。
+/// 这里把环境色一起定下来，深浅色截图才有参考价值。
+/// 正式使用不设置 `EUCLID_DEBUG_APPEARANCE`，环境色完全跟随系统。
+struct DebugColorSchemeOverride: ViewModifier {
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if let scheme = DebugAppearanceScript.requestedColorScheme {
+            content.environment(\.colorScheme, scheme)
+        } else {
+            content
+        }
+    }
+}
+
+/// 开发调试用的图层脚本。
+///
+/// `EUCLID_DEBUG_OPEN=<目录或影像>` 时启动后直接打开这份数据（不动「最近打开」那份偏好），
+/// 无人值守截图核对时用得上：本机数据换一份就能看真实影像下的界面。
+///
+/// `EUCLID_DEBUG_LAYERS="add;move:0>3;opacity:0.6;select:1"` 时启动十秒后
+/// 按分号分隔的顺序执行，每步把**面板里的行顺序**（上 → 下）打到 stderr。
+///
+/// 拖动排序这条链路没有别的办法无人值守地跑：这里调的就是面板拖放用的那个模型方法
+/// （`moveLayer(_:toPanelRow:)`），因此日志里的顺序就是「拖到那一行之后应该看到的顺序」。
+@MainActor
+enum DebugLayerScript {
+    static func runIfRequested(model: AppModel) {
+        if let path = ProcessInfo.processInfo.environment["EUCLID_DEBUG_OPEN"] {
+            model.openForDebugging(URL(fileURLWithPath: path))
+        }
+        guard let raw = ProcessInfo.processInfo.environment["EUCLID_DEBUG_LAYERS"] else { return }
+        func log(_ text: String) {
+            FileHandle.standardError.write(Data(("[layers] " + text + "\n").utf8))
+        }
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(10))
+            log("开始：" + order(model))
+            for step in raw.split(separator: ";") {
+                let parts = step.trimmingCharacters(in: .whitespaces)
+                    .split(separator: ":", maxSplits: 1)
+                    .map(String.init)
+                guard let action = parts.first, !action.isEmpty else { continue }
+                let value = parts.count > 1 ? parts[1] : ""
+                switch action {
+                case "move":
+                    let numbers = value.split(separator: ">").compactMap { Int($0) }
+                    guard numbers.count == 2, model.panelOrder.indices.contains(numbers[0]) else { break }
+                    let id = model.panelOrder[numbers[0]].id
+                    model.moveLayer(id, toPanelRow: numbers[1])
+                    log("把面板第 \(numbers[0]) 行拖到第 \(numbers[1]) 行：\(order(model))")
+                case "opacity":
+                    guard let opacity = Double(value) else { break }
+                    model.setOpacity(of: model.selectedLayer?.id, to: opacity)
+                    log("不透明度 → \(opacity)")
+                case "select":
+                    guard let row = Int(value), model.panelOrder.indices.contains(row) else { break }
+                    model.selectLayer(model.panelOrder[row].id)
+                    log("选中第 \(row) 行：\(model.selectedLayer?.name ?? "无")")
+                case "hide", "show":
+                    let parts = value.split(separator: ">").compactMap { Int($0) }
+                    guard let row = parts.first, model.panelOrder.indices.contains(row) else { break }
+                    model.setVisible(action == "show", of: model.panelOrder[row].id)
+                    log("第 \(row) 行\(action == "show" ? "显示" : "隐藏")：\(order(model))")
+                case "add":
+                    guard let id = model.selectedLayer?.id else { break }
+                    model.duplicateLayer(id)
+                    log("复制选中层：\(order(model))")
+                default:
+                    break
+                }
+            }
+            log("结束：" + order(model))
+        }
+    }
+
+    /// 面板里的行顺序（第一行是最上面那层），带各自的实例 id、来源与不透明度。
+    /// id 只取前 4 位：核对拖动排序时看的就是「哪一层挪到了哪一行」。
+    private static func order(_ model: AppModel) -> String {
+        model.panelOrder
+            .map {
+                let shortID = String($0.id.prefix(4))
+                return "\(shortID)：\($0.name)<\($0.kind.rawValue)·\(Int(($0.opacity * 100).rounded()))%>"
+            }
+            .joined(separator: " | ")
+    }
+}
+
+/// 开发调试用的窗口截图脚本。
+///
+/// `EUCLID_DEBUG_WINDOW_SNAPSHOT=<路径>` 时启动若干秒后把**整个窗口内容**渲染成 PNG。
+/// 与 `EUCLID_DEBUG_SNAPSHOT` 只截画布不同，这个连两侧面板、状态栏一起截，用来核对布局与
+/// 深浅色对比度；渲染走 AppKit 自己的绘制（`cacheDisplay`），因此不需要屏幕录制权限，
+/// 也不必让窗口真的显示在屏幕上。
+///
+/// `EUCLID_DEBUG_WINDOW_SNAPSHOT_AT=6,12` 可给一串「启动后第几秒」（逗号分隔，默认 10）；
+/// 路径里含 `%d` 时按序号展开，便于一次跑出多张（例如数据铺好前后各一张）。
+@MainActor
+enum DebugWindowSnapshotScript {
+    static func runIfRequested() {
+        guard let path = ProcessInfo.processInfo.environment["EUCLID_DEBUG_WINDOW_SNAPSHOT"] else { return }
+        let times = (ProcessInfo.processInfo.environment["EUCLID_DEBUG_WINDOW_SNAPSHOT_AT"] ?? "10")
+            .split(separator: ",")
+            .compactMap { Double($0) }
+            .sorted()
+        Task { @MainActor in
+            var elapsed = 0.0
+            for (index, time) in times.enumerated() {
+                let delay = max(0, time - elapsed)
+                if delay > 0 { try? await Task.sleep(for: .seconds(delay)) }
+                elapsed = max(elapsed, time)
+                let target = path.contains("%d") ? String(format: path, index + 1) : path
+                write(to: URL(fileURLWithPath: target), label: "\(time)s")
+            }
+        }
+    }
+
+    /// 把一个视图渲染成 PNG 字节（整棵视图树，含 AppKit 与 SwiftUI 两侧）。
+    static func pngData(of view: NSView) -> Data? {
+        guard view.bounds.width >= 1, view.bounds.height >= 1,
+              let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return nil }
+        view.cacheDisplay(in: view.bounds, to: rep)
+        return rep.representation(using: .png, properties: [:])
+    }
+
+    /// 在视图树里找第一个指定类型的视图（调试输出用）。
+    private static func find<T: NSView>(_ type: T.Type, in view: NSView) -> T? {
+        if let match = view as? T { return match }
+        for subview in view.subviews {
+            if let match = find(type, in: subview) { return match }
+        }
+        return nil
+    }
+
+    private static func write(to url: URL, label: String) {
+        func log(_ text: String) {
+            FileHandle.standardError.write(Data(("[window] " + text + "\n").utf8))
+        }
+        guard let window = NSApplication.shared.windows.first(where: { $0.isVisible }),
+              let content = window.contentView else {
+            log("\(label)：没有可见窗口")
+            return
+        }
+        guard let data = pngData(of: content) else {
+            log("\(label)：窗口内容渲染失败")
+            return
+        }
+        // 画布底色与外观的落点（核对深浅色时最容易出错的就是这一对）：
+        if let canvas = Self.find(TileCanvasNSView.self, in: content) {
+            log("画布：\(canvas.debugAppearanceDescription)")
+        }
+        do {
+            try data.write(to: url, options: .atomic)
+            let size = "\(Int(content.bounds.width))×\(Int(content.bounds.height)) 点"
+            log("\(label)：已写出 \(url.path)（\(size)，\(data.count) 字节）")
+        } catch {
+            log("\(label)：写盘失败 \(error.localizedDescription)")
         }
     }
 }

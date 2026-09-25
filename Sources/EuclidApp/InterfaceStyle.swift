@@ -8,6 +8,14 @@ import SwiftUI
 enum InterfaceStyle {
     /// 浮在内容之上的控制层圆角，与系统控件的圆角观感一致。
     static let controlCornerRadius: CGFloat = 10
+    /// 浮层面板（图层 / 检查器 / 工具条）的圆角：比控制层更大一圈。
+    static let panelCornerRadius: CGFloat = 12
+    /// 左侧「图层」面板的宽度。
+    static let layersPanelWidth: CGFloat = 236
+    /// 右侧检查器面板的宽度。
+    static let inspectorPanelWidth: CGFloat = 292
+    /// 最右侧工具条的宽度。
+    static let toolStripWidth: CGFloat = 44
     /// 控件最小点击高度（macOS 指针输入下仍保证可点）。
     static let controlHeight: CGFloat = 24
 
@@ -34,5 +42,63 @@ extension View {
             background(.regularMaterial, in: shape)
                 .overlay(shape.strokeBorder(.separator.opacity(0.6), lineWidth: 0.5))
         }
+    }
+
+    /// 浮层面板外观：玻璃（或材质）底 + 一道描边 + 一层投影。
+    ///
+    /// 投影按深浅色分开取：深色下黑色投影不压住底下的画布就看不出来，
+    /// 浅色下同样的量又会显脏，两边各取一个刚好把面板从画布上「抬起来」的值。
+    func panelSurface(cornerRadius: CGFloat = InterfaceStyle.panelCornerRadius) -> some View {
+        modifier(PanelSurface(cornerRadius: cornerRadius))
+    }
+}
+
+/// 浮层面板：材质 + 描边 + 投影。
+///
+/// 面板用比小控件更「实」的一档材质（而不是 Liquid Glass）：它是一整块面积压在影像上，
+/// 玻璃太透，底下的白影像会把面板整体提亮，字反而不好认；厚材质既能透出一点底，
+/// 又保证文字对比度与 Pixelmator 那种面板色调接近。
+private struct PanelSurface: ViewModifier {
+    @Environment(\.colorScheme) private var colorScheme
+    let cornerRadius: CGFloat
+
+    func body(content: Content) -> some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        content
+            .background {
+                // 材质负责透出底下的影像，再压一层与窗口同色的半透明底：
+                // 影像很亮时（正射影像常常整片白）玻璃会把面板整体提亮，字就压不住了。
+                shape
+                    .fill(.thickMaterial)
+                    .overlay {
+                        shape.fill(
+                            Color(nsColor: .windowBackgroundColor)
+                                .opacity(colorScheme == .dark ? 0.55 : 0.35)
+                        )
+                    }
+            }
+            .overlay(shape.strokeBorder(.separator.opacity(0.6), lineWidth: 0.5))
+            .shadow(
+                color: .black.opacity(colorScheme == .dark ? 0.5 : 0.16),
+                radius: 12,
+                y: 4
+            )
+    }
+}
+
+extension NSColor {
+    /// 在指定外观下解析语义色。
+    ///
+    /// `NSColor.cgColor` 只认「当前绘制外观」（`NSAppearance.current`），在绘制上下文之外
+    /// 一律按系统外观取色。而 CALayer 的颜色必须在设置的那一刻就定下来，
+    /// 于是强制深色（或应用自己声明深色）时，画布底色与网格线仍是浅色的一套。
+    /// 凡是要写进 CALayer 的语义色，都得先经过这里。
+    func resolvedCGColor(in appearance: NSAppearance) -> CGColor {
+        let color = self
+        var resolved = color.cgColor
+        appearance.performAsCurrentDrawingAppearance {
+            resolved = color.cgColor
+        }
+        return resolved
     }
 }

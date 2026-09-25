@@ -20,6 +20,14 @@ struct ViewportSnapshot: Sendable {
 final class TileCanvasNSView: NSView {
     private let overlay = MeasurementOverlay()
 
+    /// 画布底色（影像之外的「桌面」）。
+    ///
+    /// 单独一层铺在所有瓦片之下，而不是直接给视图图层设 `backgroundColor`：
+    /// 这个视图是被 SwiftUI 托管的（`NSViewRepresentable`），实测视图图层自己的底色
+    /// 根本不会被画出来（它下面的子图层倒是正常），画布会直接露出窗口底色 ——
+    /// 于是深色模式下画布依旧是白的。铺一层自己的底最稳。
+    private let backgroundLayer = CALayer()
+
     /// 图层栈：按 `MapLayer.id` 存放，显示顺序由模型给的图层列表决定（列表末尾在最上层）。
     private var stacks: [String: TileLayerStack] = [:]
     /// 每一层已经装配过的来源签名：只有来源真的变了才重配（改不透明度、调顺序都不重取图）。
@@ -42,7 +50,7 @@ final class TileCanvasNSView: NSView {
     private func makeStack() -> TileLayerStack {
         let stack = TileLayerStack()
         stack.needsSync = { [weak self] in self?.syncLayers() }
-        stack.refreshGridAppearance()
+        stack.refreshGridAppearance(stroke: gridStrokeColor)
         return stack
     }
     /// 适配窗口用的默认范围（数据范围算出来之前 / 在线底图）。
@@ -109,10 +117,11 @@ final class TileCanvasNSView: NSView {
         setAccessibilityRole(.image)
         setAccessibilityLabel("地图画布，暂无内容")
         layer?.masksToBounds = true
-        layer?.backgroundColor = NSColor.underPageBackgroundColor.cgColor
 
-        // 图层栈按需创建（见 `setLayers`），测量标注常驻最上层。
+        // 顺序即层序：底色 → 图层栈（按需插在中间）→ 测量标注。
+        layer?.addSublayer(backgroundLayer)
         layer?.addSublayer(overlay.hostLayer)
+        applyAppearanceColors()
     }
 
     @available(*, unavailable)
@@ -138,13 +147,36 @@ final class TileCanvasNSView: NSView {
         refreshOverlay()
     }
 
+    /// 画布底色：影像之外的「桌面」，跟着外观走（深色下是接近黑的灰）。
+    ///
+    /// 语义色要按当前有效外观解析：`NSColor.cgColor` 只看「当前绘制外观」，
+    /// 在绘制上下文之外拿到的永远是系统外观的那一套，深色模式下画布会留在浅色。
+    private var canvasBackgroundColor: CGColor {
+        NSColor.underPageBackgroundColor.resolvedCGColor(in: effectiveAppearance)
+    }
+
+    /// 瓦片网格线的颜色：同样按当前有效外观解析。
+    private var gridStrokeColor: CGColor {
+        NSColor.labelColor.withAlphaComponent(0.32).resolvedCGColor(in: effectiveAppearance)
+    }
+
     /// 语义色在每次外观变化时重新取一遍，避免深浅色切换后颜色残留。
     private func applyAppearanceColors() {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        layer?.backgroundColor = NSColor.underPageBackgroundColor.cgColor
-        for stack in stacks.values { stack.refreshGridAppearance() }
+        backgroundLayer.backgroundColor = canvasBackgroundColor
+        backgroundLayer.frame = bounds
+        for stack in stacks.values { stack.refreshGridAppearance(stroke: gridStrokeColor) }
+        overlay.appearance = effectiveAppearance
         CATransaction.commit()
+    }
+
+    /// 调试用：当前外观与画布底色（无人值守核对深浅色时看这两个值最直接）。
+    var debugAppearanceDescription: String {
+        let components = (backgroundLayer.backgroundColor?.components ?? []).map {
+            Int((CGFloat($0) * 255).rounded())
+        }
+        return "外观=\(effectiveAppearance.name.rawValue) 画布底色=\(components)"
     }
 
     override func updateTrackingAreas() {
@@ -413,6 +445,7 @@ final class TileCanvasNSView: NSView {
         camera = camera.clamped(zoomLevelRange: zoomBounds)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
+        backgroundLayer.frame = bounds
         for stack in stacks.values { stack.hostLayer.frame = bounds }
         CATransaction.commit()
         syncLayers()

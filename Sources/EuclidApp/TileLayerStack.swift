@@ -627,8 +627,11 @@ final class TileLayerStack {
     }
 
     /// 刷新网格颜色（跟随深浅色）。
-    func refreshGridAppearance() {
-        gridLayer.strokeColor = NSColor.labelColor.withAlphaComponent(0.32).cgColor
+    ///
+    /// 颜色由画布按**当前有效外观**解析好后传进来：CALayer 的颜色没有「语义」，
+    /// 设置的那一刻就定死了，自己在这里取 `labelColor.cgColor` 只会拿到系统外观的值。
+    func refreshGridAppearance(stroke: CGColor) {
+        gridLayer.strokeColor = stroke
     }
 
     // MARK: - 辅助

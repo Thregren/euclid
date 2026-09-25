@@ -284,9 +284,26 @@ final class AppModel {
         setStatus("已复制图层：\(copy.name)", autoClearAfter: 5)
     }
 
-    /// 拖拽排序（列表顺序即叠放顺序，末尾在最上）。
-    func moveLayers(from offsets: IndexSet, to destination: Int) {
-        layers.move(fromOffsets: offsets, toOffset: destination)
+    // MARK: - 图层面板的顺序
+
+    /// 图层在面板里自上而下的顺序。
+    ///
+    /// 画师习惯：**最上面那层排在第一行**（Pixelmator / Photoshop 都如此），
+    /// 而模型里存的是「下 → 上」，两者正好相反。这份换算只在这里做，
+    /// 面板显示与拖动排序都走它，免得各处各翻一次。
+    var panelOrder: [MapLayer] { layers.reversed() }
+
+    /// 把某一层拖到面板的某一行：`row` 是插入位置，取 `0…layers.count`，
+    /// `0` 表示放到第一行之前（也就是最上层），`layers.count` 表示放到最后一行之后（最底层）。
+    func moveLayer(_ id: String, toPanelRow row: Int) {
+        guard let from = layers.firstIndex(where: { $0.id == id }) else { return }
+        let clamped = min(max(row, 0), layers.count)
+        // 面板行号自上而下，模型下标自下而上：先把行号翻成「移除之前」的插入下标，
+        // 移除之后再把落在后面的下标补回来。
+        var target = layers.count - clamped
+        let layer = layers.remove(at: from)
+        if target > from { target -= 1 }
+        layers.insert(layer, at: min(max(target, 0), layers.count))
         pushLayers()
     }
 
@@ -378,6 +395,8 @@ final class AppModel {
     let viewport = ViewportState()
     let canvas = CanvasController()
     let measurements = MeasurementStore()
+    /// 左侧图层面板里的小缩略图。
+    let thumbnails = LayerThumbnailStore()
     let download = TileDownloadModel()
     /// 「从影像生成瓦片」面板的状态。
     let tileExport = TileExportModel()
@@ -657,7 +676,21 @@ final class AppModel {
             return
         }
         remember(url)
-        guard isDirectory.boolValue else {
+        openWithoutRemembering(url, isDirectory: isDirectory.boolValue)
+    }
+
+    /// 打开一份数据但**不写进「最近打开」**（调试用：无人值守截图时不改用户的偏好）。
+    func openForDebugging(_ url: URL) {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path(percentEncoded: false), isDirectory: &isDirectory) else {
+            setStatus("找不到这个路径：\(url.lastPathComponent)")
+            return
+        }
+        openWithoutRemembering(url, isDirectory: isDirectory.boolValue)
+    }
+
+    private func openWithoutRemembering(_ url: URL, isDirectory: Bool) {
+        guard isDirectory else {
             // 文件：按单幅影像打开（GeoTIFF / TIFF / 普通图片）。
             openRaster(url)
             return

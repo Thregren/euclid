@@ -9,7 +9,7 @@ macOS 原生的正射影像查看器与量测工具，为 **WebODM / ODM 的输�
 按地理参考摆到正确位置，读坐标、测距离、量面积、画圆、导出结果、出图——
 全部在本机完成，没有联网依赖。
 
-当前版本 **1.13.0**，下载见 [Releases](https://github.com/Thregren/euclid/releases/latest)。
+当前版本 **1.14.0**，下载见 [Releases](https://github.com/Thregren/euclid/releases/latest)。
 
 ## 特性
 
@@ -46,6 +46,9 @@ macOS 原生的正射影像查看器与量测工具，为 **WebODM / ODM 的输�
   在 OSM 在线编辑器 / QGIS 里填 `http://127.0.0.1:端口/{z}/{x}/{y}.png` 就能拿本地影像当底图
 - **多图层**：本地数据集、单幅影像、在线底图都能作为图层叠加，每层一条独立的不透明度、
   单独的显示开关与移除按钮；列表顺序就是叠放顺序，其中「基准层」是测量、存档与相机尺度的依据
+- **图层面板在左边**（版式照 Pixelmator Pro）：每行有缩略图、名称、来源与显示勾选框，
+  **按住任意一行就能拖着改叠放顺序**（拖到哪一行的上／下半就插到那一侧，有落点提示线）；
+  面板底部是选中层的不透明度滑杆，以及按名字搜索、按种类过滤的搜索框
 - **从影像生成瓦片**：把 GeoTIFF / TIFF 切成各级瓦片（⌘⇧T），
   尺寸 512（默认，本地浏览 1:1）/ 256 可选，格式 JPEG（质量默认 85）或 PNG，生成完直接打开
 - 测量结果按数据集 / 影像路径自动存档，下次打开自动恢复
@@ -166,7 +169,10 @@ cd euclid
 | 图层栈 | `TileLayerStack.swift` | 「一个数据源 ↔ 一个宿主图层」的全套逻辑：换层级留旧图兜底、祖先贴图、同帧接图、缺片负缓存、按中心距离排序取图、空闲预取、瓦片网格、不透明度 |
 | 测量交互 | `MeasurementStore.swift` | 工具状态机（浏览 / 点 / 测距 / 测面积 / 画圆）、草稿与已完成测量、选中、撤销重做（1.5 s 合并窗口）、半径输入、顶点吸附数据 |
 | 标注绘制 | `MeasurementOverlay.swift`、`MeasurementPalette.swift` | 描边 / 填充 / 顶点 / 标注 / 半径辅助线各用图层池复用；圆环采样缓存；深浅色与「减少动态效果」适配；出图前的文字翻转补偿 |
-| 界面 | `RootView.swift`、`SidebarView.swift`、`InspectorView.swift`、`InspectorSections.swift`、`StatusBarView.swift`、`ScaleBarView.swift`、`InterfaceStyle.swift`、`CoordinateText.swift` | 三栏结构、数据源列表与最近打开、检查器分区、状态栏读数、比例尺（与出图共用刻度算法）、语义色与材质 |
+| 界面结构 | `RootView.swift`、`InterfaceStyle.swift` | 画布铺满窗口，左侧图层面板 / 右侧检查器 / 右缘工具条浮在画布之上，底部一条状态栏；面板材质、圆角、投影与语义色解析都在 `InterfaceStyle` 里收敛 |
+| 图层面板 | `LayerPanel.swift`、`LayerThumbnails.swift` | 左栏「图层」：标题行（＋ 添加 / 复制 / ⋯ 更多）、可点选可拖动排序的图层行、底部不透明度与搜索；缩略图直接向图层来源要一张低层级瓦片，取不到就退回类型图标 |
+| 检查器 | `InspectorView.swift`、`InspectorSections.swift`、`DataSourceSections.swift` | 可用数据与最近打开、图层属性、测量、指针坐标、视图与来源详情 |
+| 状态栏与比例尺 | `StatusBarView.swift`、`ScaleBarView.swift`、`CoordinateText.swift` | 状态栏读数、比例尺（与出图共用刻度算法）、坐标文本格式化 |
 | 底图与下载界面 | `OnlineBasemap.swift`、`TileDownloadModel.swift`、`DownloadSheet.swift` | 在线底图配置与有效性判定；下载面板参数、计划预览、进度与取消 |
 | 出图 | `ViewExporter.swift` | 画面 + 信息栏（数据源、中心坐标、层级、比例尺）合成 PNG，供保存与剪贴板 |
 | 存档 | `MeasurementArchive.swift` | 测量结果按数据集 / 影像路径存到 `~/Library/Application Support/Euclid/` |
@@ -247,9 +253,11 @@ Sources/EuclidApp/        应用层
   EuclidApp.swift           入口、菜单命令
   AppModel.swift            应用状态、装配流程、出图与导出动作
   RootView.swift            窗口结构、工具栏、工具提示
-  SidebarView.swift         数据源列表、位置、最近打开
+  LayerPanel.swift          左栏图层面板（含拖动排序）
+  LayerThumbnails.swift     图层面板里的小缩略图
   InspectorView.swift       检查器布局
   InspectorSections.swift   指针坐标与测量分区
+  DataSourceSections.swift  可用数据与最近打开
   TileCanvasNSView.swift    AppKit 画布：渲染与交互
   TileMapView.swift         SwiftUI ↔ AppKit 桥接
   TileLayerStack.swift      单条瓦片图层栈
@@ -319,6 +327,24 @@ docs/                     技术路线、构建与运行、开发进度、使用
 [开发进度](docs/03-进度.md)｜[使用说明](docs/04-使用说明.md)
 
 ## 更新日志
+
+### 1.14.0
+
+- **图层管理搬到左边**，整块版式照 Pixelmator Pro 重做：画布铺满窗口，左侧「图层」面板、
+  右侧检查器、最右缘的竖直工具条（浏览 / 点坐标 / 测距 / 测面积 / 画圆，下面是瓦片网格与适配窗口）
+  都浮在画布之上，底部留一条状态栏；面板用比小控件更「实」的一档材质 + 描边 + 投影
+- **图层列表可以手动拖动排序**：按住任意一行拖动即可，拖到目标行的上／下半就插到那一侧
+  （落点处有强调色横线提示）。这一版改用 AppKit 的拖放（`onDrag` / `onDrop` + 自定义拖放类型），
+  上一版在 `Form` 里用 SwiftUI `draggable` / `dropDestination` 的路子在带按钮的行里起不来
+- 图层行左边是**该层真实的缩略图**（向图层来源取一张低层级瓦片缩图，取不到退回类型图标），
+  右边是显示勾选框；面板底部是选中层的不透明度滑杆与「搜索 + 按种类过滤」
+- 图层拖动排序的换算是「面板自上而下 = 图层从最上到最下」（画师习惯，与 Pixelmator 一致），
+  与模型里「下 → 上」的存储顺序相反，换算只在 `AppModel.panelOrder` / `moveLayer(_:toPanelRow:)` 一处做
+- **深色适配**：画布底色、瓦片网格线、测量标注的底色与文字都改成按**当前有效外观**解析语义色。
+  `NSColor.cgColor` 只看「当前绘制外观」，在绘制上下文之外取到的永远是系统外观那一套，
+  于是深色下画布底、网格线与标注底色都还停在浅色；另外画布底色改为单独一层（视图图层自己的
+  `backgroundColor` 在 SwiftUI 托管下不会被画出来）
+- 删除右侧检查器里的旧「图层」面板与左侧边栏；可用数据 / 最近打开搬进检查器
 
 ### 1.13.0
 

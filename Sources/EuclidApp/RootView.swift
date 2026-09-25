@@ -6,19 +6,19 @@ struct RootView: View {
 
     var body: some View {
         @Bindable var model = model
-        NavigationSplitView {
-            SidebarView()
-                .navigationSplitViewColumnWidth(min: 220, ideal: 250, max: 320)
-        } detail: {
-            MapScreen()
+        // 版式照 Pixelmator Pro：画布铺满窗口，两侧面板与右侧工具条浮在画布之上，
+        // 底部再留一条状态栏。面板之间不挤压画布，因此窗口拉大时看到的始终是整幅影像。
+        VStack(spacing: 0) {
+            ZStack {
+                MapScreen()
+                floatingPanels
+            }
+            StatusBarView()
         }
         // 标题给的是「当前在看什么」；没有内容时留空，避免拿 App 名当标题。
         .navigationTitle(model.hasMapContent ? model.basemapName : "")
         .navigationSubtitle(subtitle)
-        .inspector(isPresented: $model.showInspector) {
-            InspectorView()
-                .inspectorColumnWidth(min: 240, ideal: 280, max: 360)
-        }
+        .modifier(DebugColorSchemeOverride())
         .toolbar { toolbarContent }
         .sheet(isPresented: $model.showDownloadSheet) {
             DownloadSheet()
@@ -40,7 +40,26 @@ struct RootView: View {
             DebugTileExportScript.runIfRequested(model: model)
             DebugVerifyScript.runIfRequested(model: model)
             DebugTileServerScript.runIfRequested(model: model)
+            DebugLayerScript.runIfRequested(model: model)
         }
+    }
+
+    /// 浮在画布上的三块：左侧图层、右侧检查器、右缘工具条。
+    private var floatingPanels: some View {
+        HStack(alignment: .top, spacing: 10) {
+            LayersPanel()
+            Spacer(minLength: 0)
+            if model.showInspector {
+                InspectorView()
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
+            }
+            ToolStrip()
+        }
+        .padding(.top, 12)
+        .padding(.bottom, 12)
+        .padding(.leading, 14)
+        .padding(.trailing, 2)
+        .animation(InterfaceStyle.reducesMotion ? nil : .easeInOut(duration: 0.18), value: model.showInspector)
     }
 
     private var subtitle: String {
@@ -72,7 +91,6 @@ struct RootView: View {
         }
 
         ToolbarItemGroup(placement: .primaryAction) {
-            toolPicker
             exportMenu
 
             Toggle(isOn: Bindable(model).showInspector) {
@@ -129,23 +147,6 @@ struct RootView: View {
             Label("图层", systemImage: "square.3.layers.3d")
         }
         .help("添加图层、切换在线底图与瓦片工具（当前：\(model.basemapName)）")
-    }
-
-    private var toolPicker: some View {
-        Picker("工具", selection: Binding(
-            get: { model.measurements.tool },
-            set: { model.measurements.tool = $0 }
-        )) {
-            ForEach(MapTool.allCases, id: \.self) { tool in
-                Text(tool.title)
-                    .tag(tool)
-                    .help(tool.help)
-            }
-        }
-        .pickerStyle(.segmented)
-        .labelsHidden()
-        .frame(width: 232)
-        .help("工具（⌘1–⌘5，或按 \(MapTool.allCases.map(\.shortcut).joined(separator: " / "))）：浏览、点坐标、测距、测面积、画圆")
     }
 
     /// 出图、测量导出与测量存档收在同一个菜单里：
@@ -215,11 +216,13 @@ struct MapScreen: View {
                 measurements: model.measurements,
                 showGrid: model.showTileGrid
             )
-            .ignoresSafeArea(edges: .bottom)
+            // 画布铺到窗口边缘：浮层的面板与底部状态栏都压在它上面。
+            .ignoresSafeArea()
 
             if model.hasMapContent {
                 MapControls()
-                    .padding(.leading, 16)
+                    // 左栏浮着「图层」面板，画布左下角要让开它的宽度。
+                    .padding(.leading, 14 + InterfaceStyle.layersPanelWidth + 12)
                     .padding(.bottom, 16)
                     .transition(.opacity)
             }
@@ -230,9 +233,6 @@ struct MapScreen: View {
             } else if let message = model.loadingMessage {
                 LoadingOverlay(message: message)
             }
-        }
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            StatusBarView()
         }
         .dropDestination(for: URL.self) { urls, _ in
             guard let url = urls.first else { return false }
@@ -274,6 +274,99 @@ struct MapControls: View {
         .padding(.vertical, 7)
         .controlSurface()
         .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
+    }
+}
+
+/// 最右侧的竖直工具条（照 Pixelmator Pro 的右缘工具栏）。
+///
+/// 五个工具与「显示瓦片网格 / 适配窗口」都是高频动作，放在画布右缘一点就到；
+/// 上排是工具（互斥，当前工具有底色），下排是视图开关。
+struct ToolStrip: View {
+    @Environment(AppModel.self) private var model
+    @State private var hovered: String?
+
+    var body: some View {
+        VStack(spacing: 2) {
+            ForEach(MapTool.allCases, id: \.self) { tool in
+                toolButton(tool)
+            }
+
+            Divider()
+                .padding(.vertical, 4)
+
+            viewButton(
+                id: "grid",
+                symbol: "grid",
+                title: model.showTileGrid ? "隐藏瓦片网格（⌘G）" : "显示瓦片网格（⌘G）",
+                isOn: model.showTileGrid
+            ) {
+                model.showTileGrid.toggle()
+            }
+
+            viewButton(
+                id: "fit",
+                symbol: "arrow.up.left.and.arrow.down.right",
+                title: "适配窗口（⌘0）",
+                isOn: false
+            ) {
+                model.canvas.fit()
+            }
+        }
+        .padding(.vertical, 8)
+        .frame(width: InterfaceStyle.toolStripWidth)
+        .panelSurface()
+    }
+
+    private func toolButton(_ tool: MapTool) -> some View {
+        let isActive = model.measurements.tool == tool
+        return Button {
+            model.measurements.tool = tool
+        } label: {
+            Image(systemName: tool.symbolName)
+                .font(.system(size: 15, weight: .medium))
+                .frame(width: 30, height: 30)
+                .foregroundStyle(isActive ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
+                .background(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(fill(isActive: isActive, id: tool.rawValue))
+                )
+                .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .help(tool.help)
+        .accessibilityLabel(tool.title)
+        .onHover { hovered = $0 ? tool.rawValue : (hovered == tool.rawValue ? nil : hovered) }
+    }
+
+    private func viewButton(
+        id: String,
+        symbol: String,
+        title: String,
+        isOn: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 15, weight: .medium))
+                .frame(width: 30, height: 30)
+                .foregroundStyle(isOn ? AnyShapeStyle(.tint) : AnyShapeStyle(.primary))
+                .background(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(fill(isActive: isOn, id: id))
+                )
+                .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .help(title)
+        .accessibilityLabel(title)
+        .onHover { hovered = $0 ? id : (hovered == id ? nil : hovered) }
+    }
+
+    /// 底色：当前工具/开关用强调色，指针悬停时给一点灰，其余透明。
+    private func fill(isActive: Bool, id: String) -> Color {
+        if isActive { return .accentColor }
+        if hovered == id { return Color.primary.opacity(0.10) }
+        return .clear
     }
 }
 
