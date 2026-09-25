@@ -68,6 +68,11 @@ struct Euclid: App {
             .keyboardShortcut("t", modifiers: [.command, .shift])
             .help("把 GeoTIFF / TIFF 切成各级瓦片，生成后可直接浏览")
             Divider()
+            Button("快速导出当前视图（含标注）") {
+                model.quickExportView()
+            }
+            .keyboardShortcut("e", modifiers: .command)
+            .disabled(!model.hasMapContent)
             Button("导出当前视图为图片…") {
                 model.exportViewAsImage()
             }
@@ -78,6 +83,17 @@ struct Euclid: App {
             }
             .keyboardShortcut("c", modifiers: [.command, .shift])
             .disabled(!model.hasMapContent)
+            Divider()
+            Button("保存测量到文件…") {
+                model.saveMeasurementsToFile()
+            }
+            .keyboardShortcut("s", modifiers: .command)
+            Button("从文件载入测量…") {
+                model.loadMeasurementsFromFile()
+            }
+            Button("在访达中显示测量自动存档") {
+                model.revealMeasurementArchive()
+            }
         }
         CommandGroup(replacing: .undoRedo) {
             Button("撤销") { model.performUndo() }
@@ -117,6 +133,11 @@ struct Euclid: App {
                 .keyboardShortcut("4", modifiers: .command)
             Button("画圆") { model.measurements.tool = .circle }
                 .keyboardShortcut("5", modifiers: .command)
+            Divider()
+            Button("记下指针位置的点（把指针放到目标上，按 P）") {
+                model.dropPointAtCursor()
+            }
+            .disabled(!model.hasMapContent)
             Divider()
             Button("结束当前测量") {
                 model.measurements.finishDraft()

@@ -152,12 +152,16 @@ final class TileCanvasNSView: NSView {
     }
 
     /// 世界范围（在线底图的兜底适配目标）。
+    ///
+    /// 注意 y 的起点：墨卡托裁掉两极后的范围是 `0.1217…0.8783`，
+    /// 从 0 起算会让「适配整个世界」把视角整体推到北半球（以前打开在线底图看到的是北纬五十几度）。
     private static let worldRect = CGRect(
         x: 0,
-        y: 0,
+        y: WebMercator.normalizedY(latitude: WebMercator.maxLatitude),
         width: 1,
-        height: WebMercator.normalizedY(latitude: WebMercator.maxLatitude)
-            - WebMercator.normalizedY(latitude: -WebMercator.maxLatitude)
+        // 高度必须为正：y 向南递增，所以南边界减北边界。
+        height: WebMercator.normalizedY(latitude: -WebMercator.maxLatitude)
+            - WebMercator.normalizedY(latitude: WebMercator.maxLatitude)
     )
 
     /// 本地影像层（上层）。传 nil 表示关掉这一层。
@@ -340,6 +344,27 @@ final class TileCanvasNSView: NSView {
         camera.center = WebMercator.normalized(coordinate)
         camera = camera.clamped(zoomLevelRange: zoomBounds)
         syncLayers()
+    }
+
+    /// 把指针当前位置记成一个点（快捷键 P，与「点坐标」工具共用同一份数据）。
+    ///
+    /// 指针坐标优先取实时读数；还没移动过指针时按最后一次已知位置换算，
+    /// 因此「把鼠标放到目标上、按 P」一定落在你看到的位置。
+    @discardableResult
+    func dropPointAtCursor() -> GeoMeasurement? {
+        guard let store = measurementStore else { return nil }
+        // 优先用实时读数；指针不在画布上时退回「最后位置」，再退回视图中心。
+        let coordinate: GeoCoordinate
+        if let cursor = store.cursorInfo?.coordinate {
+            coordinate = cursor
+        } else if let point = lastPointerPoint {
+            coordinate = camera.coordinate(forViewPoint: point)
+        } else {
+            coordinate = WebMercator.coordinate(fromNormalized: camera.center)
+        }
+        let measurement = store.dropPoint(at: coordinate)
+        refreshOverlay()
+        return measurement
     }
 
     // MARK: - 缩放控制
@@ -696,6 +721,7 @@ final class TileCanvasNSView: NSView {
 
     override func mouseMoved(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
+        lastPointerPoint = point
         updateLiveCoordinate(point)
         reportCursor(point)
         updateHover(at: point)
@@ -710,6 +736,9 @@ final class TileCanvasNSView: NSView {
         hoveredVertex = nil
         refreshOverlay()
     }
+
+    /// 指针在画布里的最后位置（快捷键落点用；鼠标移出画布后仍然有效）。
+    private var lastPointerPoint: CGPoint?
 
     private func updateLiveCoordinate(_ point: CGPoint) {
         guard let store = measurementStore, tool != .browse, !store.draft.isEmpty else { return }
@@ -867,6 +896,9 @@ final class TileCanvasNSView: NSView {
         case "o":
             measurementStore?.tool = .circle
             window?.invalidateCursorRects(for: self)
+        case "p":
+            // 记下指针位置的点：与「点坐标」工具同一份数据，落点后立刻选中，可直接编辑样式。
+            dropPointAtCursor()
         case "+", "=":
             zoomIn()
         case "-", "_":

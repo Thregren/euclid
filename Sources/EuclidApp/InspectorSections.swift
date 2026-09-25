@@ -51,8 +51,15 @@ struct CursorCoordinateSection: View {
                 } label: {
                     Label("复制坐标", systemImage: "doc.on.doc")
                 }
+                // 与「点坐标」工具落的是同一种测量：把指针放到目标上按 P 就好。
+                Button {
+                    model.dropPointAtCursor()
+                } label: {
+                    Label("记下这个点", systemImage: "mappin.and.ellipse")
+                }
+                .help("把指针所在的坐标记成一个点（快捷键 P），与「点坐标」工具共用同一份测量数据")
             } else {
-                Text("把指针移到地图上即可读取坐标")
+                Text("把指针移到地图上即可读取坐标；把指针放到目标上按 P 可以记下这个点")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -106,9 +113,18 @@ struct MeasurementSection: View {
             }
 
             if store.hasContent {
-                Button("清除全部", role: .destructive) {
-                    model.clearMeasurements()
+                // 「彻底保存」与「彻底清理」明确摆在一起：存档是自动的，另外还能另存为文件带走。
+                HStack(spacing: 8) {
+                    Button("保存到文件…") { model.saveMeasurementsToFile() }
+                    Button("从文件载入…") { model.loadMeasurementsFromFile() }
+                    Spacer()
+                    Button("清除全部", role: .destructive) { model.clearMeasurements() }
                 }
+                .controlSize(.small)
+                Text("改动按数据集 / 影像自动存档，下次打开自动恢复；也可以另存为文件带走。")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         } header: {
             Text("测量")

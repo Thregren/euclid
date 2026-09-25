@@ -291,6 +291,46 @@ enum DebugAppearanceScript {
     }
 }
 
+/// 开发调试用的自检脚本：一次跑完「快捷键落点 / 快速导出 / 测量存档读写」。
+///
+/// `EUCLID_DEBUG_VERIFY=1` 时启动十几秒后依次执行并把结果打到 stderr。
+/// 只用于无人值守核对，正式使用不设置该变量。
+@MainActor
+enum DebugVerifyScript {
+    static func runIfRequested(model: AppModel) {
+        guard ProcessInfo.processInfo.environment["EUCLID_DEBUG_VERIFY"] != nil else { return }
+        func log(_ text: String) {
+            FileHandle.standardError.write(Data(("[verify] " + text + "\n").utf8))
+        }
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(14))
+            let center = model.viewport.center
+            log(String(format: "视图中心 %.5f, %.5f  z%d 底图=%@",
+                       center.longitude, center.latitude, model.viewport.dataZoom, model.basemapName))
+
+            // 1) 快捷键落点（与「点坐标」同一份数据）
+            let before = model.measurements.measurements.count
+            model.dropPointAtCursor()
+            model.dropPointAtCursor()
+            let points = model.measurements.measurements.filter { $0.kind == .point }
+            log("落点：测量 \(before) → \(model.measurements.measurements.count)，其中 point 类 \(points.count) 条，"
+                + "点坐标 \(points.last?.points.first.map { String(format: "%.5f, %.5f", $0.longitude, $0.latitude) } ?? "无")")
+
+            // 2) 测量存档读写（同一个文件：写进去再读回来）
+            let file = URL(fileURLWithPath: "/tmp/euclid-verify-measurements.json")
+            _ = model.writeMeasurements(to: file)
+            let written = model.measurements.measurements.count
+            model.clearMeasurements()
+            let loaded = model.loadMeasurements(from: file) ?? -1
+            log("存档：写出 \(written) 条 → 清空 → 读回 \(loaded) 条（应相等）")
+
+            // 3) 快速导出（不弹面板，直接落到快捷导出目录）
+            model.quickExportView()
+            log("快速导出：状态=「\(model.statusMessage ?? "无")」")
+        }
+    }
+}
+
 /// 开发调试用的瓦片生成脚本。
 ///
 /// `EUCLID_DEBUG_TILE_EXPORT="<输出目录>|<zmin>|<zmax>|<尺寸>|<jpg|png>[|<质量>]"` 时

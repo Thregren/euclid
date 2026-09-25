@@ -34,6 +34,7 @@ struct RootView: View {
             DebugBasemapScript.runIfRequested(model: model)
             DebugExportScript.runIfRequested(model: model)
             DebugTileExportScript.runIfRequested(model: model)
+            DebugVerifyScript.runIfRequested(model: model)
         }
     }
 
@@ -62,44 +63,12 @@ struct RootView: View {
             }
             .help("打开瓦片目录（⌘O）")
 
-            Button {
-                model.showDownloadSheet = true
-            } label: {
-                Label("下载在线瓦片", systemImage: "square.and.arrow.down.on.square")
-            }
-            .help("从在线瓦片源下载指定范围的瓦片（⌘⇧D）")
-
             basemapMenu
         }
 
         ToolbarItemGroup(placement: .primaryAction) {
             toolPicker
-
-            Button {
-                model.canvas.zoomOut()
-            } label: {
-                Label("缩小", systemImage: "minus.magnifyingglass")
-            }
-            .help("缩小（⌘-）")
-            .disabled(!model.hasMapContent)
-
-            Button {
-                model.canvas.zoomIn()
-            } label: {
-                Label("放大", systemImage: "plus.magnifyingglass")
-            }
-            .help("放大（⌘=）")
-            .disabled(!model.hasMapContent)
-
-            Button {
-                model.canvas.fit()
-            } label: {
-                Label("适配窗口", systemImage: "arrow.up.left.and.arrow.down.right")
-            }
-            .help("适配窗口（⌘0）")
-            .disabled(!model.hasMapContent)
-
-            measurementMenu
+            exportMenu
 
             Toggle(isOn: Bindable(model).showInspector) {
                 Label("检查器", systemImage: "sidebar.right")
@@ -134,6 +103,7 @@ struct RootView: View {
                 .keyboardShortcut("g", modifiers: .command)
             Divider()
             Button("下载在线瓦片…") { model.showDownloadSheet = true }
+            Button("从影像生成瓦片…") { model.showTileExportSheet = true }
         } label: {
             Label("底图", systemImage: model.onlineBasemap == nil ? "square.stack.3d.up" : "globe")
         }
@@ -157,33 +127,52 @@ struct RootView: View {
         .help("工具（⌘1–⌘5，或按 \(MapTool.allCases.map(\.shortcut).joined(separator: " / "))）：浏览、点坐标、测距、测面积、画圆")
     }
 
-    /// 测量相关操作：复制 / 导出 / 清除。收在一个菜单里，避免工具栏堆项。
-    private var measurementMenu: some View {
+    /// 出图、测量导出与测量存档收在同一个菜单里：
+    /// 「把东西拿出去」和「彻底清理 / 彻底保存」都在这一个地方，工具栏也不必堆项。
+    private var exportMenu: some View {
         Menu {
-            Section("复制到剪贴板") {
+            Section("当前视图") {
+                Button("快速导出当前视图（含标注）") { model.quickExportView() }
+                    .keyboardShortcut("e", modifiers: .command)
+                Button("导出当前视图为图片…") { model.exportViewAsImage() }
+                    .keyboardShortcut("e", modifiers: [.command, .shift])
+                Button("复制当前视图到剪贴板") { model.copyViewToClipboard() }
+                    .keyboardShortcut("c", modifiers: [.command, .shift])
+                Button("在访达中显示导出目录") { model.revealQuickExportFolder() }
+            }
+            .disabled(!model.hasMapContent)
+
+            Section("测量结果") {
                 ForEach(MeasurementExportFormat.textFormats) { format in
                     Button("复制为 \(format.title)") {
                         model.copyMeasurements(as: format)
                     }
                 }
-            }
-            Section("导出文件") {
                 ForEach(MeasurementExportFormat.allCases) { format in
                     Button(exportTitle(for: format)) {
                         model.exportMeasurements(as: format)
                     }
                 }
             }
+
+            Section("测量存档") {
+                Button("保存测量到文件…") { model.saveMeasurementsToFile() }
+                    .keyboardShortcut("s", modifiers: .command)
+                Button("从文件载入测量…") { model.loadMeasurementsFromFile() }
+                Button("在访达中显示自动存档") { model.revealMeasurementArchive() }
+                Text("改动会按数据集 / 影像自动存档，下次打开自动恢复；也可以另存为文件带走吧。")
+            }
+
             Section {
                 Button("清除全部测量", role: .destructive) {
                     model.clearMeasurements()
                 }
+                .keyboardShortcut("k", modifiers: [.command, .shift])
             }
         } label: {
-            Label("测量结果", systemImage: "ruler")
+            Label("导出", systemImage: "square.and.arrow.up")
         }
-        .help("导出、复制或清除测量结果")
-        .disabled(!model.measurements.hasContent)
+        .help("出图、导出测量结果、保存 / 载入测量存档、清除全部测量")
     }
 
     private func exportTitle(for format: MeasurementExportFormat) -> String {

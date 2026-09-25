@@ -170,10 +170,10 @@ extension TileSourceTemplate {
     /// 内置预设。刻意不内置 Google 地图：其条款不允许把瓦片抓取到服务之外保存；
     /// 需要别的源时用「自定义模板」填入自己的模板与授权信息。
     public static let presets: [TileSourceTemplate] = [
+        .openStreetMap,
         .tiandituImagery,
         .tiandituImageryLabel,
         .tiandituVector,
-        .openStreetMap,
         .custom,
     ]
 

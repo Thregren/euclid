@@ -64,7 +64,7 @@ enum MapTool: String, CaseIterable, Hashable, Sendable {
     func hint(draftCount: Int) -> String? {
         switch self {
         case .browse:
-            return nil
+            return "P 记下指针位置的点（与「点坐标」工具同一份数据）· 滚轮缩放 · 中键或拖动平移"
         case .point:
             return "点击地图取点，坐标显示在检查器中"
         case .distance:
@@ -235,6 +235,25 @@ final class MeasurementStore {
 
     // MARK: - 草稿操作
 
+    /// 快捷键落点：把指针当前位置记成一个点，不必先切到「点坐标」工具。
+    ///
+    /// 落的点与「点坐标」工具落下的**是同一种测量**（`kind == .point`，进同一个数组、同一套
+    /// 存档与导出），因此不存在「快捷键记的点」和「画出来的点」两套数据。
+    @discardableResult
+    func dropPoint(at coordinate: GeoCoordinate) -> GeoMeasurement {
+        markUndoPoint()
+        let measurement = GeoMeasurement(
+            kind: .point,
+            points: [coordinate],
+            colorIndex: nextColorIndex(),
+            style: pendingStyle
+        )
+        measurements.append(measurement)
+        selectedID = measurement.id
+        onChange?()
+        return measurement
+    }
+
     func addPoint(_ coordinate: GeoCoordinate) {
         guard let kind = tool.measurementKind else { return }
         // 画圆的第二次点击若几乎落在圆心上，视为误触，不生成极小的圆。
@@ -396,6 +415,16 @@ final class MeasurementStore {
         markUndoPoint()
         measurements.append(measurement)
         if select { selectedID = measurement.id }
+        onChange?()
+    }
+
+    /// 追加一组外来测量（从文件载入时用），保留现有内容。
+    func merge(_ incoming: [GeoMeasurement]) {
+        guard !incoming.isEmpty else { return }
+        markUndoPoint()
+        measurements.append(contentsOf: incoming)
+        selectedID = incoming.last?.id
+        colorCounter += incoming.count
         onChange?()
     }
 

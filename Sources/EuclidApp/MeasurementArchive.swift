@@ -59,4 +59,29 @@ enum MeasurementArchive {
         }
         write(contents)
     }
+
+    // MARK: - 手工存档（另存为 / 从文件载入）
+
+    /// 把一组测量编成可读的 JSON（另存到用户挑的文件里）。
+    static func encode(_ measurements: [GeoMeasurement]) -> Data? {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        return try? encoder.encode(measurements)
+    }
+
+    /// 从 JSON 里读回测量；格式不对时返回 nil。
+    static func decode(_ data: Data) -> [GeoMeasurement]? {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        if let list = try? decoder.decode([GeoMeasurement].self, from: data) { return list }
+        // 兼容旧写法：整份存档文件的格式。
+        if let contents = try? decoder.decode(Contents.self, from: data) {
+            return contents.entries.values.flatMap(\.measurements)
+        }
+        return nil
+    }
+
+    /// 自动存档文件所在位置（「在访达中显示」用）。
+    static var archiveFileURL: URL? { fileURL }
 }
