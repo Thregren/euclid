@@ -122,6 +122,8 @@ final class TileCanvasNSView: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
+        setAccessibilityRole(.image)
+        setAccessibilityLabel("地图画布，暂无内容")
         layer?.masksToBounds = true
         layer?.backgroundColor = NSColor.underPageBackgroundColor.cgColor
 
@@ -216,6 +218,8 @@ final class TileCanvasNSView: NSView {
         var maximumDataZoom: Double = 20
         /// 数据源实际提供的整数层级范围。
         var dataZoomRange: ClosedRange<Int> = 0...22
+        /// 画布名称，用于无障碍标签。
+        var contentName = ""
     }
 
     /// 本地数据集。
@@ -234,7 +238,8 @@ final class TileCanvasNSView: NSView {
             defaultZoomLevel: Double(min(dataset.zoomRange.upperBound, dataset.zoomRange.lowerBound + 2)),
             waitingForExtent: extent == nil,
             maximumDataZoom: Double(dataset.zoomRange.upperBound),
-            dataZoomRange: dataset.zoomRange
+            dataZoomRange: dataset.zoomRange,
+            contentName: dataset.name
         ))
     }
 
@@ -257,7 +262,8 @@ final class TileCanvasNSView: NSView {
             fitRect: fitRect ?? Self.worldRect,
             defaultZoomLevel: 2,
             maximumDataZoom: Double(basemap.zoomRange.upperBound),
-            dataZoomRange: basemap.zoomRange
+            dataZoomRange: basemap.zoomRange,
+            contentName: basemap.name
         ))
     }
 
@@ -289,12 +295,17 @@ final class TileCanvasNSView: NSView {
             provider = nil
             extentRect = nil
             defaultFitRect = nil
+            setAccessibilityLabel("地图画布，暂无内容")
+            setAccessibilityValue(nil)
             measurementStore?.cursorInfo = nil
             onTileStatsChanged?(0, 0)
             syncLayers()
             return
         }
         self.provider = provider
+        // 画布是自绘的，给读屏一个可读的名字与当前层级。
+        setAccessibilityLabel(setup.contentName.isEmpty ? "地图画布" : "地图画布：\(setup.contentName)")
+        setAccessibilityValue("z\(currentDataZoom)")
         baseTileSize = setup.tileSize
         tileSizeFollowsDisplayScale = setup.tileSizeFollowsDisplayScale
         camera.displayScale = displayScale
@@ -743,6 +754,11 @@ final class TileCanvasNSView: NSView {
 
         let retired = backdropLayers
         backdropLayers.removeAll()
+        // 「减少动态效果」时直接摘掉，不做淡出。
+        guard !InterfaceStyle.reducesMotion else {
+            for layer in retired.values { layer.removeFromSuperlayer() }
+            return
+        }
         // 自己的图已经盖满时摘掉背景是看不见的；稀疏缺片的格子还露着背景，淡出更自然。
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -865,7 +881,7 @@ final class TileCanvasNSView: NSView {
         let rect = Self.contentsRect(source: source, destination: tile)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        if animated {
+        if animated, !InterfaceStyle.reducesMotion {
             // 首次出现、以及换图（祖先贴图 → 自己的图）都做一次很短的交叉淡入，
             // 避免整屏几十块瓦片按解码顺序「啪、啪」地跳出来。
             let fade = CATransition()

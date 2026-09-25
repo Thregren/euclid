@@ -9,6 +9,7 @@ import TileKit
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
+        DebugAppearanceScript.applyIfRequested()
         // 便于自动化截图/录屏时让窗口保持在最前。
         guard ProcessInfo.processInfo.environment["EUCLID_FLOAT_WINDOW"] != nil else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {

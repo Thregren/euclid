@@ -8,7 +8,7 @@ struct ScaleBarView: View {
         let barWidth = width
         VStack(alignment: .leading, spacing: 3) {
             Text(label)
-                .font(.system(size: 11, weight: .medium))
+                .font(.subheadline.weight(.medium))
                 .monospacedDigit()
                 .foregroundStyle(.primary)
             HStack(spacing: 0) {

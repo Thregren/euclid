@@ -39,16 +39,16 @@ struct StatusBarView: View {
     private var sourceLabel: some View {
         if let basemap = model.onlineBasemap {
             Label(basemap.name, systemImage: "globe")
-                .font(.system(size: 11))
+                .font(.subheadline)
                 .lineLimit(1)
                 .help(basemap.attribution)
         } else if let dataset = model.selectedDataset {
             Label(dataset.name, systemImage: "square.stack.3d.up")
-                .font(.system(size: 11))
+                .font(.subheadline)
                 .lineLimit(1)
         } else {
             Text(model.statusMessage ?? "就绪")
-                .font(.system(size: 11))
+                .font(.subheadline)
                 .foregroundStyle(.secondary)
         }
     }
@@ -59,15 +59,15 @@ struct StatusBarView: View {
     private var coordinateReadout: some View {
         if let cursor = model.measurements.cursorInfo {
             Label(CoordinateText.decimal(cursor.coordinate), systemImage: "scope")
-                .font(.system(size: 11))
+                .font(.subheadline)
                 .monospacedDigit()
             Text(CoordinateText.dms(cursor.coordinate))
-                .font(.system(size: 11))
+                .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
         } else {
             Text("移动指针查看坐标")
-                .font(.system(size: 11))
+                .font(.subheadline)
                 .foregroundStyle(.tertiary)
         }
     }
@@ -76,7 +76,7 @@ struct StatusBarView: View {
 
     private func readout(_ text: String, weight: Font.Weight = .regular) -> some View {
         Text(text)
-            .font(.system(size: 11, weight: weight))
+            .font(.subheadline.weight(weight))
             .foregroundStyle(weight == .medium ? .primary : .secondary)
             .monospacedDigit()
     }
@@ -94,7 +94,7 @@ struct StatusBarView: View {
         if let message = model.statusMessage, model.hasMapContent {
             Divider().frame(height: 12)
             Text(message)
-                .font(.system(size: 11))
+                .font(.subheadline)
                 .foregroundStyle(.tint)
                 .lineLimit(1)
         }
@@ -105,7 +105,7 @@ struct StatusBarView: View {
         if model.download.isRunning, let progress = model.download.progress {
             Divider().frame(height: 12)
             Label("下载 \(progress.completed)/\(progress.total)", systemImage: "arrow.down.circle")
-                .font(.system(size: 11, weight: .medium))
+                .font(.subheadline.weight(.medium))
                 .monospacedDigit()
                 .foregroundStyle(.tint)
         }

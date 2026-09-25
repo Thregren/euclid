@@ -12,7 +12,8 @@ struct RootView: View {
         } detail: {
             MapScreen()
         }
-        .navigationTitle(model.selectedDataset?.name ?? "尺规")
+        // 标题给的是「当前在看什么」；没有内容时留空，避免拿 App 名当标题。
+        .navigationTitle(model.hasMapContent ? model.basemapName : "")
         .navigationSubtitle(subtitle)
         .inspector(isPresented: $model.showInspector) {
             InspectorView()
@@ -31,6 +32,10 @@ struct RootView: View {
     }
 
     private var subtitle: String {
+        if let basemap = model.onlineBasemap {
+            let attribution = basemap.attribution.isEmpty ? "" : " · \(basemap.attribution)"
+            return "在线底图 z0–z\(basemap.zoomRange.upperBound)\(attribution)"
+        }
         guard let dataset = model.selectedDataset else { return "未打开数据集" }
         return "z\(dataset.zoomRange.lowerBound)–z\(dataset.zoomRange.upperBound) · \(dataset.layout.tileSize)px"
     }
@@ -59,16 +64,6 @@ struct RootView: View {
             toolPicker
 
             Button {
-                model.clearMeasurements()
-            } label: {
-                Label("清除测量", systemImage: "trash")
-            }
-            .help("清除所有测量")
-            .disabled(!model.measurements.hasContent)
-
-            exportMenu
-
-            Button {
                 model.canvas.zoomOut()
             } label: {
                 Label("缩小", systemImage: "minus.magnifyingglass")
@@ -92,10 +87,7 @@ struct RootView: View {
             .help("适配窗口（⌘0）")
             .disabled(!model.hasMapContent)
 
-            Toggle(isOn: Bindable(model).showTileGrid) {
-                Label("瓦片网格", systemImage: "grid")
-            }
-            .help("显示瓦片网格（⌘G）")
+            measurementMenu
 
             Toggle(isOn: Bindable(model).showInspector) {
                 Label("检查器", systemImage: "sidebar.right")
@@ -126,11 +118,14 @@ struct RootView: View {
             }
             .pickerStyle(.inline)
             Divider()
+            Toggle("显示瓦片网格", isOn: Bindable(model).showTileGrid)
+                .keyboardShortcut("g", modifiers: .command)
+            Divider()
             Button("下载在线瓦片…") { model.showDownloadSheet = true }
         } label: {
-            Label(model.basemapName, systemImage: model.onlineBasemap == nil ? "square.stack.3d.up" : "globe")
+            Label("底图", systemImage: model.onlineBasemap == nil ? "square.stack.3d.up" : "globe")
         }
-        .help("切换底图：本地数据集或在线瓦片源")
+        .help("当前底图：\(model.basemapName)")
     }
 
     private var toolPicker: some View {
@@ -150,7 +145,8 @@ struct RootView: View {
         .help("工具（⌘1–⌘5，或按 \(MapTool.allCases.map(\.shortcut).joined(separator: " / "))）：浏览、点坐标、测距、测面积、画圆")
     }
 
-    private var exportMenu: some View {
+    /// 测量相关操作：复制 / 导出 / 清除。收在一个菜单里，避免工具栏堆项。
+    private var measurementMenu: some View {
         Menu {
             Section("复制到剪贴板") {
                 ForEach(MeasurementExportFormat.textFormats) { format in
@@ -166,10 +162,15 @@ struct RootView: View {
                     }
                 }
             }
+            Section {
+                Button("清除全部测量", role: .destructive) {
+                    model.clearMeasurements()
+                }
+            }
         } label: {
-            Label("导出测量结果", systemImage: "square.and.arrow.up")
+            Label("测量结果", systemImage: "ruler")
         }
-        .help("导出或复制测量结果")
+        .help("导出、复制或清除测量结果")
         .disabled(!model.measurements.hasContent)
     }
 
@@ -202,11 +203,10 @@ struct MapScreen: View {
 
                 if let hint = toolHint {
                     Text(hint)
-                        .font(.system(size: 11, weight: .medium))
+                        .font(.subheadline.weight(.medium))
                         .padding(.horizontal, 10)
                         .padding(.vertical, 6)
-                        .background(.regularMaterial, in: Capsule())
-                        .overlay(Capsule().strokeBorder(.separator.opacity(0.6), lineWidth: 0.5))
+                        .controlSurface(shape: Capsule())
                         .padding(.bottom, 16)
                         .frame(maxWidth: .infinity, alignment: .center)
                         .allowsHitTesting(false)
@@ -217,6 +217,8 @@ struct MapScreen: View {
         .overlay {
             if !model.hasMapContent {
                 EmptyStateView()
+            } else if let message = model.loadingMessage {
+                LoadingOverlay(message: message)
             }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -249,7 +251,7 @@ struct MapControls: View {
                 }
                 Divider().frame(height: 18)
                 Text("z\(model.viewport.dataZoom)")
-                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    .font(.callout.weight(.semibold))
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
                     .frame(minWidth: 34)
@@ -257,20 +259,12 @@ struct MapControls: View {
             }
             .padding(.horizontal, 6)
             .padding(.vertical, 4)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .strokeBorder(.separator.opacity(0.6), lineWidth: 0.5)
-            )
+            .controlSurface()
 
             ScaleBarView(metersPerPoint: model.viewport.metersPerPoint)
                 .padding(.horizontal, 8)
                 .padding(.vertical, 6)
-                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        .strokeBorder(.separator.opacity(0.6), lineWidth: 0.5)
-                )
+                .controlSurface()
         }
         .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
     }
@@ -284,12 +278,32 @@ struct ControlButton: View {
     var body: some View {
         Button(action: action) {
             Image(systemName: symbol)
-                .font(.system(size: 13, weight: .medium))
-                .frame(width: 26, height: 22)
+                .font(.body.weight(.medium))
+                .frame(width: 28, height: InterfaceStyle.controlHeight)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(help)
         .help(help)
+    }
+}
+
+/// 画布还没内容时的加载态：转圈加一句说明，别让用户对着空白猜。
+struct LoadingOverlay: View {
+    let message: String
+
+    var body: some View {
+        VStack(spacing: 10) {
+            ProgressView()
+                .controlSize(.small)
+            Text(message)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 14)
+        .controlSurface()
+        .allowsHitTesting(false)
     }
 }
 

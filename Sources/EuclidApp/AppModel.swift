@@ -104,6 +104,8 @@ final class AppModel {
     var datasets: [TileDataset] = []
     var selectedDatasetID: TileDataset.ID?
     var isScanning = false
+    /// 正在读取数据范围：这期间画布是空的，界面上要给个进度指示。
+    var isResolvingExtent = false
     var statusMessage: String?
     var rootFolder: URL?
     var extent: DatasetExtent?
@@ -133,6 +135,13 @@ final class AppModel {
 
     /// 界面上是否有可看的内容（本地数据集或在线底图）。
     var hasMapContent: Bool { selectedDataset != nil || onlineBasemap != nil }
+
+    /// 正在忙什么；nil 表示空闲。用于画布上的进度指示（HIG：加载时别只留空白）。
+    var loadingMessage: String? {
+        if isScanning { return "正在扫描目录…" }
+        if isResolvingExtent { return "正在读取数据范围…" }
+        return nil
+    }
 
     /// 当前底图的显示名。
     var basemapName: String {
@@ -339,6 +348,7 @@ final class AppModel {
         extent = nil
         guard let dataset = datasets.first(where: { $0.id == id }) else {
             usesOnlineBasemap = false
+            isResolvingExtent = false
             viewport.reset()
             return
         }
@@ -348,11 +358,13 @@ final class AppModel {
         canvas.refreshOverlay()
         // 数据范围要扫完目录才知道，这期间画布先不铺图（在错误位置铺一屏空占位只会闪）。
         setStatus("正在读取数据范围…", autoClearAfter: 0)
+        isResolvingExtent = true
         Task {
             let result = await Task.detached(priority: .userInitiated) {
                 DatasetLocator.extent(of: dataset)
             }.value
             guard selectedDatasetID == dataset.id else { return }
+            isResolvingExtent = false
             AppModel.trace("extent done \(String(describing: result?.tileCount))")
             extent = result
             canvas.updateExtent(result)

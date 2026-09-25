@@ -77,7 +77,7 @@ struct DownloadSheet: View {
                     label("URL 模板")
                     TextField("https://…/{z}/{x}/{y}.png", text: $download.template)
                         .textFieldStyle(.roundedBorder)
-                        .font(.system(size: 11, design: .monospaced))
+                        .font(.system(.subheadline, design: .monospaced))
                         .help("支持 {z} {x} {y}，另有 {-y}（TMS 行号）、{s}（子域）、{key}（密钥）")
                 }
                 if download.needsKey {
@@ -85,7 +85,7 @@ struct DownloadSheet: View {
                         label("密钥")
                         TextField("tk=…", text: $download.key)
                             .textFieldStyle(.roundedBorder)
-                            .font(.system(size: 11, design: .monospaced))
+                            .font(.system(.subheadline, design: .monospaced))
                             .frame(maxWidth: 260, alignment: .leading)
                     }
                     GridRow {
@@ -100,7 +100,7 @@ struct DownloadSheet: View {
                 Divider()
                 HStack(alignment: .top, spacing: 6) {
                     Image(systemName: "exclamationmark.triangle")
-                        .font(.system(size: 11))
+                        .font(.subheadline)
                         .foregroundStyle(.orange)
                     Text(download.terms)
                         .font(.caption)
@@ -216,7 +216,7 @@ struct DownloadSheet: View {
             HStack(spacing: 8) {
                 Button("选择目录…") { model.download.chooseOutputDirectory() }
                 Text(download.outputDirectory?.path(percentEncoded: false) ?? "未选择")
-                    .font(.system(size: 11, design: .monospaced))
+                    .font(.system(.subheadline, design: .monospaced))
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .foregroundStyle(download.outputDirectory == nil ? .secondary : .primary)
@@ -279,7 +279,7 @@ struct DownloadSheet: View {
                     Text("\(byteText(progress.bytes))")
                         .foregroundStyle(.secondary)
                 }
-                .font(.system(size: 11))
+                .font(.subheadline)
             }
 
             if let summary = download.summary {
@@ -287,7 +287,7 @@ struct DownloadSheet: View {
                     Text(summary.cancelled ? "已停止" : "已完成")
                         .fontWeight(.semibold)
                     Text(summaryText(summary))
-                        .font(.system(size: 11))
+                        .font(.subheadline)
                         .foregroundStyle(.secondary)
                     if let failure = summary.failures.first {
                         Text("示例失败：\(failure)")
@@ -300,7 +300,7 @@ struct DownloadSheet: View {
 
             if let error = download.errorMessage {
                 Text(error)
-                    .font(.system(size: 11))
+                    .font(.subheadline)
                     .foregroundStyle(.red)
             }
         }
@@ -355,20 +355,21 @@ struct DownloadSheet: View {
         _ title: String,
         @ViewBuilder content: () -> Content
     ) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text(title)
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(.secondary)
+        // 用系统标准的分组框做容器，深浅色、增强对比度、降低透明度都交给系统。
+        GroupBox {
             content()
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, 2)
+        } label: {
+            Text(title)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
         }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
     private func label(_ text: String) -> some View {
         Text(text)
-            .font(.system(size: 11))
+            .font(.subheadline)
             .foregroundStyle(.secondary)
             .frame(width: 58, alignment: .trailing)
     }

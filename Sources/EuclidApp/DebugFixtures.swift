@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import TileKit
 
@@ -208,6 +209,22 @@ enum DebugBasemapScript {
             let after = "[basemap] 4 秒后：可见=\(model.viewport.visibleTiles) 已载入=\(model.viewport.loadedTiles) "
                 + "层级=\(model.viewport.dataZoom) 状态=\(model.statusMessage ?? "无")\n"
             FileHandle.standardError.write(Data(after.utf8))
+        }
+    }
+}
+
+/// 开发调试用的外观脚本。
+///
+/// `EUCLID_DEBUG_APPEARANCE=dark|light` 时强制指定外观，便于在浅色与深色下各截一次图核对对比度；
+/// 正式使用不设置该变量，外观完全跟随系统。
+@MainActor
+enum DebugAppearanceScript {
+    static func applyIfRequested() {
+        guard let raw = ProcessInfo.processInfo.environment["EUCLID_DEBUG_APPEARANCE"]?.lowercased() else { return }
+        switch raw {
+        case "dark": NSApplication.shared.appearance = NSAppearance(named: .darkAqua)
+        case "light": NSApplication.shared.appearance = NSAppearance(named: .aqua)
+        default: break
         }
     }
 }
