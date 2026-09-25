@@ -58,20 +58,25 @@ final class CanvasController {
     func set(dataset: TileDataset?, extent: DatasetExtent?) {
         let apply: () -> Void = { [weak self] in
             guard let self else { return }
-            self.view?.configure(dataset: dataset, extent: extent)
+            self.view?.setLocal(dataset: dataset, extent: extent)
         }
         pending = apply
         apply()
     }
 
-    /// 切到在线底图。
-    func set(online basemap: OnlineBasemap, fitRect: CGRect?) {
+    /// 装配（或关掉）在线底图层。
+    func set(online basemap: OnlineBasemap?, fitRect: CGRect?) {
         let apply: () -> Void = { [weak self] in
             guard let self else { return }
-            self.view?.configure(online: basemap, fitRect: fitRect)
+            self.view?.setOnline(basemap: basemap, fitRect: fitRect)
         }
         pending = apply
         apply()
+    }
+
+    /// 两条图层的不透明度。
+    func setLayerOpacity(local: Double, online: Double) {
+        view?.setLayerOpacity(local: local, online: online)
     }
 
     func updateExtent(_ extent: DatasetExtent?) {
@@ -122,6 +127,16 @@ final class AppModel {
         didSet { applyBasemap() }
     }
 
+    /// 本地影像的不透明度：调低就能透过它看到下层的在线底图，用来核对配准。
+    var localLayerOpacity: Double = 1 {
+        didSet { canvas.setLayerOpacity(local: localLayerOpacity, online: onlineLayerOpacity) }
+    }
+
+    /// 在线底图的不透明度。
+    var onlineLayerOpacity: Double = 1 {
+        didSet { canvas.setLayerOpacity(local: localLayerOpacity, online: onlineLayerOpacity) }
+    }
+
     let viewport = ViewportState()
     let canvas = CanvasController()
     let measurements = MeasurementStore()
@@ -150,15 +165,35 @@ final class AppModel {
 
     /// 按当前选择刷新画布。
     func applyBasemap() {
-        guard let basemap = onlineBasemap else {
-            canvas.set(dataset: selectedDataset, extent: extent)
-            return
+        applyOnlineLayer(force: true)
+    }
+
+    /// 装配本地图层。只在数据集真的换了才重装，避免切换底图时把本地层也重取一遍。
+    func applyLocalLayer(force: Bool = false) {
+        guard force || selectedDatasetID != appliedLocalDatasetID else { return }
+        appliedLocalDatasetID = selectedDatasetID
+        canvas.set(dataset: selectedDataset, extent: extent)
+        canvas.setLayerOpacity(local: localLayerOpacity, online: onlineLayerOpacity)
+    }
+
+    /// 装配在线图层。签名没变就不重装。
+    func applyOnlineLayer(force: Bool = false) {
+        let basemap = onlineBasemap
+        let signature = basemap.map {
+            "\($0.template.id)|\($0.template.urlTemplate)|\($0.key)"
         }
-        if let reason = basemap.invalidReason {
-            setStatus(reason, autoClearAfter: 6)
+        guard force || signature != appliedOnlineSignature else { return }
+        appliedOnlineSignature = signature
+
+        guard let basemap, basemap.invalidReason == nil else {
+            canvas.set(online: nil, fitRect: nil)
+            if let reason = basemap?.invalidReason {
+                setStatus(reason, autoClearAfter: 6)
+            }
             return
         }
         canvas.set(online: basemap, fitRect: extent?.worldRect)
+        canvas.setLayerOpacity(local: localLayerOpacity, online: onlineLayerOpacity)
         let suffix = basemap.attribution.isEmpty ? "" : " · \(basemap.attribution)"
         setStatus("底图：\(basemap.name)\(suffix)", autoClearAfter: 5)
     }
@@ -169,6 +204,9 @@ final class AppModel {
 
     /// 扫描代号，用于丢弃过期的扫描结果。
     private var scanGeneration = 0
+    /// 已经装配到画布上的本地数据集与在线源，避免重复重装。
+    private var appliedLocalDatasetID: TileDataset.ID?
+    private var appliedOnlineSignature: String?
     /// 状态栏提示的自动清除任务。
     private var statusClearTask: Task<Void, Never>?
     /// 存档写入的防抖任务。
@@ -347,13 +385,15 @@ final class AppModel {
         selectedDatasetID = id
         extent = nil
         guard let dataset = datasets.first(where: { $0.id == id }) else {
-            usesOnlineBasemap = false
             isResolvingExtent = false
+            applyLocalLayer(force: true)
+            applyOnlineLayer()
             viewport.reset()
             return
         }
-        // 选数据集即回到本地数据底图（`usesOnlineBasemap` 的 didSet 会重装画布）。
-        usesOnlineBasemap = false
+        // 选数据集就重装本地图层；在线底图是否叠加由 `usesOnlineBasemap` 决定，互不影响。
+        applyLocalLayer(force: true)
+        applyOnlineLayer()
         measurements.restore(MeasurementArchive.measurements(for: dataset.rootURL.path(percentEncoded: false)))
         canvas.refreshOverlay()
         // 数据范围要扫完目录才知道，这期间画布先不铺图（在错误位置铺一屏空占位只会闪）。

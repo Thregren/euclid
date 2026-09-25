@@ -188,6 +188,10 @@ enum DebugBasemapScript {
             if let key = ProcessInfo.processInfo.environment["EUCLID_DEBUG_BASEMAP_KEY"] {
                 model.download.key = key
             }
+            if let raw = ProcessInfo.processInfo.environment["EUCLID_DEBUG_LOCAL_OPACITY"],
+               let value = Double(raw) {
+                model.localLayerOpacity = min(max(value, 0), 1)
+            }
             if raw == "local" {
                 model.usesOnlineBasemap = false
             } else if let preset = TileSourceTemplate.preset(id: raw), !preset.urlTemplate.isEmpty {

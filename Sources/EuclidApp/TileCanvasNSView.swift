@@ -15,54 +15,23 @@ struct ViewportSnapshot: Sendable {
 /// 瓦片画布：每个可见瓦片对应一个 CALayer，由窗口服务器在 GPU 上合成。
 ///
 /// 视图坐标约定：NSView 未翻转，原点在左下、y 向上；图层坐标 y 向下，
-/// 由 `tileHostLayer` / `overlay.hostLayer` 的 `isGeometryFlipped` 保证一致。
+/// 由各图层栈的 `hostLayer` / `overlay.hostLayer` 的 `isGeometryFlipped` 保证一致。
 @MainActor
 final class TileCanvasNSView: NSView {
-    private let tileHostLayer = CALayer()
-    private let gridLayer = CAShapeLayer()
     private let overlay = MeasurementOverlay()
 
-    private var tileLayers: [SlippyTile: CALayer] = [:]
-    /// 换层级时保留下来的上一层图层：新图层的图还没到位前由它顶着，避免整屏变灰。
-    private var backdropLayers: [SlippyTile: CALayer] = [:]
-    /// 当前真正在渲染的层级。
-    private var renderedZoom: Int?
-    private var tileTasks: [SlippyTile: Task<Void, Never>] = [:]
-    /// 每一格当前显示的图片来自哪一块瓦片：自己，或者某个祖先层级。
-    private var layerImageSource: [SlippyTile: SlippyTile] = [:]
-    /// 正在为哪些格子找祖先贴图（避免重复发起）。
-    private var fallbackTasks: Set<SlippyTile> = []
-    private var missingTiles: Set<SlippyTile> = []
-    /// 已经确认「自己没有图、可回溯的祖先层级也没有图」的格子。
-    ///
-    /// 少了它，`applyFallbackImages` 的失败分支会一轮接一轮地重新找祖先，
-    /// 渲染就变成停不下来的空转：打开数据集时（相机还停在数据之外）每秒能跑两百多轮，
-    /// 每轮都要重铺图层、重画标注、把 viewport 重新推给 SwiftUI。
-    private var unresolvedTiles: Set<SlippyTile> = []
-    /// 已经排队等下一帧补请求的标记，避免同一帧重复调度。
-    private var refillScheduled = false
-    /// 上一次预取的「层级 + 视野范围」，用来避免重复预取同一圈。
-    private var lastPrefetchKey = ""
-    /// 单次预取的瓦片上限。
-    private static let prefetchLimit = 24
-
-    private var provider: TileProvider?
+    /// 下层：在线底图（作为参考底图）。
+    private let onlineStack = TileLayerStack()
+    /// 上层：本地影像（正在判读/量测的那份）。
+    private let localStack = TileLayerStack()
     private var dataset: TileDataset?
-    /// 相机里的瓦片边长基数：本地数据集是瓦片像素边长，在线底图是模板声明的边长。
-    private var baseTileSize: Double = 512
-    /// 在线底图按「一张瓦片铺满它的像素数」显示，因此相机里的边长要跟着设备像素比走。
-    private var tileSizeFollowsDisplayScale = false
     /// 适配窗口用的默认范围（数据范围算出来之前 / 在线底图）。
     private var defaultFitRect: CGRect?
-    /// 数据源可用的缩放层级范围（相机上下限）与自身最大层级（「原始比例」用）。
-    private var sourceZoomLevelRange: ClosedRange<Double> = -2...26
-    private var sourceMaximumZoom: Double = 20
-    /// 数据源实际提供的整数层级范围（状态栏层级、瓦片编号用）。
-    private var sourceDataZoomRange: ClosedRange<Int> = 0...22
-    /// 数据集已就位但数据范围还在算：这段时间不铺图（见 `configure`）。
+    /// 在线底图的适配范围（没有本地数据时用它对齐窗口）。
+    private var onlineFitRect: CGRect?
+    /// 数据集已就位但数据范围还在算：这段时间不铺图（见 `setLocal`）。
     private var awaitingExtent = false
     private var extentRect: CGRect?
-    private var generation = 0
     private var zoomBounds: ClosedRange<Double> = 0...30
     private var trackingArea: NSTrackingArea?
 
@@ -79,11 +48,6 @@ final class TileCanvasNSView: NSView {
     private var middleDragLastPoint: CGPoint?
     /// 当前指针悬停的顶点，用于高亮提示可拖动。
     private var hoveredVertex: (measurementID: UUID?, index: Int)?
-    /// 单帧最多渲染的瓦片数量，作为异常情况下的安全阀。
-    private let maximumTilesPerFrame = 1200
-    /// 同时在途的瓦片请求上限。
-    /// Retina 上一个整数层级要多铺 4 倍瓦片，这里相应放宽一点，首屏更快铺满。
-    private let maximumConcurrentRequests = 32
     /// 顶点吸附半径（点）。
     private let snapRadius: CGFloat = 12
     /// 点击与拖动位移的区分阈值（点）。
@@ -110,7 +74,6 @@ final class TileCanvasNSView: NSView {
 
     var showTileGrid = false {
         didSet {
-            gridLayer.isHidden = !showTileGrid
             syncLayers()
         }
     }
@@ -127,16 +90,12 @@ final class TileCanvasNSView: NSView {
         layer?.masksToBounds = true
         layer?.backgroundColor = NSColor.underPageBackgroundColor.cgColor
 
-        tileHostLayer.isGeometryFlipped = true
-        tileHostLayer.masksToBounds = true
-        layer?.addSublayer(tileHostLayer)
-
-        gridLayer.fillColor = nil
-        gridLayer.strokeColor = Self.gridColor.cgColor
-        gridLayer.lineWidth = 1
-        gridLayer.isHidden = true
-        tileHostLayer.addSublayer(gridLayer)
-
+        // 下层在线底图、上层本地影像；两层共用同一个相机，叠加显示时天然同步。
+        for stack in [onlineStack, localStack] {
+            stack.needsSync = { [weak self] in self?.syncLayers() }
+            stack.refreshGridAppearance()
+            layer?.addSublayer(stack.hostLayer)
+        }
         layer?.addSublayer(overlay.hostLayer)
     }
 
@@ -168,12 +127,8 @@ final class TileCanvasNSView: NSView {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         layer?.backgroundColor = NSColor.underPageBackgroundColor.cgColor
-        gridLayer.strokeColor = Self.gridColor.cgColor
+        for stack in [onlineStack, localStack] { stack.refreshGridAppearance() }
         CATransaction.commit()
-    }
-
-    private static var gridColor: NSColor {
-        NSColor.labelColor.withAlphaComponent(0.32)
     }
 
     override func updateTrackingAreas() {
@@ -196,77 +151,6 @@ final class TileCanvasNSView: NSView {
         addCursorRect(bounds, cursor: tool == .browse ? .openHand : .crosshair)
     }
 
-    // MARK: - 数据源
-
-    /// 装配一次数据源所需的全部参数。本地数据集与在线底图都走这一条路径，
-    /// 于是「换底图」不影响图层金字塔、兜底与缓存那一整套逻辑。
-    private struct SourceSetup {
-        var provider: TileProvider?
-        /// 相机里的瓦片边长（视图点）。
-        var tileSize: Double = 512
-        /// 在线底图按「一张瓦片铺满它的像素数」的通用约定显示，相机里的边长要跟着设备像素比走。
-        var tileSizeFollowsDisplayScale = false
-        /// 可缩放层级范围（真实层级 ± 余量）。
-        var zoomLevelRange: ClosedRange<Double> = -2...26
-        /// 适配窗口用的世界范围。
-        var fitRect: CGRect?
-        /// 没有适配范围时的默认层级（在线底图的初始世界视图）。
-        var defaultZoomLevel: Double = 2
-        /// 数据范围还在算：先不铺图。
-        var waitingForExtent = false
-        /// 数据源自身的最大层级（「原始比例」用）。
-        var maximumDataZoom: Double = 20
-        /// 数据源实际提供的整数层级范围。
-        var dataZoomRange: ClosedRange<Int> = 0...22
-        /// 画布名称，用于无障碍标签。
-        var contentName = ""
-    }
-
-    /// 本地数据集。
-    func configure(dataset: TileDataset?, extent: DatasetExtent?) {
-        guard let dataset else {
-            self.dataset = nil
-            applySource(SourceSetup(provider: nil, fitRect: nil))
-            return
-        }
-        self.dataset = dataset
-        applySource(SourceSetup(
-            provider: TileProvider(source: dataset.source),
-            tileSize: Double(dataset.layout.tileSize),
-            zoomLevelRange: max(-2, Double(dataset.zoomRange.lowerBound))...min(Double(dataset.zoomRange.upperBound) + 1, 26),
-            fitRect: extent?.worldRect,
-            defaultZoomLevel: Double(min(dataset.zoomRange.upperBound, dataset.zoomRange.lowerBound + 2)),
-            waitingForExtent: extent == nil,
-            maximumDataZoom: Double(dataset.zoomRange.upperBound),
-            dataZoomRange: dataset.zoomRange,
-            contentName: dataset.name
-        ))
-    }
-
-    /// 在线底图。
-    func configure(online basemap: OnlineBasemap, fitRect: CGRect?) {
-        dataset = nil
-        guard basemap.isValid else {
-            applySource(SourceSetup(provider: nil, fitRect: nil))
-            return
-        }
-        applySource(SourceSetup(
-            provider: TileProvider(
-                source: basemap.makeSource(),
-                memoryLimitBytes: 256 * 1024 * 1024,
-                maxConcurrentDecodes: 6
-            ),
-            tileSize: Double(basemap.tileSize),
-            tileSizeFollowsDisplayScale: true,
-            zoomLevelRange: 0...Double(basemap.zoomRange.upperBound),
-            fitRect: fitRect ?? Self.worldRect,
-            defaultZoomLevel: 2,
-            maximumDataZoom: Double(basemap.zoomRange.upperBound),
-            dataZoomRange: basemap.zoomRange,
-            contentName: basemap.name
-        ))
-    }
-
     /// 世界范围（在线底图的兜底适配目标）。
     private static let worldRect = CGRect(
         x: 0,
@@ -276,48 +160,81 @@ final class TileCanvasNSView: NSView {
             - WebMercator.normalizedY(latitude: -WebMercator.maxLatitude)
     )
 
-    private func applySource(_ setup: SourceSetup) {
-        generation += 1
-        cancelPendingRequests()
-        for layer in tileLayers.values { layer.removeFromSuperlayer() }
-        tileLayers.removeAll()
-        for layer in backdropLayers.values { layer.removeFromSuperlayer() }
-        backdropLayers.removeAll()
-        renderedZoom = nil
-        layerImageSource.removeAll()
-        fallbackTasks.removeAll()
-        unresolvedTiles.removeAll()
-        missingTiles.removeAll()
-        awaitingExtent = false
-        lastPrefetchKey = ""
-
-        guard let provider = setup.provider else {
-            provider = nil
+    /// 本地影像层（上层）。传 nil 表示关掉这一层。
+    func setLocal(dataset: TileDataset?, extent: DatasetExtent?) {
+        guard let dataset else {
+            self.dataset = nil
+            localStack.clear()
+            awaitingExtent = false
             extentRect = nil
             defaultFitRect = nil
-            setAccessibilityLabel("地图画布，暂无内容")
-            setAccessibilityValue(nil)
-            measurementStore?.cursorInfo = nil
-            onTileStatsChanged?(0, 0)
+            refreshCamera(fitRect: nil, defaultZoomLevel: nil)
+            updateAccessibilityLabel()
             syncLayers()
             return
         }
-        self.provider = provider
-        // 画布是自绘的，给读屏一个可读的名字与当前层级。
-        setAccessibilityLabel(setup.contentName.isEmpty ? "地图画布" : "地图画布：\(setup.contentName)")
-        setAccessibilityValue("z\(currentDataZoom)")
-        baseTileSize = setup.tileSize
-        tileSizeFollowsDisplayScale = setup.tileSizeFollowsDisplayScale
-        camera.displayScale = displayScale
-        camera.tilePixelSize = cameraTileSize
-        camera.viewportSize = bounds.size
-        extentRect = setup.fitRect
-        defaultFitRect = setup.fitRect
-        sourceZoomLevelRange = setup.zoomLevelRange
-        sourceMaximumZoom = setup.maximumDataZoom
-        sourceDataZoomRange = setup.dataZoomRange
+        self.dataset = dataset
+        localStack.configure(
+            source: dataset.source,
+            name: dataset.name,
+            tileSize: dataset.layout.tileSize,
+            zoomRange: dataset.zoomRange,
+            followsDisplayScale: false,
+            maximumDataZoom: Double(dataset.zoomRange.upperBound)
+        )
+        extentRect = extent?.worldRect
+        defaultFitRect = extent?.worldRect
+        // 数据范围还没算出来时，相机只能停在数据集之外，此刻铺出来的只会是一屏空占位，
+        // 白读磁盘，而且范围一到画面必然整体跳一次。等 `setExtent` 到了再开始铺。
+        awaitingExtent = extent == nil
+        refreshCamera(fitRect: extent?.worldRect, defaultZoomLevel: nil)
+        updateAccessibilityLabel()
+        syncLayers()
+    }
 
-        let fitCamera = setup.fitRect.map {
+    /// 在线底图层（下层）。传 nil 表示关掉这一层。
+    func setOnline(basemap: OnlineBasemap?, fitRect: CGRect?) {
+        onlineFitRect = fitRect
+        guard let basemap, basemap.isValid else {
+            onlineStack.clear()
+            refreshCamera(fitRect: nil, defaultZoomLevel: nil)
+            updateAccessibilityLabel()
+            syncLayers()
+            return
+        }
+        onlineStack.configure(
+            source: basemap.makeSource(),
+            name: basemap.name,
+            tileSize: basemap.tileSize,
+            zoomRange: basemap.zoomRange,
+            followsDisplayScale: true,
+            maximumDataZoom: Double(basemap.zoomRange.upperBound),
+            memoryLimitBytes: 256 * 1024 * 1024,
+            maxConcurrentRequests: 24
+        )
+        updateAccessibilityLabel()
+        // 已经有本地数据时不打断当前视图；只有在线底图时按它的范围适配一次。
+        refreshCamera(fitRect: localStack.isActive ? nil : (fitRect ?? Self.worldRect),
+                      defaultZoomLevel: 2)
+        syncLayers()
+    }
+
+    /// 两层的不透明度：把上层影像淡下去就能看到下层的路网做对照。
+    func setLayerOpacity(local: Double, online: Double) {
+        localStack.opacity = local
+        onlineStack.opacity = online
+    }
+
+    /// 依据当前激活的图层重配相机（瓦片边长、缩放上下限，以及可选的窗口适配）。
+    private func refreshCamera(fitRect: CGRect?, defaultZoomLevel: Double?) {
+        camera.displayScale = displayScale
+        camera.viewportSize = bounds.size
+        // 相机里的瓦片边长跟着「上层」走：本地影像按设备像素 1:1，只有在线时才按地图约定。
+        let primary = localStack.isActive ? localStack : onlineStack
+        camera.tilePixelSize = primary.isActive ? primary.cameraTileSize(displayScale: displayScale) : 512
+
+        let rect = fitRect ?? (localStack.isActive ? defaultFitRect : nil) ?? onlineFitRect
+        let fitCamera = rect.map {
             MapCamera.fitting(
                 $0,
                 viewportSize: bounds.size,
@@ -325,18 +242,36 @@ final class TileCanvasNSView: NSView {
                 tilePixelSize: camera.tilePixelSize,
                 displayScale: camera.displayScale
             )
-        } ?? camera.settingZoomLevel(setup.defaultZoomLevel)
+        } ?? camera.settingZoomLevel(defaultZoomLevel ?? camera.zoomLevel)
 
-        zoomBounds = max(-2, fitCamera.zoomLevel - 1.2)...setup.zoomLevelRange.upperBound
+        // 上下限取两层的并集：更深的源决定能放多大，浅的那层靠祖先贴图兜底。
+        // 两层都没装配时给一个宽松范围，免得算成空区间（`ClosedRange` 会直接崩）。
+        var upper = 26.0
+        var hasActive = false
+        for stack in [onlineStack, localStack] where stack.isActive {
+            upper = hasActive ? max(upper, stack.zoomLevelRange.upperBound) : stack.zoomLevelRange.upperBound
+            hasActive = true
+        }
+        let lower = min(max(-2, fitCamera.zoomLevel - 1.2), upper - 0.001)
+        zoomBounds = lower...upper
         camera = fitCamera.clamped(zoomLevelRange: zoomBounds)
-        // 数据范围还没算出来时，相机只能停在数据集之外，此刻铺出来的只会是一屏空占位，
-        // 白读磁盘，而且范围一到画面必然整体跳一次。等 `setExtent` 到了再开始铺。
-        awaitingExtent = setup.waitingForExtent
-        syncLayers()
     }
 
+    /// 画布是自绘的，给读屏一个可读的名字与当前层级。
+    private func updateAccessibilityLabel() {
+        let name = localStack.isActive ? localStack.name : (onlineStack.isActive ? onlineStack.name : "")
+        guard !name.isEmpty else {
+            setAccessibilityLabel("地图画布，暂无内容")
+            setAccessibilityValue(nil)
+            return
+        }
+        let overlay = (localStack.isActive && onlineStack.isActive) ? "，叠加在线底图" : ""
+        setAccessibilityLabel("地图画布：\(name)\(overlay)")
+        setAccessibilityValue("z\(currentDataZoom)")
+    }
+
+    /// 本地数据范围算好之后对齐窗口（只影响本地层，不打断已经铺好的其他层）。
     func setExtent(_ extent: DatasetExtent?) {
-        // 在线底图状态下，本地数据集的范围变化不该打断当前视图。
         guard dataset != nil else { return }
         awaitingExtent = false
         extentRect = extent?.worldRect
@@ -346,21 +281,17 @@ final class TileCanvasNSView: NSView {
             syncLayers()
             return
         }
-        let fit = MapCamera.fitting(
-            extent.worldRect,
-            viewportSize: bounds.size,
-            padding: 28,
-            tilePixelSize: camera.tilePixelSize,
-            displayScale: camera.displayScale
-        )
-        zoomBounds = max(-2, fit.zoomLevel - 1.2)...sourceZoomLevelRange.upperBound
-        camera = fit.clamped(zoomLevelRange: zoomBounds)
+        refreshCamera(fitRect: extent.worldRect, defaultZoomLevel: nil)
         syncLayers()
     }
 
+    /// 适配窗口：优先本地数据范围，其次在线底图范围。
     func fitToData() {
-        guard provider != nil, !awaitingExtent || extentRect != nil else { return }
-        let rect = extentRect ?? defaultFitRect ?? camera.visibleWorldRect
+        guard localStack.isActive || onlineStack.isActive else { return }
+        guard !awaitingExtent || extentRect != nil else { return }
+        let rect = (localStack.isActive ? (extentRect ?? defaultFitRect) : nil)
+            ?? onlineFitRect
+            ?? Self.worldRect
         camera = MapCamera.fitting(
             rect,
             viewportSize: bounds.size,
@@ -397,9 +328,10 @@ final class TileCanvasNSView: NSView {
     }
 
     func zoomToActualSize() {
-        guard provider != nil else { return }
+        let primary = localStack.isActive ? localStack : onlineStack
+        guard primary.isActive else { return }
         camera = camera.settingZoomLevel(
-            sourceMaximumZoom,
+            primary.maximumDataZoom,
             zoomLevelRange: zoomBounds
         )
         syncLayers()
@@ -412,8 +344,6 @@ final class TileCanvasNSView: NSView {
         GeoBounds(normalizedRect: camera.visibleWorldRect)
     }
 
-    // MARK: - 布局与渲染
-
     override func layout() {
         super.layout()
         guard bounds.width > 1, bounds.height > 1 else { return }
@@ -421,7 +351,7 @@ final class TileCanvasNSView: NSView {
         camera = camera.clamped(zoomLevelRange: zoomBounds)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        tileHostLayer.frame = bounds
+        for stack in [onlineStack, localStack] { stack.hostLayer.frame = bounds }
         CATransaction.commit()
         syncLayers()
     }
@@ -429,218 +359,95 @@ final class TileCanvasNSView: NSView {
     /// 当前屏幕的设备像素比。
     private var displayScale: Double { Double(window?.backingScaleFactor ?? 2) }
 
-    /// 相机里的瓦片边长（视图点）。本地数据集按设备像素 1:1；在线底图按通用地图约定，
-    /// 一张瓦片铺满它自己的像素数，于是在不屏幕上都有一致的视觉比例尺。
-    private var cameraTileSize: Double {
-        baseTileSize * (tileSizeFollowsDisplayScale ? displayScale : 1)
-    }
-
     private func updateContentsScale() {
         let scale = displayScale
         // 设备像素比参与缩放层级换算：换到 Retina / 外接屏时瓦片仍是 1:1 对应设备像素。
-        if abs(camera.displayScale - scale) > 0.001 || abs(camera.tilePixelSize - cameraTileSize) > 0.001 {
+        let previous = camera.tilePixelSize
+        camera.displayScale = scale
+        refreshCamera(fitRect: nil, defaultZoomLevel: nil)
+        if abs(previous - camera.tilePixelSize) > 0.001 {
             let zoom = camera.zoomLevel
-            camera.displayScale = scale
-            camera.tilePixelSize = cameraTileSize
             camera = camera.settingZoomLevel(zoom).clamped(zoomLevelRange: zoomBounds)
         }
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        for layer in tileLayers.values {
-            layer.contentsScale = scale
-        }
-        CATransaction.commit()
-        overlay.setContentsScale(scale)
+        for stack in [onlineStack, localStack] { stack.setContentsScale(CGFloat(scale)) }
+        overlay.setContentsScale(CGFloat(scale))
         refreshOverlay()
+        syncLayers()
     }
 
+    /// 当前主图层（上层）正在渲染的整数层级。
     private var currentDataZoom: Int {
-        let raw = Int(camera.zoomLevel.rounded())
-        return min(max(raw, sourceDataZoomRange.lowerBound), sourceDataZoomRange.upperBound)
+        let primary = localStack.isActive ? localStack : onlineStack
+        guard primary.isActive else { return 0 }
+        return primary.dataZoom(for: camera)
     }
 
+    /// 把两条图层都同步一遍：下层先铺，上层后铺，叠加顺序天然正确。
     private func syncLayers() {
         guard bounds.width > 1, bounds.height > 1 else { return }
         camera.viewportSize = bounds.size
+        for stack in [onlineStack, localStack] { stack.updateSortCenter(camera.center) }
 
-        guard let provider, !awaitingExtent else {
-            renderGrid(zoom: nil)
+        let active = localStack.isActive || onlineStack.isActive
+        guard active, !awaitingExtent else {
+            _ = onlineStack.sync(camera: camera, viewportSize: bounds.size, displayScale: displayScale, showGrid: false)
+            _ = localStack.sync(camera: camera, viewportSize: bounds.size, displayScale: displayScale, showGrid: false)
             refreshOverlay()
             reportViewport(visibleTiles: 0)
             return
         }
 
-        let zoom = currentDataZoom
-        guard let columns = camera.tileColumnRange(zoom: zoom),
-              let rows = camera.tileRowRange(zoom: zoom) else {
-            refreshOverlay()
-            reportViewport(visibleTiles: 0)
-            return
-        }
-        let total = columns.count * rows.count
-        guard total <= maximumTilesPerFrame else {
-            // 超出安全阀时宁可清空，也不要留着上一帧的残影误导判读。
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            for layer in tileLayers.values { layer.removeFromSuperlayer() }
-            tileLayers.removeAll()
-            CATransaction.commit()
-            refreshOverlay()
-            onTileStatsChanged?(0, missingTiles.count)
-            reportViewport(visibleTiles: total)
-            return
-        }
-
-        let tileWorldSize = 1.0 / Double(1 << zoom)
-        let tileDisplaySize = CGFloat(camera.pixelsPerWorldUnit * tileWorldSize)
-        let scale = window?.backingScaleFactor ?? 2
-
-        var needed = Set<SlippyTile>()
-        needed.reserveCapacity(total)
-        for row in rows {
-            for column in columns {
-                needed.insert(SlippyTile(zoom: zoom, x: column, y: row))
-            }
-        }
-        // 「没有图可用」的结论只对还留在屏幕上的格子有效：离开视野就忘掉，转回来再试一次。
-        unresolvedTiles.formIntersection(needed)
-
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-
-        // 层级切换：把上一层的图层整体留作背景层，新图层的图到位前画面不会变空。
-        if renderedZoom != zoom {
-            for layer in backdropLayers.values { layer.removeFromSuperlayer() }
-            backdropLayers = tileLayers
-            tileLayers.removeAll()
-            layerImageSource.removeAll()
-            fallbackTasks.removeAll()
-            renderedZoom = zoom
-        }
-
-        // 换层级时把即将摘掉的图层图片先接过来，作为新瓦片的**同帧**兜底。
-        // 否则新图层会先闪一帧占位色，等磁盘读完才出图 —— 连续缩放时看着就是「一闪一闪」。
-        var recycledImages: [SlippyTile: CGImage] = [:]
-        for (tile, layer) in tileLayers where !needed.contains(tile) {
-            if let image = Self.contentsImage(of: layer) {
-                recycledImages[tile] = image
-            }
-            layer.removeFromSuperlayer()
-            tileLayers[tile] = nil
-            layerImageSource[tile] = nil
-            fallbackTasks.remove(tile)
-        }
-
-        for tile in needed {
-            let worldX = Double(tile.x) / Double(1 << zoom)
-            let worldY = Double(tile.y) / Double(1 << zoom)
-            let origin = camera.layerPoint(forWorldPoint: CGPoint(x: worldX, y: worldY))
-            let frame = CGRect(
-                x: origin.x,
-                y: origin.y,
-                width: tileDisplaySize,
-                height: tileDisplaySize
+        // 网格画在最上面那层（你正在判读的那份瓦片）。
+        let gridOwner = localStack.isActive ? localStack : onlineStack
+        var frames: [TileLayerFrame] = []
+        var visibleTiles = 0
+        var loadedTiles = 0
+        var missingTiles = 0
+        for stack in [onlineStack, localStack] where stack.isActive {
+            let frame = stack.sync(
+                camera: camera,
+                viewportSize: bounds.size,
+                displayScale: displayScale,
+                showGrid: showTileGrid && stack === gridOwner
             )
-
-            let layer: CALayer
-            if let existing = tileLayers[tile] {
-                layer = existing
-            } else {
-                layer = CALayer()
-                layer.magnificationFilter = .trilinear
-                layer.minificationFilter = .trilinear
-                layer.contentsGravity = .resize
-                layer.contentsScale = scale
-                // 新格子一开始是**透明**的：换层级时先让下面保留的上一层图层顶着，
-                // 自己的图到了再淡入。这里要是铺一层半透明占位色（而且它还盖在上一层图上），
-                // 每跨一次层级整屏就会先蒙上一层灰白纱再恢复 —— 那就是「一闪一闪」。
-                tileLayers[tile] = layer
-                tileHostLayer.insertSublayer(layer, below: gridLayer)
+            if let frame {
+                frames.append(frame)
+                visibleTiles = max(visibleTiles, frame.needed)
+                loadedTiles += frame.loaded
+                missingTiles += frame.missing
             }
-            if layerImageSource[tile] == nil,
-               let ancestor = Self.bestAncestor(of: tile, in: recycledImages),
-               let image = recycledImages[ancestor] {
-                install(image, in: layer, source: ancestor, for: tile, animated: false)
-            }
-            layer.frame = frame
         }
-        CATransaction.commit()
 
-        requestMissingTiles(needed: needed, provider: provider)
-        applyFallbackImages(needed: needed, provider: provider)
-        updateBackdropFrames()
-        dropBackdropIfSettled(needed: needed)
-        renderGrid(zoom: zoom)
         refreshOverlay()
-        Self.traceView(camera: camera, zoomBounds: zoomBounds, dataZoom: zoom, needed: needed.count,
-                       loaded: layerImageSource.filter { $0.key == $0.value }.count,
-                       fallback: layerImageSource.count - layerImageSource.filter { $0.key == $0.value }.count,
-                       missing: missingTiles.count,
-                       tileDisplaySize: tileDisplaySize)
-        reportViewport(visibleTiles: needed.count)
-        prefetchSurroundingTiles(needed: needed)
+        for frame in frames { Self.traceView(layer: frame, camera: camera, zoomBounds: zoomBounds) }
+        onTileStatsChanged?(loadedTiles, missingTiles)
+        reportViewport(visibleTiles: visibleTiles)
+        setAccessibilityValue("z\(currentDataZoom)")
     }
 
-    /// 预取视野外一圈的瓦片，让接下来的平移不必再等磁盘或网络。
-    ///
-    /// 只在当前视野已经没有待取瓦片时做（不跟首屏抢并发额度），
-    /// 并用「层级 + 视野行列范围」当键，视野没动就不重复预取。
-    private func prefetchSurroundingTiles(needed: Set<SlippyTile>) {
-        guard let provider else { return }
-        let settled = needed.allSatisfy { tile in
-            layerImageSource[tile] == tile || missingTiles.contains(tile) || unresolvedTiles.contains(tile)
-        }
-        guard settled else { return }
-
-        let zoom = currentDataZoom
-        guard let columns = camera.tileColumnRange(zoom: zoom),
-              let rows = camera.tileRowRange(zoom: zoom) else { return }
-        let key = "\(zoom):\(columns.lowerBound)-\(columns.upperBound):\(rows.lowerBound)-\(rows.upperBound)"
-        guard key != lastPrefetchKey else { return }
-        lastPrefetchKey = key
-
-        let maximumIndex = (1 << zoom) - 1
-        var ring: [SlippyTile] = []
-        for row in (rows.lowerBound - 1)...(rows.upperBound + 1) {
-            for column in (columns.lowerBound - 1)...(columns.upperBound + 1) {
-                guard (0...maximumIndex).contains(column), (0...maximumIndex).contains(row) else { continue }
-                let tile = SlippyTile(zoom: zoom, x: column, y: row)
-                guard !needed.contains(tile) else { continue }
-                ring.append(tile)
-            }
-        }
-        guard !ring.isEmpty else { return }
-
-        let batch = Array(ring.prefix(Self.prefetchLimit))
-        Task.detached(priority: .utility) {
-            await provider.prefetch(batch)
-        }
+    /// 把当前视图状态汇报给界面（状态栏、检查器）。
+    private func reportViewport(visibleTiles: Int) {
+        onViewportChanged?(ViewportSnapshot(
+            zoomLevel: camera.zoomLevel,
+            dataZoom: currentDataZoom,
+            center: WebMercator.coordinate(fromNormalized: camera.center),
+            metersPerPoint: camera.groundMetersPerPoint,
+            visibleTiles: visibleTiles
+        ))
     }
 
     /// 调试用：`EUCLID_TRACE_VIEW=1` 时把每次渲染的关键数字打到 stderr。
-    static func traceView(
-        camera: MapCamera,
-        zoomBounds: ClosedRange<Double>,
-        dataZoom: Int,
-        needed: Int,
-        loaded: Int,
-        fallback: Int,
-        missing: Int,
-        tileDisplaySize: CGFloat
-    ) {
+    static func traceView(layer: TileLayerFrame, camera: MapCamera, zoomBounds: ClosedRange<Double>) {
         guard ProcessInfo.processInfo.environment["EUCLID_TRACE_VIEW"] != nil else { return }
         let line = String(
-            format: "[view] z=%.2f 层级=%d 范围=%.2f…%.2f 需要=%d 已载入=%d 祖先兜底=%d 缺片=%d 瓦片边长=%.0fpt 中心=(%.5f,%.5f)\n",
-            camera.zoomLevel, dataZoom, zoomBounds.lowerBound, zoomBounds.upperBound,
-            needed, loaded, fallback, missing, tileDisplaySize, camera.center.x, camera.center.y
+            format: "[view] %@ z=%.2f 层级=%d 范围=%.2f…%.2f 需要=%d 已载入=%d 祖先兜底=%d 缺片=%d 瓦片边长=%.0fpt 中心=(%.5f,%.5f)\n",
+            layer.name, camera.zoomLevel, layer.zoom,
+            zoomBounds.lowerBound, zoomBounds.upperBound,
+            layer.needed, layer.loaded, layer.fallback, layer.missing,
+            layer.tileDisplaySize, camera.center.x, camera.center.y
         )
         FileHandle.standardError.write(Data(line.utf8))
     }
-
-    /// 调试用：把当前画布（瓦片 + 标注）离屏渲染成 PNG，不需要屏幕在前台。
-    ///
-    /// `EUCLID_DEBUG_SNAPSHOT=<目录>` 时按帧写出 `frame-01.png`、`frame-02.png`…
-    /// 用于核对清晰度、换层级时是否出现空白帧。
     func writeDebugSnapshot(index: Int) {
         guard bounds.width > 1, bounds.height > 1,
               let directory = ProcessInfo.processInfo.environment["EUCLID_DEBUG_SNAPSHOT"] else { return }
@@ -665,308 +472,6 @@ final class TileCanvasNSView: NSView {
         guard let destination = CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil) else { return }
         CGImageDestinationAddImage(destination, image, nil)
         CGImageDestinationFinalize(destination)
-    }
-
-    private func requestMissingTiles(needed: Set<SlippyTile>, provider: TileProvider) {
-        let currentGeneration = generation
-        let outstanding = tileTasks.count
-        // 只按「自己的图还没上屏、没有在途请求、也不是已确认缺片」判断是否要取图。
-        // 注意不能只看 `contents == nil`：祖先贴图先顶上时图层也有内容，但自己的图仍要取。
-        // 过去这里还记过一个「请求过就不再请求」的集合，结果是图层一旦被移除重建
-        // （换个缩放层级就会发生），新图层永远不会再取图，整屏变成空占位。
-        var pending: [SlippyTile] = needed.filter { tile in
-            layerImageSource[tile] != tile
-                && tileTasks[tile] == nil
-                && !missingTiles.contains(tile)
-        }
-        guard !pending.isEmpty else { return }
-
-        // 靠近视图中心的瓦片优先加载。
-        let center = camera.center
-        let zoom = currentDataZoom
-        pending.sort { lhs, rhs in
-            distanceSquared(lhs, center: center, zoom: zoom) < distanceSquared(rhs, center: center, zoom: zoom)
-        }
-
-        let budget = max(0, maximumConcurrentRequests - outstanding)
-        for tile in pending.prefix(budget) {
-            tileTasks[tile] = Task { @MainActor [weak self] in
-                guard let self else { return }
-                let image = await provider.image(for: tile)
-                guard self.generation == currentGeneration else { return }
-                self.tileTasks[tile] = nil
-                guard let image else {
-                    if self.missingTiles.count > 50_000 { self.missingTiles.removeAll(keepingCapacity: true) }
-                    self.missingTiles.insert(tile)
-                    self.publishTileStats()
-                    self.scheduleRefill()
-                    return
-                }
-                if let layer = self.tileLayers[tile] {
-                    // 首次出现也做一次很短的淡入：瓦片是按解码完成的先后落下来的，
-                    // 硬贴上去就是一块块「啪」地跳出来，一屏几十块看着就是闪。
-                    self.install(image, in: layer, source: tile, for: tile, animated: true)
-                }
-                self.publishTileStats()
-                // 并发额度腾出来了，把这一帧没排上队的瓦片接着取。
-                self.scheduleRefill()
-            }
-        }
-    }
-
-    /// 本轮请求结束后补跑一次同步，避免超出并发额度的瓦片要等到下次交互才加载。
-    private func scheduleRefill() {
-        guard !refillScheduled else { return }
-        refillScheduled = true
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            self.refillScheduled = false
-            self.syncLayers()
-        }
-    }
-
-    // MARK: - 祖先贴图兜底
-
-    /// 背景层跟着相机走，缩放平移时始终保持与当前层级对齐。
-    private func updateBackdropFrames() {
-        guard !backdropLayers.isEmpty else { return }
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        for (tile, layer) in backdropLayers {
-            let count = Double(1 << tile.zoom)
-            let size = CGFloat(camera.pixelsPerWorldUnit / count)
-            let origin = camera.layerPoint(forWorldPoint: CGPoint(
-                x: Double(tile.x) / count,
-                y: Double(tile.y) / count
-            ))
-            layer.frame = CGRect(x: origin.x, y: origin.y, width: size, height: size)
-        }
-        CATransaction.commit()
-    }
-
-    /// 当前层级的每一格都有自己的图（或已确认缺片）之后，背景层就没必要留着了。
-    private func dropBackdropIfSettled(needed: Set<SlippyTile>) {
-        guard !backdropLayers.isEmpty else { return }
-        let settled = needed.allSatisfy { tile in
-            layerImageSource[tile] == tile || missingTiles.contains(tile)
-        }
-        guard settled else { return }
-
-        let retired = backdropLayers
-        backdropLayers.removeAll()
-        // 「减少动态效果」时直接摘掉，不做淡出。
-        guard !InterfaceStyle.reducesMotion else {
-            for layer in retired.values { layer.removeFromSuperlayer() }
-            return
-        }
-        // 自己的图已经盖满时摘掉背景是看不见的；稀疏缺片的格子还露着背景，淡出更自然。
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        for layer in retired.values {
-            let fade = CABasicAnimation(keyPath: "opacity")
-            fade.fromValue = layer.opacity
-            fade.toValue = 0
-            fade.duration = 0.2
-            fade.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            layer.add(fade, forKey: "backdropFade")
-            layer.opacity = 0
-        }
-        CATransaction.commit()
-        Task { @MainActor in
-            try? await Task.sleep(for: .seconds(0.25))
-            for layer in retired.values { layer.removeFromSuperlayer() }
-        }
-    }
-
-    /// 祖先层级最多回溯几级。数值越大，稀疏数据越不容易露白，但请求也越多。
-    private static let maximumFallbackLevels = 4
-    /// 同时在找祖先贴图的格子数量上限，避免一屏几十个空格同时发起请求。
-    private static let maximumFallbackLookups = 8
-
-    /// 给还没有图的格子先铺上祖先层级的图（裁到对应子区域）。
-    ///
-    /// 这是「缩放不闪」的关键：换层级时新图还没到，但父层级的图往往已经在内存缓存里，
-    /// 直接按比例铺上去，画面就是连续的；等自己那张图到了再无缝替换。
-    private func applyFallbackImages(needed: Set<SlippyTile>, provider: TileProvider) {
-        let waiting = needed.filter {
-            layerImageSource[$0] == nil
-                && !fallbackTasks.contains($0)
-                && !unresolvedTiles.contains($0)
-        }
-        guard !waiting.isEmpty, fallbackTasks.count < Self.maximumFallbackLookups else { return }
-
-        let zoom = currentDataZoom
-        let center = camera.center
-        let currentGeneration = generation
-        let budget = max(0, Self.maximumFallbackLookups - fallbackTasks.count)
-        let ordered = waiting.sorted {
-            distanceSquared($0, center: center, zoom: zoom) < distanceSquared($1, center: center, zoom: zoom)
-        }
-
-        for tile in ordered.prefix(budget) {
-            fallbackTasks.insert(tile)
-            Task { @MainActor [weak self] in
-                let ancestor = await Self.firstAvailableAncestor(of: tile, provider: provider)
-                guard let self else { return }
-                self.fallbackTasks.remove(tile)
-                guard self.generation == currentGeneration else { return }
-                guard let found = ancestor else {
-                    // 自己也没有、祖先也没有：先记下来，别在下一轮又从头找一遍。
-                    // 这里仍然补跑一次同步，是为了让本轮没排上的格子继续找；
-                    // 因为候选集合只减不增，这个回路会在几轮内收敛。
-                    self.unresolvedTiles.insert(tile)
-                    self.scheduleRefill()
-                    return
-                }
-                // 自己的图已经到了就不用兜底了。
-                guard self.layerImageSource[tile] != tile,
-                      self.layerImageSource[tile] == nil,
-                      let layer = self.tileLayers[tile] else { return }
-                self.install(found.image, in: layer, source: found.tile, for: tile, animated: true)
-                self.publishTileStats()
-                self.scheduleRefill()
-            }
-        }
-    }
-
-    /// 从父层级往上找第一张已经能取到的瓦片。
-    private static func firstAvailableAncestor(
-        of tile: SlippyTile,
-        provider: TileProvider
-    ) async -> (tile: SlippyTile, image: CGImage)? {
-        var level = tile.zoom - 1
-        var tries = 0
-        while level >= 0, tries < maximumFallbackLevels {
-            let shift = tile.zoom - level
-            let ancestor = SlippyTile(zoom: level, x: tile.x >> shift, y: tile.y >> shift)
-            if let image = await provider.image(for: ancestor) {
-                return (ancestor, image)
-            }
-            level -= 1
-            tries += 1
-        }
-        return nil
-    }
-
-    /// 在已有的图片里找最近的祖先层级瓦片（用于同帧兜底，不需要等异步取图）。
-    static func bestAncestor(of tile: SlippyTile, in images: [SlippyTile: CGImage]) -> SlippyTile? {
-        guard !images.isEmpty else { return nil }
-        var level = tile.zoom - 1
-        var tries = 0
-        while level >= 0, tries < maximumFallbackLevels {
-            let shift = tile.zoom - level
-            let ancestor = SlippyTile(zoom: level, x: tile.x >> shift, y: tile.y >> shift)
-            if images[ancestor] != nil { return ancestor }
-            level -= 1
-            tries += 1
-        }
-        return nil
-    }
-
-    /// 取出图层里装的图片（`CALayer.contents` 是 `Any?`，用 CFTypeID 判断再取）。
-    static func contentsImage(of layer: CALayer) -> CGImage? {
-        guard let contents = layer.contents,
-              CFGetTypeID(contents as CFTypeRef) == CGImage.typeID else { return nil }
-        return (contents as! CGImage)
-    }
-
-    /// 把图片装进格子：来源可能是自己，也可能是祖先（按 `contentsRect` 裁出对应子区域）。
-    private func install(
-        _ image: CGImage,
-        in layer: CALayer,
-        source: SlippyTile,
-        for tile: SlippyTile,
-        animated: Bool
-    ) {
-        let rect = Self.contentsRect(source: source, destination: tile)
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        if animated, !InterfaceStyle.reducesMotion {
-            // 首次出现、以及换图（祖先贴图 → 自己的图）都做一次很短的交叉淡入，
-            // 避免整屏几十块瓦片按解码顺序「啪、啪」地跳出来。
-            let fade = CATransition()
-            fade.type = .fade
-            fade.duration = 0.12
-            fade.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            layer.add(fade, forKey: "contentFade")
-        }
-        layer.contents = image
-        layer.contentsRect = rect
-        layer.backgroundColor = nil
-        layerImageSource[tile] = source
-        CATransaction.commit()
-    }
-
-    /// 目标瓦片在来源瓦片图片里占的子区域（单位坐标，y 从图片顶部算起）。
-    static func contentsRect(source: SlippyTile, destination: SlippyTile) -> CGRect {
-        let shift = destination.zoom - source.zoom
-        guard shift > 0 else { return CGRect(x: 0, y: 0, width: 1, height: 1) }
-        let factor = Double(1 << shift)
-        let dx = Double(destination.x - source.x * (1 << shift)) / factor
-        let dy = Double(destination.y - source.y * (1 << shift)) / factor
-        return CGRect(x: dx, y: dy, width: 1 / factor, height: 1 / factor)
-    }
-
-    private func distanceSquared(_ tile: SlippyTile, center: CGPoint, zoom: Int) -> Double {
-        let n = Double(1 << zoom)
-        let dx = (Double(tile.x) + 0.5) / n - center.x
-        let dy = (Double(tile.y) + 0.5) / n - center.y
-        return dx * dx + dy * dy
-    }
-
-    private func cancelPendingRequests() {
-        for task in tileTasks.values { task.cancel() }
-        tileTasks.removeAll()
-    }
-
-    private func publishTileStats() {
-        // 只统计「自己的图已经上屏」的瓦片；祖先贴图兜底的不算已载入。
-        let loaded = layerImageSource.filter { $0.key == $0.value }.count
-        onTileStatsChanged?(loaded, missingTiles.count)
-    }
-
-    private func reportViewport(visibleTiles: Int) {
-        onViewportChanged?(ViewportSnapshot(
-            zoomLevel: camera.zoomLevel,
-            dataZoom: currentDataZoom,
-            center: WebMercator.coordinate(fromNormalized: camera.center),
-            metersPerPoint: camera.groundMetersPerPoint,
-            visibleTiles: visibleTiles
-        ))
-        publishTileStats()
-    }
-
-    private func renderGrid(zoom: Int?) {
-        guard showTileGrid, let zoom else {
-            gridLayer.path = nil
-            return
-        }
-        guard let columns = camera.tileColumnRange(zoom: zoom),
-              let rows = camera.tileRowRange(zoom: zoom) else {
-            gridLayer.path = nil
-            return
-        }
-        let tileWorldSize = 1.0 / Double(1 << zoom)
-        let size = CGFloat(camera.pixelsPerWorldUnit * tileWorldSize)
-        guard size > 4 else {
-            gridLayer.path = nil
-            return
-        }
-        let path = CGMutablePath()
-        for column in columns {
-            let worldX = Double(column) / Double(1 << zoom)
-            let viewX = (worldX - camera.center.x) * camera.pixelsPerWorldUnit + bounds.width / 2
-            path.move(to: CGPoint(x: viewX, y: 0))
-            path.addLine(to: CGPoint(x: viewX, y: bounds.height))
-        }
-        for row in rows {
-            let worldY = Double(row) / Double(1 << zoom)
-            let viewTopY = (camera.center.y - worldY) * camera.pixelsPerWorldUnit + bounds.height / 2
-            let viewY = bounds.height - viewTopY
-            path.move(to: CGPoint(x: 0, y: viewY))
-            path.addLine(to: CGPoint(x: bounds.width, y: viewY))
-        }
-        gridLayer.path = path
     }
 
     // MARK: - 测量标注

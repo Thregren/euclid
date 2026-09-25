@@ -9,12 +9,7 @@ struct SidebarView: View {
 
         List(selection: selection) {
             Section("底图") {
-                Picker("底图", selection: $model.usesOnlineBasemap) {
-                    Text("本地数据").tag(false)
-                    Text("在线底图").tag(true)
-                }
-                .labelsHidden()
-                .pickerStyle(.segmented)
+                Toggle("叠加在线底图", isOn: $model.usesOnlineBasemap)
 
                 if model.usesOnlineBasemap {
                     Picker("数据源", selection: onlineSourceBinding) {
@@ -35,6 +30,7 @@ struct SidebarView: View {
                                     .controlSize(.small)
                             }
                         }
+                        opacityRow("底图不透明度", value: $model.onlineLayerOpacity)
                         if let reason = basemap.invalidReason {
                             Label(reason, systemImage: "exclamationmark.triangle")
                                 .font(.caption2)
@@ -47,6 +43,10 @@ struct SidebarView: View {
                                 .fixedSize(horizontal: false, vertical: true)
                         }
                     }
+                }
+
+                if model.selectedDataset != nil {
+                    opacityRow("影像不透明度", value: $model.localLayerOpacity)
                 }
             }
 
@@ -115,6 +115,22 @@ struct SidebarView: View {
             }
         }
         .listStyle(.sidebar)
+    }
+
+    /// 不透明度一行：标签 + 滑杆 + 百分比（HIG：滑杆配实时数值）。
+    private func opacityRow(_ title: String, value: Binding<Double>) -> some View {
+        HStack(spacing: 8) {
+            Text(title)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+            Slider(value: value, in: 0...1)
+                .controlSize(.small)
+            Text("\(Int((value.wrappedValue * 100).rounded()))%")
+                .font(.subheadline)
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .frame(width: 38, alignment: .trailing)
+        }
     }
 
     /// 选在线数据源时顺带打开在线底图，省一步；下载面板与这里共用同一个 `sourceID`。

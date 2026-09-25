@@ -9,7 +9,7 @@ struct InspectorView: View {
             if model.hasMapContent {
                 CursorCoordinateSection()
                 MeasurementSection()
-                basemapSection
+                layersSection
                 datasetSection
                 if let extent = model.extent {
                     extentSection(extent)
@@ -32,13 +32,20 @@ struct InspectorView: View {
 
     // MARK: - 数据集信息
 
-    /// 在线底图信息；用本地数据时不显示。
+    /// 图层信息：本地影像与在线底图各自的不透明度与来源。
     @ViewBuilder
-    private var basemapSection: some View {
-        if let basemap = model.onlineBasemap {
-            Section("在线底图") {
-                LabeledContent("数据源") {
-                    Text(basemap.name)
+    private var layersSection: some View {
+        Section("图层") {
+            if let dataset = model.selectedDataset {
+                LabeledContent("本地影像") {
+                    Text("\(dataset.name) · \(percent(model.localLayerOpacity))")
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+            if let basemap = model.onlineBasemap {
+                LabeledContent("在线底图") {
+                    Text("\(basemap.name) · \(percent(model.onlineLayerOpacity))")
                         .lineLimit(1)
                         .truncationMode(.middle)
                 }
@@ -54,6 +61,10 @@ struct InspectorView: View {
                 }
             }
         }
+    }
+
+    private func percent(_ value: Double) -> String {
+        "\(Int((value * 100).rounded()))%"
     }
 
     @ViewBuilder
