@@ -76,7 +76,6 @@ enum ViewExporter {
         defer { NSGraphicsContext.restoreGraphicsState() }
 
         let inset = 14 * scale
-        let baselineY = 16 * scale
 
         // 左上：数据源与叠加信息。
         let titleStyle = NSMutableParagraphStyle()
@@ -103,7 +102,8 @@ enum ViewExporter {
             ))
         }
         title.draw(
-            in: CGRect(x: inset, y: baselineY, width: size.width - inset * 2 - 130 * scale, height: 18 * scale)
+            // 右边留出比例尺的位置（最长 180 点 + 边距），数据源名很长时也不会压到比例尺上。
+            in: CGRect(x: inset, y: 26 * scale, width: size.width - inset * 2 - 210 * scale, height: 18 * scale)
         )
 
         // 左下：中心坐标。
@@ -112,7 +112,7 @@ enum ViewExporter {
             info.center.longitude, info.center.latitude, info.zoom
         )
         (coordinate as NSString).draw(
-            at: CGPoint(x: inset, y: baselineY - 20 * scale),
+            at: CGPoint(x: inset, y: 9 * scale),
             withAttributes: [
                 .font: NSFont.monospacedDigitSystemFont(ofSize: 10.5 * scale, weight: .regular),
                 .foregroundColor: NSColor.darkGray,
