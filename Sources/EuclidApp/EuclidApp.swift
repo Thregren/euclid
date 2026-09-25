@@ -56,6 +56,17 @@ struct Euclid: App {
                 model.showDownloadSheet = true
             }
             .keyboardShortcut("d", modifiers: [.command, .shift])
+            Divider()
+            Button("导出当前视图为图片…") {
+                model.exportViewAsImage()
+            }
+            .keyboardShortcut("e", modifiers: [.command, .shift])
+            .disabled(!model.hasMapContent)
+            Button("复制当前视图到剪贴板") {
+                model.copyViewToClipboard()
+            }
+            .keyboardShortcut("c", modifiers: [.command, .shift])
+            .disabled(!model.hasMapContent)
         }
         CommandGroup(replacing: .undoRedo) {
             Button("撤销") { model.performUndo() }

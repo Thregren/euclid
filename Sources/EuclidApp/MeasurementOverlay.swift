@@ -32,15 +32,6 @@ final class MeasurementOverlay {
 
     private var contentsScale: CGFloat = 2
 
-    /// 圆周采样点缓存：采样只跟圆心与半径有关，平移缩放时可以整段复用。
-    private struct RingCacheEntry {
-        var center: GeoCoordinate
-        var radius: Double
-        var ring: [GeoCoordinate]
-    }
-
-    private var ringCache: [UUID: RingCacheEntry] = [:]
-
     init() {
         hostLayer.isGeometryFlipped = true
         hostLayer.masksToBounds = true
@@ -56,6 +47,31 @@ final class MeasurementOverlay {
         for layer in labelLayers {
             layer.contentsScale = scale
         }
+    }
+
+    /// 离屏渲染时把标注文字临时翻正。
+    ///
+    /// `CALayer.render(in:)` 在 y 向下的上下文里会把 `CATextLayer` 的文字画成上下镜像
+    /// （瓦片那种「画图片」的内容不受影响），屏幕上的合成路径则正常。
+    /// 导出图片与调试截图都走离屏渲染，所以出图前给文字图层补一次纵向翻转，出图后立刻还原。
+    func withLabelsUprightForOffscreenRender<T>(_ body: () -> T) -> T {
+        let original = labelLayers.map(\.transform)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for layer in labelLayers where !layer.isHidden {
+            layer.transform = CATransform3DMakeScale(1, -1, 1)
+        }
+        CATransaction.commit()
+
+        defer {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            for (index, layer) in labelLayers.enumerated() where index < original.count {
+                layer.transform = original[index]
+            }
+            CATransaction.commit()
+        }
+        return body()
     }
 
     func update(
@@ -86,7 +102,6 @@ final class MeasurementOverlay {
             draw(
                 kind: measurement.kind,
                 coordinates: measurement.points,
-                cacheKey: measurement.id,
                 stroke: MeasurementPalette.strokeColor(of: measurement),
                 fill: MeasurementPalette.resolvedFillColor(of: measurement),
                 lineWidth: MeasurementPalette.lineWidth(of: measurement),
@@ -107,7 +122,6 @@ final class MeasurementOverlay {
             draw(
                 kind: draftKind,
                 coordinates: coordinates,
-                cacheKey: nil,
                 stroke: MeasurementPalette.draftStrokeColor(at: paletteIndex, style: draftStyle),
                 fill: MeasurementPalette.draftFillColor(at: paletteIndex, style: draftStyle),
                 lineWidth: CGFloat(draftStyle.sanitized().strokeWidth),
@@ -159,7 +173,6 @@ final class MeasurementOverlay {
     private func draw(
         kind: MeasurementKind,
         coordinates: [GeoCoordinate],
-        cacheKey: UUID?,
         stroke: NSColor,
         fill: NSColor,
         lineWidth: CGFloat,
@@ -171,15 +184,15 @@ final class MeasurementOverlay {
     ) {
         let points = coordinates.map { layerPoint($0, camera: camera) }
         let outlined = kind == .circle
-        // 圆的圆周、周长与面积共用同一组采样点；缓存后平移缩放不必重复测地计算。
+        // 圆的圆周、周长与面积共用同一组采样点；求值带缓存（见 `MeasurementCalculator.circleMetrics`），
+        // 因此平移缩放时不会每帧重算 360 点采样。
         var circleMetrics: MeasurementCalculator.CircleMetrics?
         if outlined, coordinates.count >= 2 {
             let radius = Geodesy.distance(from: coordinates[0], to: coordinates[1])
             if radius > 0 {
                 circleMetrics = MeasurementCalculator.circleMetrics(
                     center: coordinates[0],
-                    radius: radius,
-                    ring: cachedRing(for: cacheKey, center: coordinates[0], radius: radius)
+                    radius: radius
                 )
             }
         }
@@ -329,20 +342,6 @@ final class MeasurementOverlay {
         }
         path.closeSubpath()
         return path
-    }
-
-    /// 取圆周采样点：命中缓存就直接复用，否则算一次并记下来。
-    private func cachedRing(for key: UUID?, center: GeoCoordinate, radius: Double) -> [GeoCoordinate] {
-        if let key, let entry = ringCache[key], entry.center == center,
-           abs(entry.radius - radius) < 1e-9 {
-            return entry.ring
-        }
-        let ring = Geodesy.circleRing(center: center, radius: radius)
-        if let key {
-            if ringCache.count > 64 { ringCache.removeAll(keepingCapacity: true) }
-            ringCache[key] = RingCacheEntry(center: center, radius: radius, ring: ring)
-        }
-        return ring
     }
 
     private func strokePath(_ path: CGPath, stroke: NSColor, lineWidth: CGFloat, prominent: Bool) {

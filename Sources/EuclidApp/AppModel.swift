@@ -2,6 +2,7 @@ import AppKit
 import Observation
 import SwiftUI
 import TileKit
+import UniformTypeIdentifiers
 
 /// 画布对外汇报的视图状态。
 @MainActor
@@ -97,6 +98,12 @@ final class CanvasController {
     /// 调试用：把画布离屏渲染成 PNG（见 `EUCLID_DEBUG_SNAPSHOT`）。
     func snapshot(index: Int) { view?.writeDebugSnapshot(index: index) }
     func actualSize() { view?.zoomToActualSize() }
+    /// 把当前画面渲染成位图（导出图片用）。
+    func mapImage(includingMeasurements: Bool) -> CGImage? {
+        view?.renderMapImage(includingMeasurements: includingMeasurements)
+    }
+    /// 画布的设备像素比：导出图片时用它决定字号与线宽。
+    var backingScale: CGFloat { view?.backingScale ?? 2 }
 }
 
 /// 应用状态。
@@ -531,5 +538,90 @@ extension AppModel {
     func clearMeasurements() {
         measurements.clearAll()
         canvas.refreshOverlay()
+    }
+
+    // MARK: - 出图
+
+    /// 导出当前视图：画面（瓦片 + 测量标注）加一条信息栏，
+    /// 里面是数据源、中心坐标、层级与比例尺，直接贴进报告就能看懂。
+    func exportViewAsImage() {
+        guard let info = viewImageInfo else {
+            setStatus("当前没有可导出的画面")
+            return
+        }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "\(basemapName)-视图.png"
+        panel.allowedContentTypes = [.png]
+        panel.isExtensionHidden = false
+        panel.message = "导出当前视图（下方带数据源、中心坐标与比例尺信息栏）"
+        let measurementsToggle = NSButton(
+            checkboxWithTitle: "包含测量标注", target: nil, action: nil
+        )
+        measurementsToggle.state = .on
+        panel.accessoryView = measurementsToggle
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        let includesMeasurements = measurementsToggle.state == .on
+        guard let data = viewImageData(info: info, includingMeasurements: includesMeasurements) else {
+            setStatus("导出失败：画面还没渲染好", autoClearAfter: 8)
+            return
+        }
+        do {
+            try data.write(to: url, options: .atomic)
+            setStatus("已导出当前视图到 \(url.lastPathComponent)")
+        } catch {
+            setStatus("导出失败：\(error.localizedDescription)", autoClearAfter: 8)
+        }
+    }
+
+    /// 把当前视图放进剪贴板，直接粘到聊天窗口或文档里。
+    func copyViewToClipboard() {
+        guard let info = viewImageInfo,
+              let data = viewImageData(info: info, includingMeasurements: true),
+              let image = NSImage(data: data) else {
+            setStatus("当前没有可复制的画面")
+            return
+        }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.writeObjects([image])
+        setStatus("已复制当前视图（\(image.size.width)×\(image.size.height) 点）")
+    }
+
+    private func viewImageData(info: ViewExporter.Info, includingMeasurements: Bool) -> Data? {
+        guard let map = canvas.mapImage(includingMeasurements: includingMeasurements),
+              let composed = ViewExporter.compose(
+                map: map,
+                scale: canvas.backingScale,
+                info: info
+              ) else { return nil }
+        return ViewExporter.pngData(composed)
+    }
+
+    /// 出图用的数据（调试脚本与菜单共用同一条路径）。
+    func viewImageData(includingMeasurements: Bool = true) -> Data? {
+        guard let info = viewImageInfo else { return nil }
+        return viewImageData(info: info, includingMeasurements: includingMeasurements)
+    }
+
+    /// 信息栏内容：现在看的是什么、中心在哪、多大比例、量了几条。
+    private var viewImageInfo: ViewExporter.Info? {
+        guard hasMapContent else { return nil }
+        let dataset = selectedDataset
+        let online = onlineBasemap
+        var subtitleParts: [String] = []
+        if dataset != nil, let online {
+            subtitleParts.append("叠加 \(online.name)")
+        }
+        if let online, !online.attribution.isEmpty {
+            subtitleParts.append(online.attribution)
+        }
+        return ViewExporter.Info(
+            title: dataset?.name ?? online?.name ?? basemapName,
+            subtitle: subtitleParts.isEmpty ? nil : subtitleParts.joined(separator: " · "),
+            center: viewport.center,
+            zoom: viewport.dataZoom,
+            metersPerPoint: viewport.metersPerPoint,
+            measurementCount: measurements.measurements.count
+        )
     }
 }

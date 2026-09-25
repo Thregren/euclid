@@ -94,6 +94,12 @@ enum DebugZoomScript {
             }
             try? await Task.sleep(for: .seconds(2))
             snap()
+            // 顺带报一下测量结果缓存的命中次数：缩放脚本跑完会重绘很多帧，
+            // 命中数远大于测量条数，说明每帧重算测地线的那条路真的被避开了。
+            let hits = MeasurementCalculator.resultCacheHits
+            FileHandle.standardError.write(Data(
+                "[perf] 缩放脚本结束：测量结果缓存命中 \(hits) 次\n".utf8
+            ))
         }
     }
 }
@@ -254,6 +260,35 @@ enum DebugAppearanceScript {
         case "dark": NSApplication.shared.appearance = NSAppearance(named: .darkAqua)
         case "light": NSApplication.shared.appearance = NSAppearance(named: .aqua)
         default: break
+        }
+    }
+}
+
+/// 开发调试用的出图脚本。
+///
+/// `EUCLID_DEBUG_EXPORT_VIEW=<输出路径>` 时，启动十几秒后（数据范围与底图都安定下来）
+/// 在无人值守的情况下走一遍「导出当前视图」的合成路径并把 PNG 写盘，
+/// 用来核对成图里的数据源、中心坐标、层级与比例尺是不是对的。
+/// 保存面板只在菜单那条路径上出现，这里调的是同一套合成代码。
+@MainActor
+enum DebugExportScript {
+    static func runIfRequested(model: AppModel) {
+        guard let path = ProcessInfo.processInfo.environment["EUCLID_DEBUG_EXPORT_VIEW"] else { return }
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(20))
+            let url = URL(fileURLWithPath: path)
+            guard let data = model.viewImageData() else {
+                FileHandle.standardError.write(Data("[export] 当前没有可导出的画面\n".utf8))
+                return
+            }
+            do {
+                try data.write(to: url, options: .atomic)
+                let line = "[export] 已写出 \(path)（\(data.count) 字节，"
+                    + "中心=\(model.viewport.center) z\(model.viewport.dataZoom)）\n"
+                FileHandle.standardError.write(Data(line.utf8))
+            } catch {
+                FileHandle.standardError.write(Data("[export] 写盘失败：\(error)\n".utf8))
+            }
         }
     }
 }

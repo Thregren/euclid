@@ -1001,6 +1001,124 @@ do {
     expect(Datum.allCases.allSatisfy { !$0.title.isEmpty && !$0.shortTitle.isEmpty }, "每档基准都应有名称")
 }
 
+section("测量结果缓存")
+
+do {
+    // 界面上同一条测量会被反复取用（平移缩放重绘、检查器刷新），
+    // 因此求值带缓存：这里逐项核对「缓存路径 = 直算路径」以及命中与淘汰的行为。
+    let polyline = [
+        GeoCoordinate(longitude: 119.300, latitude: 26.070),
+        GeoCoordinate(longitude: 119.310, latitude: 26.080),
+        GeoCoordinate(longitude: 119.320, latitude: 26.075),
+    ]
+    let polygon = [
+        GeoCoordinate(longitude: 119.300, latitude: 26.070),
+        GeoCoordinate(longitude: 119.320, latitude: 26.070),
+        GeoCoordinate(longitude: 119.320, latitude: 26.090),
+        GeoCoordinate(longitude: 119.300, latitude: 26.090),
+    ]
+    let circle = [
+        GeoCoordinate(longitude: 119.310, latitude: 26.080),
+        GeoCoordinate(longitude: 119.320, latitude: 26.080),
+    ]
+
+    MeasurementCalculator.resetResultCache()
+    for (kind, points) in [
+        (MeasurementKind.distance, polyline),
+        (MeasurementKind.area, polygon),
+        (MeasurementKind.circle, circle),
+        (MeasurementKind.point, [polyline[0]]),
+    ] {
+        expect(
+            MeasurementCalculator.evaluate(kind: kind, points: points)
+                == MeasurementCalculator.evaluateUncached(kind: kind, points: points),
+            "缓存结果应与直算逐字段一致（\(kind.displayName)）"
+        )
+    }
+
+    // 同一条测量再取多少次都是命中缓存，不会重算。
+    let hitsBefore = MeasurementCalculator.resultCacheHits
+    _ = MeasurementCalculator.evaluate(kind: .distance, points: polyline)
+    expect(
+        MeasurementCalculator.resultCacheHits == hitsBefore + 1,
+        "再取同一条测量应命中缓存"
+    )
+    _ = MeasurementCalculator.evaluate(kind: .distance, points: polyline)
+    expect(
+        MeasurementCalculator.resultCacheHits == hitsBefore + 2,
+        "重复取用应持续命中缓存"
+    )
+
+    // 顶点动了就是另一个键：结果要走重算，且与直算一致。
+    var moved = polyline
+    moved[2].latitude += 0.002
+    let movedResult = MeasurementCalculator.evaluate(kind: .distance, points: moved)
+    expect(movedResult != MeasurementCalculator.evaluate(kind: .distance, points: polyline),
+           "顶点变了应重算，而不是复用旧结果")
+    expect(movedResult == MeasurementCalculator.evaluateUncached(kind: .distance, points: moved),
+           "改动后的结果也应与直算一致")
+
+    // 圆的度量（含 360 点采样）同样按「圆心 + 半径」缓存。
+    let metricsFirst = MeasurementCalculator.circleMetrics(center: circle[0], radius: 1_000)
+    let hitsBeforeRing = MeasurementCalculator.resultCacheHits
+    let metricsAgain = MeasurementCalculator.circleMetrics(center: circle[0], radius: 1_000)
+    expect(MeasurementCalculator.resultCacheHits == hitsBeforeRing + 1,
+           "同一个圆第二次取度量应命中缓存")
+    expect(metricsFirst.ring == metricsAgain.ring
+        && metricsFirst.circumference == metricsAgain.circumference,
+           "命中的圆度量应与第一次逐字段一致")
+    expect(metricsFirst.ring.count == MeasurementCalculator.circleSamples,
+           "圆的采样点应一并缓存下来（\(MeasurementCalculator.circleSamples) 点）")
+    expect(metricsFirst.circumference > 0 && metricsFirst.area > 0,
+           "圆的周长与面积应为正")
+    let freshRing = Geodesy.circleRing(center: circle[0], radius: 1_000)
+    expectClose(metricsAgain.circumference, Geodesy.perimeter(of: freshRing), accuracy: 1e-9,
+                "缓存里的圆周长应与重新采样一致")
+    expectClose(metricsAgain.area, Geodesy.area(of: freshRing), accuracy: 1e-9,
+                "缓存里的圆面积应与重新采样一致")
+
+    // 容量有上限：塞进去再多也不会无限增长，且被淘汰的条目重新求值仍然正确。
+    MeasurementCalculator.resetResultCache()
+    for index in 0..<(MeasurementCalculator.resultCacheLimit + 40) {
+        let offset = Double(index) * 0.0001
+        _ = MeasurementCalculator.evaluate(kind: .distance, points: [
+            GeoCoordinate(longitude: 119.0 + offset, latitude: 26.0),
+            GeoCoordinate(longitude: 119.001 + offset, latitude: 26.001),
+        ])
+    }
+    expect(MeasurementCalculator.resultCacheCount <= MeasurementCalculator.resultCacheLimit,
+           "缓存条目数不应超过上限（实际 \(MeasurementCalculator.resultCacheCount)，上限 \(MeasurementCalculator.resultCacheLimit)）")
+    expect(MeasurementCalculator.resultCacheCount >= MeasurementCalculator.resultCacheLimit / 2,
+           "缓存应真的被用起来（实际 \(MeasurementCalculator.resultCacheCount) 条）")
+    expect(
+        MeasurementCalculator.evaluate(kind: .distance, points: polyline)
+            == MeasurementCalculator.evaluateUncached(kind: .distance, points: polyline),
+        "被淘汰的测量重新求值应仍与直算一致"
+    )
+
+    // 时间对比只打印出来看看，不做断言（机器负载会影响绝对值）。
+    let dense = (0..<200).map { index in
+        GeoCoordinate(
+            longitude: 119.30 + Double(index) * 1e-5,
+            latitude: 26.07 + Double(index % 13) * 1e-5
+        )
+    }
+    let iterations = 200
+    var start = Date()
+    for _ in 0..<iterations { _ = MeasurementCalculator.evaluateUncached(kind: .area, points: dense) }
+    let uncachedMs = Date().timeIntervalSince(start) * 1000
+    MeasurementCalculator.resetResultCache()
+    _ = MeasurementCalculator.evaluate(kind: .area, points: dense)
+    start = Date()
+    for _ in 0..<iterations { _ = MeasurementCalculator.evaluate(kind: .area, points: dense) }
+    let cachedMs = Date().timeIntervalSince(start) * 1000
+    print(String(
+        format: "    200 点多边形 × %d 次：每帧重算 %.1f ms，缓存命中 %.1f ms（快 %.0f 倍）",
+        iterations, uncachedMs, cachedMs, uncachedMs / max(cachedMs, 0.0001)
+    ))
+    expect(cachedMs < uncachedMs, "缓存命中应比重算快")
+}
+
 section("在线取图与内存缓存")
 
 /// 造一张最小可解码的 PNG，用于缓存与解码路径的自检。

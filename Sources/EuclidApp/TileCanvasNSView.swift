@@ -457,9 +457,30 @@ final class TileCanvasNSView: NSView {
         FileHandle.standardError.write(Data(line.utf8))
     }
     func writeDebugSnapshot(index: Int) {
+        guard let directory = ProcessInfo.processInfo.environment["EUCLID_DEBUG_SNAPSHOT"] else { return }
+        guard let image = renderMapImage() else { return }
+        let url = URL(fileURLWithPath: directory)
+            .appending(path: String(format: "frame-%02d.png", index))
+        guard let destination = CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil) else { return }
+        CGImageDestinationAddImage(destination, image, nil)
+        CGImageDestinationFinalize(destination)
+    }
+
+    /// 当前画布的设备像素比（导出图片时用来定字号与线宽）。
+    var backingScale: CGFloat { CGFloat(displayScale) }
+
+    /// 把当前画面离屏渲染成位图：瓦片、网格与测量标注都在里面，
+    /// 不含 SwiftUI 那几块浮在画布上的控件（缩放按钮、比例尺、提示条）。
+    ///
+    /// - Parameter includingMeasurements: 导出干净的画面时可以关掉测量标注；
+    ///   调试用的瓦片网格永远不进导出图（那是排查用的，不该出现在成图里）。
+    func renderMapImage(includingMeasurements: Bool = true) -> CGImage? {
+        renderMapImage(scale: CGFloat(displayScale), includingMeasurements: includingMeasurements)
+    }
+
+    private func renderMapImage(scale: CGFloat, includingMeasurements: Bool = true) -> CGImage? {
         guard bounds.width > 1, bounds.height > 1,
-              let directory = ProcessInfo.processInfo.environment["EUCLID_DEBUG_SNAPSHOT"] else { return }
-        let scale = window?.backingScaleFactor ?? 2
+              scale > 0 else { return nil }
         let width = Int((bounds.width * scale).rounded())
         let height = Int((bounds.height * scale).rounded())
         guard width > 0, height > 0,
@@ -468,18 +489,24 @@ final class TileCanvasNSView: NSView {
                 data: nil, width: width, height: height,
                 bitsPerComponent: 8, bytesPerRow: 0, space: space,
                 bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
-              ) else { return }
+              ) else { return nil }
         context.scaleBy(x: scale, y: scale)
         // CALayer 的几何是 y 向下，位图上下文是 y 向上，这里翻回来。
         context.translateBy(x: 0, y: bounds.height)
         context.scaleBy(x: 1, y: -1)
-        layer?.render(in: context)
-        guard let image = context.makeImage() else { return }
-        let url = URL(fileURLWithPath: directory)
-            .appending(path: String(format: "frame-%02d.png", index))
-        guard let destination = CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil) else { return }
-        CGImageDestinationAddImage(destination, image, nil)
-        CGImageDestinationFinalize(destination)
+        let overlayWasHidden = overlay.hostLayer.isHidden
+        let gridStates = [onlineStack, localStack].map { $0.gridLayer.isHidden }
+        overlay.hostLayer.isHidden = !includingMeasurements
+        onlineStack.gridLayer.isHidden = true
+        localStack.gridLayer.isHidden = true
+        let rendered: CGImage? = overlay.withLabelsUprightForOffscreenRender {
+            layer?.render(in: context)
+            return context.makeImage()
+        }
+        overlay.hostLayer.isHidden = overlayWasHidden
+        onlineStack.gridLayer.isHidden = gridStates[0]
+        localStack.gridLayer.isHidden = gridStates[1]
+        return rendered
     }
 
     // MARK: - 测量标注

@@ -28,6 +28,7 @@ struct RootView: View {
             model.activateInitialDataset()
             DebugDownloadScript.runIfRequested(model: model)
             DebugBasemapScript.runIfRequested(model: model)
+            DebugExportScript.runIfRequested(model: model)
         }
     }
 
