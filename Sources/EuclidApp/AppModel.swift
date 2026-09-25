@@ -271,6 +271,9 @@ final class AppModel {
     // MARK: - 测量存档
 
     private func scheduleArchiveSave() {
+        // 调试用的示例测量（EUCLID_DEMO_MEASUREMENT）只是铺上去截图核对的，
+        // 不能写进存档：那会覆盖掉用户自己量的结果。
+        guard !DebugFixtures.isEnabled else { return }
         guard let dataset = selectedDataset else { return }
         let path = dataset.rootURL.path(percentEncoded: false)
         let snapshot = measurements.measurements

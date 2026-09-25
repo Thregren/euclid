@@ -82,6 +82,8 @@ final class TileLayerStack {
     private static let maximumFallbackLevels = 4
     /// 同时在找祖先贴图的格子数量上限，避免一屏几十个空格同时发起请求。
     private static let maximumFallbackLookups = 8
+    /// 每格瓦片向外撑出的量（点）：一半像素左右刚好盖住图层边缘的采样渗色。
+    private static let tileSeamOverlap: CGFloat = 0.5
 
     init() {
         hostLayer.isGeometryFlipped = true
@@ -245,7 +247,15 @@ final class TileLayerStack {
                 x: worldX + offset.x,
                 y: worldY + offset.y
             ))
-            let frame = CGRect(x: origin.x, y: origin.y, width: tileDisplaySize, height: tileDisplaySize)
+            // 瓦片铺在非整数倍比例上时，图层边缘会带出半像素的采样渗色，
+            // 一整片白底影像上就是每隔一片一条浅灰细线。把每格的 frame 撑开半个点，
+            // 让相邻瓦片互相盖住这道缝（内容是不透明的，重叠看不出来）。
+            let frame = CGRect(
+                x: origin.x - Self.tileSeamOverlap,
+                y: origin.y - Self.tileSeamOverlap,
+                width: tileDisplaySize + Self.tileSeamOverlap * 2,
+                height: tileDisplaySize + Self.tileSeamOverlap * 2
+            )
 
             let layer: CALayer
             if let existing = tileLayers[tile] {
