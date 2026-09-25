@@ -708,6 +708,31 @@ func rasterCheck(url: URL) async {
     }
     dump(tileImage, "tile-deep.png")
 
+    // `EUCLID_RASTER_PYRAMID=<目录>` 时顺便真生成一套瓦片（用于实测吞吐与产物核对）。
+    if let pyramid = ProcessInfo.processInfo.environment["EUCLID_RASTER_PYRAMID"] {
+        let options = TilePyramidOptions(tileSize: 512, format: .jpeg, compressionQuality: 0.85, concurrency: 4)
+        let range = TilePyramidExporter.suggestedZoomRange(for: dataset)
+        if let plan = TilePyramidExporter.plan(
+            for: dataset, zoomRange: range, options: options,
+            outputDirectory: URL(fileURLWithPath: pyramid)
+        ), let summary = try? await TilePyramidExporter().run(
+            raster: dataset, plan: plan, options: options
+        ) {
+            print(String(
+                format: "  生成瓦片 z%d–z%d：计划 %d，写出 %d，跳过 %d，失败 %d，%.1f MB，用时 %.1f s",
+                range.lowerBound, range.upperBound, plan.totalTileCount,
+                summary.written, summary.skipped, summary.failed,
+                Double(summary.bytes) / 1_000_000, summary.elapsed
+            ))
+            expect(summary.failed == 0, "真实影像生成瓦片不应有失败（\(summary.failed)）")
+            expect(summary.written > 0, "真实影像应写出瓦片")
+            expect(DatasetLocator.discover(at: URL(fileURLWithPath: pyramid)).count == 1,
+                   "生成的目录应被识别为数据集")
+        } else {
+            expect(false, "真实影像应能规划并生成瓦片")
+        }
+    }
+
     // 2) 首屏：按「适配窗口」的层级，数一数要几块、总共多久。
     let viewport = CGSize(width: 808, height: 808)
     let fitZoom = min(detailZoom, max(0, Int(floor(log2(viewport.width / (rect.width * 512))))))
@@ -1530,6 +1555,122 @@ do {
     // 认不出来的投影要老实返回 nil，而不是硬按经纬度摆。
     expect(Projection.toWGS84(x: 500000, y: 3000000, crs: .unknown(code: 2421)) == nil,
            "认不出的投影不应给出坐标")
+}
+
+section("从单幅影像生成瓦片")
+
+do {
+    let url = tiffFixtures.appending(path: "geo_utm50_deflate.tif")
+    guard let raster = try? RasterLoader.load(url: url) else {
+        expect(false, "生成瓦片的样本影像应能打开")
+        throw TilePyramidError.emptyRange
+    }
+    let output = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appending(path: "euclid-pyramid-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: output) }
+
+    // 样本影像只有 1.6 米见方，取它 1:1 附近的层级才铺得开（用 64 像素瓦片便于核对）。
+    let options = TilePyramidOptions(tileSize: 64, format: .png, concurrency: 2)
+    let zoomRange = 24...25
+    guard let plan = TilePyramidExporter.plan(
+        for: raster, zoomRange: zoomRange, options: options, outputDirectory: output
+    ) else {
+        expect(false, "应能规划出瓦片范围")
+        throw TilePyramidError.emptyRange
+    }
+    expect(plan.totalTileCount > 0, "计划里应有瓦片（\(plan.totalTileCount) 张）")
+
+    let summary = try await TilePyramidExporter().run(raster: raster, plan: plan, options: options)
+    print("    z\(zoomRange.lowerBound)–z\(zoomRange.upperBound) 计划 \(plan.totalTileCount) 张："
+        + "写出 \(summary.written)、跳过 \(summary.skipped)、失败 \(summary.failed)")
+    expect(summary.failed == 0, "生成过程不应有失败（\(summary.failed)）")
+    expect(summary.written >= 4, "影像覆盖到的瓦片都应写出（实际 \(summary.written)）")
+    expect(summary.bytes > 0, "写出的文件应有字节数")
+
+    // 闭环一：输出目录能被自己的数据集嗅探认出来。
+    let datasets = DatasetLocator.discover(at: output)
+    expect(datasets.count == 1, "输出目录应被识别为 1 个数据集（实际 \(datasets.count)）")
+    expect(datasets.first?.layout.tileSize == 64, "瓦片尺寸应被识别为 64（实际 \(datasets.first?.layout.tileSize ?? -1)）")
+    expect(datasets.first?.zoomRange == zoomRange, "层级范围应被识别为 z\(zoomRange.lowerBound)–z\(zoomRange.upperBound)")
+
+    // 闭环二：写出的文件读回来，应与「直接渲染同一块」逐字节一致（PNG 无损）。
+    let level = zoomRange.upperBound
+    let count = Double(1 << level)
+    let centerTile = SlippyTile(
+        zoom: level,
+        x: Int(raster.worldRect.midX * count),
+        y: Int(raster.worldRect.midY * count)
+    )
+    // 对比用的直接渲染必须与生成时同尺寸（`raster.source` 用的是影像默认边长）。
+    let comparableSource = RasterTileSource(
+        fileURL: raster.fileURL,
+        pixelWidth: raster.pixelWidth,
+        pixelHeight: raster.pixelHeight,
+        georeference: raster.georeference,
+        worldRect: raster.worldRect,
+        tileSize: 64
+    )
+    let direct = await comparableSource.image(for: centerTile)
+    let writtenURL = output
+        .appending(path: String(centerTile.zoom))
+        .appending(path: String(centerTile.x))
+        .appending(path: "\(centerTile.y).png")
+    expect(FileManager.default.fileExists(atPath: writtenURL.path(percentEncoded: false)),
+           "中心瓦片应已写盘（\(centerTile)）")
+    if let direct, let directBytes = rgbaBytes(of: direct),
+       let fileImage = imageContents(of: writtenURL), let fileBytes = rgbaBytes(of: fileImage) {
+        expect(fileImage.width == 64 && fileImage.height == 64, "写出的瓦片应是 64 × 64")
+        var mismatches = 0
+        for index in 0..<min(directBytes.count, fileBytes.count) where directBytes[index] != fileBytes[index] {
+            mismatches += 1
+        }
+        expect(mismatches == 0, "写出的瓦片应与直接渲染逐字节一致（不同 \(mismatches) 字节）")
+    } else {
+        expect(false, "中心瓦片应能读回并比对")
+    }
+
+    // 闭环三：JPEG 走同一条路，只是有损——解码后应当仍然「像」，且没有把透明区压成黑块。
+    let jpegOutput = output.appending(path: "jpeg")
+    let jpegOptions = TilePyramidOptions(tileSize: 64, format: .jpeg, compressionQuality: 0.85, concurrency: 2)
+    guard let jpegPlan = TilePyramidExporter.plan(
+        for: raster, zoomRange: level...level, options: jpegOptions, outputDirectory: jpegOutput
+    ) else {
+        expect(false, "JPEG 计划应能生成")
+        throw TilePyramidError.emptyRange
+    }
+    let jpegSummary = try await TilePyramidExporter().run(
+        raster: raster, plan: jpegPlan, options: jpegOptions
+    )
+    expect(jpegSummary.written > 0, "JPEG 应写出瓦片")
+    let jpegURL = jpegOutput
+        .appending(path: String(centerTile.zoom))
+        .appending(path: String(centerTile.x))
+        .appending(path: "\(centerTile.y).jpg")
+    if let jpegImage = imageContents(of: jpegURL), let jpegBytes = rgbaBytes(of: jpegImage) {
+        // 只比较**不透明**的像素：JPEG 会把无数据区合成成白底，透明像素本身没有可比性。
+        var total = 0, samples = 0
+        if let origin = rgbaBytes(of: direct ?? jpegImage) {
+            for index in stride(from: 0, to: min(origin.count, jpegBytes.count), by: 4) {
+                guard origin[index + 3] == 255 else { continue }
+                total += abs(Int(origin[index]) - Int(jpegBytes[index]))
+                total += abs(Int(origin[index + 1]) - Int(jpegBytes[index + 1]))
+                total += abs(Int(origin[index + 2]) - Int(jpegBytes[index + 2]))
+                samples += 3
+            }
+        }
+        let meanError = samples > 0 ? Double(total) / Double(samples) : 999
+        print(String(format: "    JPEG（质量 85）与无损渲染的平均通道差：%.1f/255", meanError))
+        expect(meanError < 12, "JPEG 质量 85 的平均误差应在个位数（实际 \(meanError)）")
+        // 透明区合成白底：不透明像素不该变成纯黑。
+        var blackPixels = 0
+        for index in stride(from: 0, to: jpegBytes.count, by: 4) where
+            jpegBytes[index] == 0 && jpegBytes[index + 1] == 0 && jpegBytes[index + 2] == 0 {
+            blackPixels += 1
+        }
+        expect(blackPixels < jpegBytes.count / 4 / 4, "JPEG 不该出现大片纯黑（数据空洞应合成白底）")
+    } else {
+        expect(false, "JPEG 瓦片应能读回")
+    }
 }
 
 // MARK: - 汇总
