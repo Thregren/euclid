@@ -290,7 +290,12 @@ struct MeasurementSection: View {
             .font(.callout)
         }
 
-        MeasurementStyleEditor(measurement: measurement)
+        // 样式编辑最长（颜色、粗细、填充、批量按钮），默认折叠：
+        // 展开时它会把「图层」「数据源」顶到很下面，每次调不透明度都要滚到底。
+        DisclosureGroup("样式") {
+            MeasurementStyleEditor(measurement: measurement)
+        }
+        .font(.callout)
     }
 
     private func segmentLabel(_ measurement: GeoMeasurement, index: Int) -> String {

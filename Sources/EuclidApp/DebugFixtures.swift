@@ -248,6 +248,33 @@ enum DebugBasemapScript {
     }
 }
 
+/// 开发调试用的窗口摆放脚本。
+///
+/// `EUCLID_DEBUG_WINDOW="x,y,w,h"`（屏幕左上角为原点，单位点）时把主窗口摆到指定位置并改大小。
+/// 用途只有一个：无人值守截图时能**只截窗口区域**而不必截整屏（整屏会把桌面上别的内容一起拍进去），
+/// 而窗口位置平时由 AppKit 的状态恢复决定，改偏好文件不生效。
+@MainActor
+enum DebugWindowScript {
+    static func applyIfRequested() {
+        guard let raw = ProcessInfo.processInfo.environment["EUCLID_DEBUG_WINDOW"] else { return }
+        let numbers = raw.split(separator: ",").compactMap { Double($0) }
+        guard numbers.count == 4 else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            guard let window = NSApplication.shared.windows.first(where: { $0.isVisible }),
+                  let screenHeight = (window.screen ?? NSScreen.main)?.frame.height else { return }
+            window.setFrame(
+                NSRect(
+                    x: numbers[0],
+                    y: screenHeight - numbers[1] - numbers[3],
+                    width: numbers[2],
+                    height: numbers[3]
+                ),
+                display: true
+            )
+        }
+    }
+}
+
 /// 开发调试用的外观脚本。
 ///
 /// `EUCLID_DEBUG_APPEARANCE=dark|light` 时强制指定外观，便于在浅色与深色下各截一次图核对对比度；

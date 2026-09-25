@@ -207,18 +207,6 @@ struct MapScreen: View {
                     .padding(.leading, 16)
                     .padding(.bottom, 16)
                     .transition(.opacity)
-
-                if let hint = toolHint {
-                    Text(hint)
-                        .font(.subheadline.weight(.medium))
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .controlSurface(shape: Capsule())
-                        .padding(.bottom, 16)
-                        .frame(maxWidth: .infinity, alignment: .center)
-                        .allowsHitTesting(false)
-                        .transition(.opacity)
-                }
             }
         }
         .overlay {
@@ -238,15 +226,14 @@ struct MapScreen: View {
         }
     }
 
-    private var toolHint: String? {
-        model.measurements.tool.hint(draftCount: model.measurements.draft.count)
-    }
 }
 
 struct MapControls: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
+        // 缩放与比例尺合成**一张**控制卡：左下角原本叠了两张玻璃卡 + 状态栏，三层信息挤在
+        // 同一个角落，视觉上很重。合成一张后角落只剩「控制卡 + 状态栏」两层，也少一层材质。
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 2) {
                 ControlButton(symbol: "minus", help: "缩小") { model.canvas.zoomOut() }
@@ -264,15 +251,13 @@ struct MapControls: View {
                     .frame(minWidth: 34)
                     .padding(.horizontal, 4)
             }
-            .padding(.horizontal, 6)
-            .padding(.vertical, 4)
-            .controlSurface()
 
             ScaleBarView(metersPerPoint: model.viewport.metersPerPoint)
                 .padding(.horizontal, 8)
-                .padding(.vertical, 6)
-                .controlSurface()
         }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 7)
+        .controlSurface()
         .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
     }
 }

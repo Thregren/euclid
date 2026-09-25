@@ -12,6 +12,7 @@ struct StatusBarView: View {
             if model.hasMapContent {
                 Divider().frame(height: 12)
                 coordinateReadout
+                toolHint
                 Spacer(minLength: 8)
                 readout(String(format: "%.3f m/px", model.viewport.metersPerPoint))
                 readout("z\(model.viewport.dataZoom)", weight: .medium)
@@ -60,6 +61,22 @@ struct StatusBarView: View {
 
     // MARK: - 中间：坐标读取
 
+    /// 当前工具的操作提示。
+    ///
+    /// 原先它是一条浮在画布底部中央的常驻胶囊，和左下角的控制卡、底部的状态栏挤成三层；
+    /// 状态栏中段本来就空着六百多点，把提示放这里既腾空了画布，又能一直看得到。
+    @ViewBuilder
+    private var toolHint: some View {
+        if let hint = model.measurements.tool.hint(draftCount: model.measurements.draft.count) {
+            Text(hint)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .help(hint)
+        }
+    }
+
     @ViewBuilder
     private var coordinateReadout: some View {
         if let cursor = model.measurements.cursorInfo {
@@ -71,9 +88,12 @@ struct StatusBarView: View {
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
         } else {
-            Text("移动指针查看坐标")
-                .font(.subheadline)
-                .foregroundStyle(.tertiary)
+            // 正在显示这个工具的操作提示时，就不再重复一句「移动指针查看坐标」。
+            if model.measurements.tool.hint(draftCount: model.measurements.draft.count) == nil {
+                Text("移动指针查看坐标")
+                    .font(.subheadline)
+                    .foregroundStyle(.tertiary)
+            }
         }
     }
 
