@@ -566,6 +566,7 @@ final class TileLayerStack {
     /// 并用「层级 + 视野行列范围」当键，视野没动就不重复预取。
     private func prefetchSurroundingTiles(camera: MapCamera, needed: Set<SlippyTile>) {
         guard let provider else { return }
+        guard !defersBackgroundWork else { return }
         let settled = needed.allSatisfy { tile in
             layerImageSource[tile] == tile || missingTiles.contains(tile) || unresolvedTiles.contains(tile)
         }
@@ -643,6 +644,9 @@ final class TileLayerStack {
 
     /// 更新排序基准（画布在同步前调用）。
     func updateSortCenter(_ center: CGPoint) { cameraCenter = center }
+
+    /// 手势进行中：先不做预取这类后台活，等手停下来再补（见 `TileCanvasNSView` 的平移快路径）。
+    var defersBackgroundWork = false
 
     private func distanceSquared(_ tile: SlippyTile, center: CGPoint) -> Double {
         let n = Double(1 << tile.zoom)

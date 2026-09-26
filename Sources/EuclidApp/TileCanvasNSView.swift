@@ -77,6 +77,37 @@ final class TileCanvasNSView: NSView {
     private var middleDragLastPoint: CGPoint?
     /// 当前指针悬停的顶点，用于高亮提示可拖动。
     private var hoveredVertex: (measurementID: UUID?, index: Int)?
+    /// 回车结束测量的键盘监视器（见 `installFinishMonitor`）。
+    private var finishMonitor: Any?
+    /// 平移手势累计但尚未提交的位移（视图点，y 向上）。
+    ///
+    /// 手势期间只把已有图层整体位移（GPU 合成，不重算瓦片），等位移攒够、手势结束或停顿一下
+    /// 才真正改相机并重铺瓦片 —— 与原生地图同一条思路：拖动时不做重活。
+    private var panOffset = CGPoint.zero
+    /// 累计位移超过这个距离（点）就先提交一次，免得拖出已经预取到的瓦片范围。
+    private static let panCommitDistance: CGFloat = 120
+    /// 没有手势阶段信息（老式滚轮）时，停顿这么久就提交。
+    private static let panFlushDelay = Duration.milliseconds(120)
+    private var panFlushTask: Task<Void, Never>?
+    /// 手势期间攒着的读数刷新（见 `scheduleReadoutRefresh`）。
+    private static let readoutDelay = Duration.milliseconds(120)
+    private var readoutTask: Task<Void, Never>?
+    private var pendingReadoutPoint: CGPoint?
+    /// 手势进行中：期间暂时关掉预取这类后台活，别和拖动抢主线程与磁盘。
+    private var isGestureActive = false
+    /// 喂给界面的读数更新间隔（秒）：状态栏与检查器不需要每个事件都刷新。
+    private static let reportInterval: TimeInterval = 1.0 / 30.0
+    private var lastCursorReport = Date.distantPast
+    private var lastViewportReport = Date.distantPast
+    /// 最近一次汇报的可见瓦片数（平移期间沿用它，瓦片数要等提交后才有新值）。
+    private var lastVisibleTiles = 0
+    /// 滚轮事件的耗时统计（`EUCLID_TRACE_SCROLL=1`）。
+    private var scrollTraceEvents = 0
+    private var scrollTraceTotal = 0.0
+    private var scrollTraceWorst = 0.0
+    private var scrollTraceCommits = 0
+    private var scrollTraceLatencyTotal = 0.0
+    private var scrollTraceLatencyWorst = 0.0
     /// 顶点吸附半径（点）。
     private let snapRadius: CGFloat = 12
     /// 点击与拖动位移的区分阈值（点）。
@@ -134,6 +165,46 @@ final class TileCanvasNSView: NSView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         updateContentsScale()
+        if window == nil {
+            removeFinishMonitor()
+        } else {
+            installFinishMonitor()
+        }
+    }
+
+    private func removeFinishMonitor() {
+        if let finishMonitor { NSEvent.removeMonitor(finishMonitor) }
+        finishMonitor = nil
+    }
+
+    /// 回车结束测量：装一个本地键盘监视器，让 ↩ 与右键**完全等效**。
+    ///
+    /// 光靠 `keyDown` 不够：画布一旦失去第一响应者（点过检查器里的测量行、折叠块、
+    /// 缩放控件都会这样），↩ 就落不到画布上，而右键仍然有效 —— 于是「右键能结束、回车没反应」。
+    ///
+    /// 监视器装在事件派发之前，只在这几种情况下接管：本窗口的草稿非空、工具不是浏览、
+    /// 当前第一响应者不是文本输入（输入框里回车是「确认输入」，不能抢）。
+    private func installFinishMonitor() {
+        guard finishMonitor == nil else { return }
+        finishMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self,
+                  event.window === self.window,
+                  event.keyCode == 36 || event.keyCode == 76,   // Return / 小键盘 Enter
+                  self.tool != .browse,
+                  let store = self.measurementStore,
+                  !store.draft.isEmpty,
+                  !Self.isTypingText(in: self.window) else { return event }
+            self.finishDraft()
+            return nil      // 已经用它结束了，别再往下传（否则按钮会「哔」一声）
+        }
+    }
+
+    /// 当前第一响应者是不是文本输入（文本框里回车不能被我方截走）。
+    private static func isTypingText(in window: NSWindow?) -> Bool {
+        guard let responder = window?.firstResponder else { return false }
+        if responder is NSTextView || responder is NSTextField { return true }
+        // SwiftUI 的 TextField 背后是 NSTextView（字段编辑器），统一在上一层判断。
+        return (responder as? NSView)?.isKind(of: NSTextView.self) ?? false
     }
 
     override func viewDidChangeBackingProperties() {
@@ -481,6 +552,8 @@ final class TileCanvasNSView: NSView {
         guard bounds.width > 1, bounds.height > 1 else { return }
         camera.viewportSize = bounds.size
         for stack in stacks.values { stack.updateSortCenter(camera.center) }
+        // 手势进行中（或刚提交的这一刻仍在拖）先不做预取：别跟用户的手抢磁盘与网络。
+        for stack in stacks.values { stack.defersBackgroundWork = isGestureActive }
 
         let activeStacks = orderedStacks.filter { $0.isActive }
         guard !activeStacks.isEmpty, !awaitingExtent else {
@@ -521,7 +594,11 @@ final class TileCanvasNSView: NSView {
     }
 
     /// 把当前视图状态汇报给界面（状态栏、检查器）。
+    ///
+    /// 中心坐标用「有效相机」：手势期间还没提交的位移也算进去，读数才不会滞后一个提交周期。
     private func reportViewport(visibleTiles: Int) {
+        lastVisibleTiles = visibleTiles
+        let camera = effectiveCamera
         onViewportChanged?(ViewportSnapshot(
             zoomLevel: camera.zoomLevel,
             dataZoom: currentDataZoom,
@@ -640,6 +717,7 @@ final class TileCanvasNSView: NSView {
     // MARK: - 交互
 
     override func mouseDown(with event: NSEvent) {
+        commitPan()
         window?.makeFirstResponder(self)
         let point = convert(event.locationInWindow, from: nil)
         dragStartPoint = point
@@ -703,6 +781,8 @@ final class TileCanvasNSView: NSView {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        let started = CFAbsoluteTimeGetCurrent()
+        defer { tracePan(startedAt: started, timestamp: event.timestamp) }
         markViewPositioned()
         let point = convert(event.locationInWindow, from: nil)
         switch dragTarget {
@@ -714,14 +794,14 @@ final class TileCanvasNSView: NSView {
             reportCursor(point)
 
         case .pan:
+            // 与双指滚动同一条快路径：拖动期间只位移图层，松手（或位移攒够）才重铺瓦片。
             if let last = dragLastPoint {
                 let delta = CGPoint(x: point.x - last.x, y: point.y - last.y)
-                camera = camera.translated(byViewDelta: delta).clamped(zoomLevelRange: zoomBounds)
+                panBy(delta, finished: false)
             }
             dragLastPoint = point
             updateLiveCoordinate(point)
-            reportCursor(point)
-            syncLayers()
+            scheduleReadoutRefresh(for: point)
 
         case .none:
             break
@@ -729,6 +809,9 @@ final class TileCanvasNSView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        // 左键拖动平移走的是「手势期间只位移、松手才重铺」的快路径，这里收尾。
+        if case .pan = dragTarget { commitPan(finished: true) }
+        finishPanTrace()
         let point = convert(event.locationInWindow, from: nil)
         let pending = pendingClickPoint
         let start = dragStartPoint
@@ -814,7 +897,7 @@ final class TileCanvasNSView: NSView {
 
     private func updateLiveCoordinate(_ point: CGPoint) {
         guard let store = measurementStore, tool != .browse, !store.draft.isEmpty else { return }
-        store.liveCoordinate = camera.coordinate(forViewPoint: point)
+        store.liveCoordinate = effectiveCamera.coordinate(forViewPoint: point)
     }
 
     /// 指针悬停到顶点时高亮，提示这里可以拖动。
@@ -826,9 +909,16 @@ final class TileCanvasNSView: NSView {
         refreshOverlay()
     }
 
-    private func reportCursor(_ point: CGPoint) {
+    /// 把指针坐标汇报给界面。
+    ///
+    /// 限到 30 Hz：触摸板一次拖动会生成上百个事件，每个都去改 SwiftUI 状态的话，
+    /// 主线程大半时间花在检查器与状态栏的重绘上，画面自然就不跟手了。
+    private func reportCursor(_ point: CGPoint, force: Bool = false) {
+        let now = Date()
+        if !force, now.timeIntervalSince(lastCursorReport) < Self.reportInterval { return }
+        lastCursorReport = now
         guard let store = measurementStore else { return }
-        let coordinate = camera.coordinate(forViewPoint: point)
+        let coordinate = effectiveCamera.coordinate(forViewPoint: point)
         let zoom = currentDataZoom
         let scale = Double(1 << zoom)
         let world = WebMercator.normalized(coordinate)
@@ -842,6 +932,14 @@ final class TileCanvasNSView: NSView {
             pixelX: Int((world.x * scale - Double(tileX)) * camera.tilePixelSize),
             pixelY: Int((world.y * scale - Double(tileY)) * camera.tilePixelSize)
         )
+    }
+
+    /// 平移期间只刷新读数（可见瓦片数等要等提交后才有新值）。
+    private func reportViewportThrottled(force: Bool = false) {
+        let now = Date()
+        if !force, now.timeIntervalSince(lastViewportReport) < Self.reportInterval { return }
+        lastViewportReport = now
+        reportViewport(visibleTiles: lastVisibleTiles)
     }
 
     private func hitTestVertex(at point: CGPoint) -> (measurementID: UUID?, index: Int)? {
@@ -890,7 +988,7 @@ final class TileCanvasNSView: NSView {
     }
 
     private func viewPoint(for coordinate: GeoCoordinate) -> CGPoint {
-        camera.viewPoint(forWorldPoint: WebMercator.normalized(coordinate))
+        effectiveCamera.viewPoint(forWorldPoint: WebMercator.normalized(coordinate))
     }
 
     /// 鼠标滚轮缩放，触摸板双指滚动平移。
@@ -899,26 +997,180 @@ final class TileCanvasNSView: NSView {
     /// - 触摸板双指滚动：平移，按住 ⌘ 时改为缩放；
     /// - 触摸板捏合走 `magnify(with:)`，双击走 `smartMagnify(with:)`。
     override func scrollWheel(with event: NSEvent) {
+        let started = CFAbsoluteTimeGetCurrent()
+        defer { traceScroll(startedAt: started, event: event) }
         markViewPositioned()
         let point = convert(event.locationInWindow, from: nil)
         let precise = event.hasPreciseScrollingDeltas
         let wantsZoom = !precise || event.modifierFlags.contains(.command)
 
         if wantsZoom {
+            commitPan()
             let steps = precise ? event.scrollingDeltaY / 20 : event.scrollingDeltaY
             guard abs(steps) > 0.0001 else { return }
             let factor = Foundation.exp(steps * Self.wheelZoomStep)
             camera = camera.zoomed(by: factor, anchorViewPoint: point, zoomLevelRange: zoomBounds)
+            updateLiveCoordinate(point)
+            reportCursor(point)
+            // 缩放必须重铺瓦片（层级或尺寸变了），但手势进行中不做预取这类后台活。
+            isGestureActive = event.phase != .ended && event.phase != .cancelled
+            syncLayers()
         } else {
             let delta = CGPoint(x: event.scrollingDeltaX, y: -event.scrollingDeltaY)
-            camera = camera.translated(byViewDelta: delta).clamped(zoomLevelRange: zoomBounds)
+            if Self.usesDirectPan {
+                // 对照用：老的「每个事件都重铺瓦片」路径，便于量化快路径的收益。
+                camera = camera.translated(byViewDelta: delta).clamped(zoomLevelRange: zoomBounds)
+                syncLayers()
+            } else {
+                let finished = event.phase == .ended || event.phase == .cancelled
+                    || event.momentumPhase == .ended
+                panBy(delta, finished: finished)
+            }
+            // 手势期间**不**逐个事件喂 SwiftUI 状态：坐标读数与视图读数攒到「手停一下」再刷。
+            // 这是拖动卡顿的主因（实测：每个事件都刷时输入延迟 25 ms、事件掉到 1/4；
+            // 手势期间不刷则 3.5 ms、事件全到）。`EUCLID_PAN_NO_REPORT=1` 可完全关掉读数刷新对照。
+            if ProcessInfo.processInfo.environment["EUCLID_PAN_NO_REPORT"] == nil {
+                scheduleReadoutRefresh(for: point)
+            }
         }
-        updateLiveCoordinate(point)
-        reportCursor(point)
+    }
+
+    /// `EUCLID_PAN_DIRECT=1` 时走「每个滚轮事件都重铺瓦片」的老路径（只用于对照测量）。
+    private static let usesDirectPan = ProcessInfo.processInfo.environment["EUCLID_PAN_DIRECT"] != nil
+
+    // MARK: - 平移的手势快路径
+
+    /// 手势期间：只累计位移并把已有图层整体挪一挪，不重铺瓦片。
+    private func panBy(_ delta: CGPoint, finished: Bool) {
+        panOffset.x += delta.x
+        panOffset.y += delta.y
+        applyPanTransform()
+        isGestureActive = true
+
+        if finished || hypot(panOffset.x, panOffset.y) >= Self.panCommitDistance {
+            commitPan(finished: finished)
+        } else {
+            schedulePanFlush()
+        }
+    }
+
+    /// 把待提交的位移写到图层变换上（合成交给窗口服务器，主线程只改一个数值）。
+    private func applyPanTransform() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        let transform = CATransform3DMakeTranslation(panOffset.x, panOffset.y, 0)
+        for stack in stacks.values { stack.hostLayer.transform = transform }
+        overlay.hostLayer.transform = transform
+        CATransaction.commit()
+    }
+
+    /// 老式滚轮没有手势阶段：停顿一小会儿就提交。
+    private func schedulePanFlush() {
+        guard panFlushTask == nil else { return }
+        panFlushTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: Self.panFlushDelay)
+            guard let self else { return }
+            self.panFlushTask = nil
+            self.commitPan(finished: true)
+        }
+    }
+
+    /// 手势期间攒着的读数刷新：手停下来（或提交）时再刷一次坐标与视图读数。
+    ///
+    /// 手感来自画面跟不跟手，坐标读数差几十毫秒完全看不出来；
+    /// 而每来一个滚轮事件就去改 SwiftUI 状态，会把主线程压在检查器与状态栏的重绘上 ——
+    /// 实测这是双指拖动卡顿的主因。
+    private func scheduleReadoutRefresh(for point: CGPoint) {
+        pendingReadoutPoint = point
+        guard readoutTask == nil else { return }
+        readoutTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: Self.readoutDelay)
+            guard let self else { return }
+            self.readoutTask = nil
+            if let point = self.pendingReadoutPoint {
+                self.pendingReadoutPoint = nil
+                self.updateLiveCoordinate(point)
+                self.reportCursor(point, force: true)
+            }
+            self.reportViewportThrottled(force: true)
+        }
+    }
+
+    /// 提交：把累计位移交给相机，再把图层变换清掉（一进一出，画面不动），然后重铺瓦片。
+    private func commitPan(finished: Bool = true) {
+        panFlushTask?.cancel()
+        panFlushTask = nil
+        isGestureActive = false
+        guard panOffset != .zero else { return }
+        let offset = panOffset
+        panOffset = .zero
+        camera = camera.translated(byViewDelta: offset).clamped(zoomLevelRange: zoomBounds)
+        applyPanTransform()          // 现在是单位变换
         syncLayers()
+        scrollTraceCommits += 1
+        // 手势真的结束了才把读数刷一次；中途按位移阈值提交时继续攒着，别打断手感。
+        guard finished else { return }
+        readoutTask?.cancel()
+        readoutTask = nil
+        if let point = pendingReadoutPoint {
+            pendingReadoutPoint = nil
+            updateLiveCoordinate(point)
+            reportCursor(point, force: true)
+        }
+        reportViewportThrottled(force: true)
+    }
+
+    /// 手势期间的「有效相机」：把还没提交的位移算进去，读数与命中判定才不会滞后。
+    private var effectiveCamera: MapCamera {
+        panOffset == .zero ? camera : camera.translated(byViewDelta: panOffset)
+    }
+
+    /// 滚轮事件的耗时统计：`EUCLID_TRACE_SCROLL=1` 时手势结束打一行。
+    private func traceScroll(startedAt: CFTimeInterval, event: NSEvent) {
+        let finished = event.phase == .ended || event.momentumPhase == .ended
+        tracePan(startedAt: startedAt, timestamp: event.timestamp)
+        if finished { finishPanTrace() }
+    }
+
+    /// 记一次平移事件的处理耗时与输入延迟。
+    func tracePan(startedAt: CFTimeInterval, timestamp: TimeInterval) {
+        guard ProcessInfo.processInfo.environment["EUCLID_TRACE_SCROLL"] != nil else { return }
+        let elapsed = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
+        // 事件从「发出」到「被处理」之间的延迟：主线程越忙，这个数越大（也是掉帧的直接体感）。
+        // `NSEvent.timestamp` 是「开机以来的秒数」，与 `systemUptime` 同一基准。
+        let now = ProcessInfo.processInfo.systemUptime
+        let latency = timestamp > 0 && now > timestamp
+            ? (now - timestamp) * 1000
+            : 0
+        scrollTraceEvents += 1
+        scrollTraceTotal += elapsed
+        scrollTraceWorst = max(scrollTraceWorst, elapsed)
+        scrollTraceLatencyTotal += latency
+        scrollTraceLatencyWorst = max(scrollTraceLatencyWorst, latency)
+    }
+
+    /// 手势结束：把统计打出来并清零。
+    func finishPanTrace() {
+        guard ProcessInfo.processInfo.environment["EUCLID_TRACE_SCROLL"] != nil,
+              scrollTraceEvents > 0 else { return }
+        let average = scrollTraceEvents > 0 ? scrollTraceTotal / Double(scrollTraceEvents) : 0
+        let latencyAverage = scrollTraceEvents > 0 ? scrollTraceLatencyTotal / Double(scrollTraceEvents) : 0
+        let line = String(
+            format: "[pan] 事件 %d 次（处理 平均 %.2f ms / 最慢 %.2f ms）· 输入延迟 平均 %.1f ms / 最慢 %.1f ms · 提交 %d 次\n",
+            scrollTraceEvents, average, scrollTraceWorst,
+            latencyAverage, scrollTraceLatencyWorst, scrollTraceCommits
+        )
+        FileHandle.standardError.write(Data(line.utf8))
+        scrollTraceEvents = 0
+        scrollTraceTotal = 0
+        scrollTraceWorst = 0
+        scrollTraceCommits = 0
+        scrollTraceLatencyTotal = 0
+        scrollTraceLatencyWorst = 0
     }
 
     override func magnify(with event: NSEvent) {
+        commitPan()
         markViewPositioned()
         let point = convert(event.locationInWindow, from: nil)
         let factor = 1 + event.magnification
@@ -926,6 +1178,7 @@ final class TileCanvasNSView: NSView {
         camera = camera.zoomed(by: factor, anchorViewPoint: point, zoomLevelRange: zoomBounds)
         updateLiveCoordinate(point)
         reportCursor(point)
+        isGestureActive = event.phase != .ended && event.phase != .cancelled
         syncLayers()
     }
 
@@ -946,8 +1199,7 @@ final class TileCanvasNSView: NSView {
                 refreshOverlay()
                 return
             case 36, 76: // Return / Enter
-                store.finishDraft()
-                refreshOverlay()
+                finishDraft()
                 return
             default:
                 break

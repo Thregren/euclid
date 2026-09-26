@@ -21,7 +21,7 @@ struct InspectorView: View {
                 if let extent = model.extent {
                     extentSection(extent)
                 }
-                viewSection
+                ViewReadoutsSection()
                 datasetSection
             } else {
                 Section {
@@ -113,8 +113,23 @@ struct InspectorView: View {
         }
     }
 
-    @ViewBuilder
-    private var viewSection: some View {
+    private func directoryDescription(_ layout: TileLayout) -> String {
+        switch layout.directoryAxis {
+        case .xFirst: return "<z>/<x>/<y>"
+        case .yFirst: return "<z>/<y>/<x>"
+        }
+    }
+}
+
+/// 检查器里的「视图」读数。
+///
+/// 单独成视图不是为了让代码好看：这些数字**每个滚轮事件都在变**，
+/// 如果它们在 `InspectorView` 的 body 里读，SwiftUI 就得整块重算这个 Form
+/// （面板里有几十行），双指拖动就是这么卡起来的。拆出来之后只有这一小节重绘。
+struct ViewReadoutsSection: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
         Section("视图") {
             LabeledContent("中心坐标") {
                 Text(CoordinateText.decimal(model.viewport.center, precision: 7))
@@ -134,10 +149,4 @@ struct InspectorView: View {
         }
     }
 
-    private func directoryDescription(_ layout: TileLayout) -> String {
-        switch layout.directoryAxis {
-        case .xFirst: return "<z>/<x>/<y>"
-        case .yFirst: return "<z>/<y>/<x>"
-        }
-    }
 }
