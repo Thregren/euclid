@@ -69,11 +69,28 @@ echo "==> ad-hoc 签名"
 find "$APP" -name ".DS_Store" -delete 2>/dev/null || true
 xattr -r -d com.apple.FinderInfo "$APP" 2>/dev/null || true
 xattr -r -d "com.apple.fileprovider.fpfs#P" "$APP" 2>/dev/null || true
+xattr -r -d com.apple.provenance "$APP" 2>/dev/null || true
 xattr -cr "$APP" 2>/dev/null || true
-if ! codesign --force --deep --sign - "$APP" 2>/dev/null; then
-    echo "    提示：签名未成功（多为输出目录受 iCloud 文件提供程序管理所致）。"
-    echo "    本机仍可运行；若要产出可分发的包，可指定输出目录，例如："
-    echo "      DIST=/tmp/euclid-dist ./Scripts/build-app.sh"
+
+# 输出目录被文件提供程序（iCloud 文稿同步、网盘客户端等）管理时，属性会被异步加回来，
+# 让 codesign 报「resource fork, Finder information, or similar detritus not allowed」。
+# 清一次不行就再清一次重签；两次都失败就直接报错退出 ——
+# 签名失败的 .app 一启动就被 dyld 杀掉（崩溃报告里只有 dyld 的帧），
+# 那种包发出去别人打不开，宁可让它打不出来。
+signed=0
+for attempt in 1 2; do
+    if codesign --force --deep --sign - "$APP" 2>/dev/null; then
+        signed=1
+        break
+    fi
+    xattr -cr "$APP" 2>/dev/null || true
+done
+if [ "$signed" != "1" ]; then
+    echo "错误：ad-hoc 签名失败，产物不可用（启动会被系统直接终止）。" >&2
+    echo "      多半是输出目录受文件提供程序（iCloud 文稿 / 网盘）管理，扩展属性清不掉。" >&2
+    echo "      换一个不受管理的目录再打包，例如：" >&2
+    echo "        DIST=/tmp/euclid-dist ./Scripts/build-app.sh" >&2
+    exit 1
 fi
 
 touch "$APP"

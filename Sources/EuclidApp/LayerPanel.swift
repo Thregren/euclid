@@ -21,6 +21,9 @@ struct LayersPanel: View {
     @State private var draggingID: String?
     /// 当前落点提示（插到哪一行、在该行的上半还是下半）。
     @State private var dropTarget: DropTarget?
+    /// 正在改名的图层（右键菜单里的「重命名…」）。
+    @State private var renamingLayerID: String?
+    @State private var renameText = ""
 
     /// 行高：拖动落点判断「上半还是下半」也要用它。
     static let rowHeight: CGFloat = 46
@@ -36,6 +39,23 @@ struct LayersPanel: View {
         .frame(width: InterfaceStyle.layersPanelWidth)
         .frame(maxHeight: .infinity)
         .panelSurface()
+        .alert("重命名图层", isPresented: isRenaming) {
+            TextField("名称", text: $renameText)
+            Button("取消", role: .cancel) { renamingLayerID = nil }
+            Button("重命名") {
+                if let id = renamingLayerID { model.renameLayer(id, to: renameText) }
+                renamingLayerID = nil
+            }
+        } message: {
+            Text("只改显示名，不影响数据来源。")
+        }
+    }
+
+    private var isRenaming: Binding<Bool> {
+        Binding(
+            get: { renamingLayerID != nil },
+            set: { if !$0 { renamingLayerID = nil } }
+        )
     }
 
     // MARK: - 标题行
@@ -176,7 +196,8 @@ struct LayersPanel: View {
         LayerRow(
             layer: layer,
             isSelected: layer.id == model.selectedLayerID,
-            thumbnail: model.thumbnails.image(for: layer)
+            thumbnail: model.thumbnails.image(for: layer),
+            onSelect: { model.selectLayer(layer.id) }
         )
         .overlay(alignment: .top) {
             if dropTarget == DropTarget(row: index, above: true) { insertionLine }
@@ -184,8 +205,8 @@ struct LayersPanel: View {
         .overlay(alignment: .bottom) {
             if dropTarget == DropTarget(row: index, above: false) { insertionLine }
         }
-        .contentShape(Rectangle())
-        .onTapGesture { model.selectLayer(layer.id) }
+        // 选中手势只挂在「缩略图 + 名称」那块，行尾的勾选框与不透明度要能正常点。
+        .contextMenu { contextMenu(for: layer) }
         // 拖动排序：AppKit 的拖放（onDrag / onDrop）比 SwiftUI 的 draggable 更可靠 ——
         // 后者在带按钮的行里经常起不来。载荷走自定义类型，别的应用拖来的东西一律不认。
         .onDrag {
@@ -224,6 +245,37 @@ struct LayersPanel: View {
             .fill(Color.accentColor)
             .frame(height: 2)
             .padding(.horizontal, 2)
+    }
+
+    /// 图层行的右键菜单：改名、复制、设为基准、显示隐藏、上下移、移除。
+    ///
+    /// 原先这一排操作只能靠面板顶上的 ⋯ 菜单（还得先点中那一行），
+    /// 对着哪一层想要什么操作，右键是最直接的路子。
+    @ViewBuilder
+    private func contextMenu(for layer: MapLayer) -> some View {
+        Button("重命名…") {
+            renameText = layer.name
+            renamingLayerID = layer.id
+        }
+        Button("复制这一层") { model.duplicateLayer(layer.id) }
+        Button(layer.isAnchor ? "已经是基准层" : "设为基准层") {
+            model.setAnchorLayer(layer.id)
+        }
+        .disabled(layer.isAnchor || layer.kind == .online)
+
+        Divider()
+
+        Button(layer.isVisible ? "隐藏这一层" : "显示这一层") {
+            model.setVisible(!layer.isVisible, of: layer.id)
+        }
+        Button("上移一层") { model.moveLayer(layer.id, up: true) }
+            .disabled(model.panelOrder.first?.id == layer.id)
+        Button("下移一层") { model.moveLayer(layer.id, up: false) }
+            .disabled(model.panelOrder.last?.id == layer.id)
+
+        Divider()
+
+        Button("移除这一层", role: .destructive) { model.removeLayer(layer.id) }
     }
 
     // MARK: - 底部：不透明度 / 搜索
@@ -419,29 +471,36 @@ private struct LayerRow: View {
     let layer: MapLayer
     let isSelected: Bool
     let thumbnail: CGImage?
+    let onSelect: () -> Void
 
     var body: some View {
         HStack(spacing: 9) {
-            thumbnailView
+            // 只有「缩略图 + 名称 + 来源」这块响应点击选中，
+            // 行尾的不透明度与勾选框要能各点各的。
+            HStack(spacing: 9) {
+                thumbnailView
 
-            VStack(alignment: .leading, spacing: 1) {
-                HStack(spacing: 5) {
-                    Text(layer.name)
-                        .font(.body.weight(.semibold))
+                VStack(alignment: .leading, spacing: 1) {
+                    HStack(spacing: 5) {
+                        Text(layer.name)
+                            .font(.body.weight(.semibold))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        if layer.isAnchor {
+                            anchorBadge
+                        }
+                    }
+                    Text(subtitle)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    if layer.isAnchor {
-                        anchorBadge
-                    }
                 }
-                Text(subtitle)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
 
-            Spacer(minLength: 4)
+                Spacer(minLength: 4)
+            }
+            .contentShape(Rectangle())
+            .onTapGesture(perform: onSelect)
 
             // 不透明度只在非 100% 时占一格：它是「修饰」而不是主信息，
             // 挤进副标题会把「512px」这类关键信息截掉（11 点下副标题只剩 90 点宽）。

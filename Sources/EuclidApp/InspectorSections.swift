@@ -122,7 +122,8 @@ struct MeasurementSection: View {
                 draftBlock(store)
             }
 
-            ForEach(store.measurements) { measurement in
+            // 新的在最上面：画完一条抬头就能看到它，不用滚到列表底部。
+            ForEach(store.measurements.reversed()) { measurement in
                 row(measurement, store: store)
             }
 
@@ -228,36 +229,13 @@ struct MeasurementSection: View {
         let isSelected = measurement.id == store.selectedID
         let color = Color(nsColor: MeasurementPalette.strokeColor(of: measurement))
         VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 6) {
-                Image(systemName: measurement.kind.symbolName)
-                    .foregroundStyle(color)
-                Text(measurement.kind.displayName)
-                    .font(.callout.weight(.medium))
-                Spacer()
-                Text(summary(of: measurement))
-                    .font(.callout)
-                    .monospacedDigit()
-                if isSelected {
-                    Button {
-                        model.zoomToMeasurement(measurement)
-                    } label: {
-                        Image(systemName: "arrow.up.left.and.arrow.down.right")
-                    }
-                    .buttonStyle(.borderless)
-                    .help("定位到该测量")
-                }
-            }
+            header(measurement, store: store, isSelected: isSelected, color: color)
 
             if isSelected {
                 details(of: measurement, store: store)
             }
         }
         .padding(.vertical, 2)
-        .contentShape(Rectangle())
-        .onTapGesture {
-            store.selectedID = isSelected ? nil : measurement.id
-            model.canvas.refreshOverlay()
-        }
         .contextMenu {
             Button("定位到该测量") {
                 model.zoomToMeasurement(measurement)
@@ -274,6 +252,43 @@ struct MeasurementSection: View {
                 store.delete(measurement.id)
                 model.canvas.refreshOverlay()
             }
+        }
+    }
+
+    /// 行标题：图标、类型、摘要、定位按钮。
+    ///
+    /// 选中手势只挂在这一行，**不能**挂到整条（含展开的明细）：那样点「样式」三角、
+    /// 拖粗细滑杆、开颜色面板都会被这层手势吃掉 —— 点一下就把这条测量取消选中、
+    /// 明细整块收起来，看上去就是「单独编辑样式坏了」。
+    private func header(
+        _ measurement: GeoMeasurement,
+        store: MeasurementStore,
+        isSelected: Bool,
+        color: Color
+    ) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: measurement.kind.symbolName)
+                .foregroundStyle(color)
+            Text(measurement.kind.displayName)
+                .font(.callout.weight(.medium))
+            Spacer()
+            Text(summary(of: measurement))
+                .font(.callout)
+                .monospacedDigit()
+            if isSelected {
+                Button {
+                    model.zoomToMeasurement(measurement)
+                } label: {
+                    Image(systemName: "arrow.up.left.and.arrow.down.right")
+                }
+                .buttonStyle(.borderless)
+                .help("定位到该测量")
+            }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            store.selectedID = isSelected ? nil : measurement.id
+            model.canvas.refreshOverlay()
         }
     }
 

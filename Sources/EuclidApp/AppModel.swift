@@ -238,6 +238,16 @@ final class AppModel {
         setStatus("基准层已改为：\(layers[index].name)", autoClearAfter: 5)
     }
 
+    /// 给某一层改名（图层行的右键菜单里用）。
+    func renameLayer(_ id: String, to name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let index = layers.firstIndex(where: { $0.id == id }) else { return }
+        guard layers[index].name != trimmed else { return }
+        layers[index].name = trimmed
+        pushLayers()
+        setStatus("图层已改名为：\(trimmed)", autoClearAfter: 5)
+    }
+
     /// 显示 / 隐藏某一层。
     func setVisible(_ visible: Bool, of id: String) {
         guard let index = layers.firstIndex(where: { $0.id == id }) else { return }

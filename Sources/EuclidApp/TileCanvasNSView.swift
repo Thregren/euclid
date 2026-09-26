@@ -644,6 +644,12 @@ final class TileCanvasNSView: NSView {
         let point = convert(event.locationInWindow, from: nil)
         dragStartPoint = point
 
+        // ⌃+左键在 macOS 上与右键等价：同样用来结束当前测量（不落点）。
+        if event.modifierFlags.contains(.control), tool != .browse {
+            finishDraft()
+            return
+        }
+
         if let hit = hitTestVertex(at: point) {
             measurementStore?.markUndoPoint()
             dragTarget = .vertex(measurementID: hit.measurementID, index: hit.index)
@@ -673,6 +679,27 @@ final class TileCanvasNSView: NSView {
         dragLastPoint = point
         if tool != .browse { pendingClickPoint = point }
         NSCursor.closedHand.set()
+    }
+
+    /// 右键：结束当前这测量。
+    ///
+    /// 与双击 / 回车同一套口径：点数够就落成测量，不够就丢掉草稿；
+    /// 没有草稿时交回默认处理（画布上没有右键菜单，等于什么也不做）。
+    override func rightMouseDown(with event: NSEvent) {
+        guard tool != .browse, let store = measurementStore, !store.draft.isEmpty else {
+            super.rightMouseDown(with: event)
+            return
+        }
+        finishDraft()
+    }
+
+    /// 收尾当前草稿（右键 / ⌃+左键共用）。
+    private func finishDraft() {
+        dragStartPoint = nil
+        pendingClickPoint = nil
+        dragTarget = nil
+        measurementStore?.finishDraft()
+        refreshOverlay()
     }
 
     override func mouseDragged(with event: NSEvent) {
