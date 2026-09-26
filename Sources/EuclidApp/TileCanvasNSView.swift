@@ -79,6 +79,8 @@ final class TileCanvasNSView: NSView {
     private var hoveredVertex: (measurementID: UUID?, index: Int)?
     /// 回车结束测量的键盘监视器（见 `installFinishMonitor`）。
     private var finishMonitor: Any?
+    /// 窗口失焦的订阅（见 `viewDidMoveToWindow`）。
+    private var resignObserver: (any NSObjectProtocol)?
     /// 平移手势累计但尚未提交的位移（视图点，y 向上）。
     ///
     /// 手势期间只把已有图层整体位移（GPU 合成，不重算瓦片），等位移攒够、手势结束或停顿一下
@@ -108,6 +110,8 @@ final class TileCanvasNSView: NSView {
     private var scrollTraceCommits = 0
     private var scrollTraceLatencyTotal = 0.0
     private var scrollTraceLatencyWorst = 0.0
+    /// 本次手势**进行中**发起的取图次数（收尾那一次不算：那是手停下来之后正常要取的）。
+    private var gestureTileRequests = 0
     /// 顶点吸附半径（点）。
     private let snapRadius: CGFloat = 12
     /// 点击与拖动位移的区分阈值（点）。
@@ -165,11 +169,33 @@ final class TileCanvasNSView: NSView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         updateContentsScale()
+        // 视图换窗口时先清掉上一次的订阅，避免重复注册。
+        if let resignObserver { NotificationCenter.default.removeObserver(resignObserver) }
+        resignObserver = nil
         if window == nil {
             removeFinishMonitor()
+            // 视图被摘下来（换窗口 / 关窗）时，手势可能正停在半路：把位移落定，别留一个偏移。
+            commitPan(finished: true)
         } else {
             installFinishMonitor()
+            // 用 block 版观察者并弱引用自己：视图先于窗口销毁也不会留下悬空指针。
+            resignObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didResignKeyNotification,
+                object: window,
+                queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated { self?.handleWindowResignKey() }
+            }
         }
+    }
+
+    /// 窗口失去焦点（⌘Tab、点别的窗口）：手势就算结束了，把位移落定并取回缺的瓦片。
+    ///
+    /// 不做这一步的话，用户拖到一半切走应用，画布会停在一个「只有图层变换」的状态里 ——
+    /// 看上去画面偏着，而且那部分瓦片一直不会被取回来。
+    private func handleWindowResignKey() {
+        commitPan(finished: true)
+        finishPanTrace()
     }
 
     private func removeFinishMonitor() {
@@ -554,13 +580,19 @@ final class TileCanvasNSView: NSView {
         for stack in stacks.values { stack.updateSortCenter(camera.center) }
         // 手势进行中（或刚提交的这一刻仍在拖）先不做预取：别跟用户的手抢磁盘与网络。
         for stack in stacks.values { stack.defersBackgroundWork = isGestureActive }
+        // 手势期间只挪图层、不取图；手停下来那一次才真正把缺的瓦片取回来。
+        let loadsTiles = !isGestureActive
 
         let activeStacks = orderedStacks.filter { $0.isActive }
         guard !activeStacks.isEmpty, !awaitingExtent else {
             for stack in stacks.values {
-                _ = stack.sync(camera: camera, viewportSize: bounds.size, displayScale: displayScale, showGrid: false)
+                _ = stack.sync(
+                    camera: camera, viewportSize: bounds.size,
+                    displayScale: displayScale, showGrid: false, loadsTiles: loadsTiles
+                )
             }
             refreshOverlay()
+            reportTileStats(loadedTiles: 0, missingTiles: 0, loadsTiles: loadsTiles)
             reportViewport(visibleTiles: 0)
             return
         }
@@ -576,7 +608,8 @@ final class TileCanvasNSView: NSView {
                 camera: camera,
                 viewportSize: bounds.size,
                 displayScale: displayScale,
-                showGrid: showTileGrid && stack === gridOwner
+                showGrid: showTileGrid && stack === gridOwner,
+                loadsTiles: loadsTiles
             )
             if let frame {
                 frames.append(frame)
@@ -588,9 +621,15 @@ final class TileCanvasNSView: NSView {
 
         refreshOverlay()
         for frame in frames { Self.traceView(layer: frame, camera: camera, zoomBounds: zoomBounds) }
-        onTileStatsChanged?(loadedTiles, missingTiles)
+        reportTileStats(loadedTiles: loadedTiles, missingTiles: missingTiles, loadsTiles: loadsTiles)
         reportViewport(visibleTiles: visibleTiles)
         setAccessibilityValue("z\(currentDataZoom)")
+    }
+
+    /// 瓦片读数是给状态栏看的，手势期间它本来也没在变，别白刷一次界面。
+    private func reportTileStats(loadedTiles: Int, missingTiles: Int, loadsTiles: Bool) {
+        guard loadsTiles else { return }
+        onTileStatsChanged?(loadedTiles, missingTiles)
     }
 
     /// 把当前视图状态汇报给界面（状态栏、检查器）。
@@ -1013,7 +1052,9 @@ final class TileCanvasNSView: NSView {
             updateLiveCoordinate(point)
             reportCursor(point)
             // 缩放必须重铺瓦片（层级或尺寸变了），但手势进行中不做预取这类后台活。
-            isGestureActive = event.phase != .ended && event.phase != .cancelled
+            // 注意：普通鼠标滚轮没有阶段信息（`.none`），不能当成「手势进行中」，
+            // 否则它永远不会去取新层级的瓦片。
+            isGestureActive = event.phase == .began || event.phase == .changed || event.phase == .stationary
             syncLayers()
         } else {
             let delta = CGPoint(x: event.scrollingDeltaX, y: -event.scrollingDeltaY)
@@ -1042,6 +1083,8 @@ final class TileCanvasNSView: NSView {
 
     /// 手势期间：只累计位移并把已有图层整体挪一挪，不重铺瓦片。
     private func panBy(_ delta: CGPoint, finished: Bool) {
+        // 手势的第一步：把取图计数清零，用来核对「手势进行中一片都没取」。
+        if panOffset == .zero { TileLayerStack.resetTileRequestCount() }
         panOffset.x += delta.x
         panOffset.y += delta.y
         applyPanTransform()
@@ -1100,12 +1143,14 @@ final class TileCanvasNSView: NSView {
     private func commitPan(finished: Bool = true) {
         panFlushTask?.cancel()
         panFlushTask = nil
-        isGestureActive = false
+        // 中途按下位移阈值提交时仍然算「手势进行中」：只挪图层，不取图。
+        isGestureActive = !finished
         guard panOffset != .zero else { return }
         let offset = panOffset
         panOffset = .zero
         camera = camera.translated(byViewDelta: offset).clamped(zoomLevelRange: zoomBounds)
         applyPanTransform()          // 现在是单位变换
+        if finished { gestureTileRequests = TileLayerStack.tileRequestCount }
         syncLayers()
         scrollTraceCommits += 1
         // 手势真的结束了才把读数刷一次；中途按位移阈值提交时继续攒着，别打断手感。
@@ -1156,17 +1201,19 @@ final class TileCanvasNSView: NSView {
         let average = scrollTraceEvents > 0 ? scrollTraceTotal / Double(scrollTraceEvents) : 0
         let latencyAverage = scrollTraceEvents > 0 ? scrollTraceLatencyTotal / Double(scrollTraceEvents) : 0
         let line = String(
-            format: "[pan] 事件 %d 次（处理 平均 %.2f ms / 最慢 %.2f ms）· 输入延迟 平均 %.1f ms / 最慢 %.1f ms · 提交 %d 次\n",
+            format: "[pan] 事件 %d 次（处理 平均 %.2f ms / 最慢 %.2f ms）· 输入延迟 平均 %.1f ms / 最慢 %.1f ms · 提交 %d 次 · 手势中取图 %d 片\n",
             scrollTraceEvents, average, scrollTraceWorst,
-            latencyAverage, scrollTraceLatencyWorst, scrollTraceCommits
+            latencyAverage, scrollTraceLatencyWorst, scrollTraceCommits, gestureTileRequests
         )
         FileHandle.standardError.write(Data(line.utf8))
+        TileLayerStack.resetTileRequestCount()
         scrollTraceEvents = 0
         scrollTraceTotal = 0
         scrollTraceWorst = 0
         scrollTraceCommits = 0
         scrollTraceLatencyTotal = 0
         scrollTraceLatencyWorst = 0
+        gestureTileRequests = 0
     }
 
     override func magnify(with event: NSEvent) {

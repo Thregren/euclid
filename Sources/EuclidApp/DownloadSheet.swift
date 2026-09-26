@@ -61,10 +61,10 @@ struct DownloadSheet: View {
 
     private func sourceSection(_ target: TileDownloadModel) -> some View {
         @Bindable var download = target
-        return sectionBox("数据源") {
+        return sheetSection("数据源") {
             Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 12, verticalSpacing: 10) {
                 GridRow {
-                    label("预设")
+                    SheetFieldLabel("预设")
                     Picker("", selection: $download.sourceID) {
                         ForEach(TileSourceTemplate.presets) { preset in
                             Text(preset.name).tag(preset.id)
@@ -74,7 +74,7 @@ struct DownloadSheet: View {
                     .frame(maxWidth: 240, alignment: .leading)
                 }
                 GridRow {
-                    label("URL 模板")
+                    SheetFieldLabel("URL 模板")
                     TextField("https://…/{z}/{x}/{y}.png", text: $download.template)
                         .textFieldStyle(.roundedBorder)
                         .font(.system(.subheadline, design: .monospaced))
@@ -82,18 +82,31 @@ struct DownloadSheet: View {
                 }
                 if download.needsKey {
                     GridRow {
-                        label("密钥")
+                        SheetFieldLabel("密钥")
                         TextField("tk=…", text: $download.key)
                             .textFieldStyle(.roundedBorder)
                             .font(.system(.subheadline, design: .monospaced))
                             .frame(maxWidth: 260, alignment: .leading)
                     }
                     GridRow {
-                        label("")
+                        SheetFieldLabel("")
                         Text("密钥只保存在内存里，退出程序后需要重新填写。")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
                     }
+                }
+                // 坐标基准也放在这：在线浏览与下载共用同一套参数，
+                // 高德 / 腾讯的底图要选 GCJ-02、百度选 BD-09 才能和 WGS84 正射影像对齐。
+                GridRow {
+                    SheetFieldLabel("坐标基准")
+                    Picker("", selection: Bindable(download).datum) {
+                        ForEach(Datum.allCases) { datum in
+                            Text(datum.shortTitle).tag(datum)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(maxWidth: 240, alignment: .leading)
+                    .help("高德 / 腾讯选 GCJ-02、百度选 BD-09，其余保持 WGS84")
                 }
             }
             if !download.terms.isEmpty {
@@ -115,7 +128,7 @@ struct DownloadSheet: View {
 
     private func regionSection(_ target: TileDownloadModel) -> some View {
         @Bindable var download = target
-        return sectionBox("区域（WGS84 经纬度）") {
+        return sheetSection("区域（WGS84 经纬度）") {
             HStack(spacing: 8) {
                 Button("用当前视图") {
                     model.download.useCurrentView(model.canvas.visibleBounds())
@@ -136,15 +149,15 @@ struct DownloadSheet: View {
 
             Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 12, verticalSpacing: 8) {
                 GridRow {
-                    label("西经")
+                    SheetFieldLabel("西经")
                     coordinateField($download.bounds.west)
-                    label("东经")
+                    SheetFieldLabel("东经")
                     coordinateField($download.bounds.east)
                 }
                 GridRow {
-                    label("南纬")
+                    SheetFieldLabel("南纬")
                     coordinateField($download.bounds.south)
-                    label("北纬")
+                    SheetFieldLabel("北纬")
                     coordinateField($download.bounds.north)
                 }
             }
@@ -167,15 +180,15 @@ struct DownloadSheet: View {
 
     private func zoomSection(_ target: TileDownloadModel) -> some View {
         @Bindable var download = target
-        return sectionBox("层级与规模") {
+        return sheetSection("层级与规模") {
             Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 12, verticalSpacing: 8) {
                 GridRow {
-                    label("最小层级")
+                    SheetFieldLabel("最小层级")
                     Stepper(value: $download.minimumZoom, in: 0...min(download.maximumZoomLimit, 30)) {
                         Text("z\(download.minimumZoom)").monospacedDigit()
                     }
                     .frame(width: 130, alignment: .leading)
-                    label("最大层级")
+                    SheetFieldLabel("最大层级")
                     Stepper(value: $download.maximumZoom, in: 0...min(download.maximumZoomLimit, 30)) {
                         Text("z\(download.maximumZoom)").monospacedDigit()
                     }
@@ -212,7 +225,7 @@ struct DownloadSheet: View {
 
     private func outputSection(_ target: TileDownloadModel) -> some View {
         @Bindable var download = target
-        return sectionBox("输出") {
+        return sheetSection("输出") {
             HStack(spacing: 8) {
                 Button("选择目录…") { model.download.chooseOutputDirectory() }
                 Text(download.outputDirectory?.path(percentEncoded: false) ?? "未选择")
@@ -223,12 +236,12 @@ struct DownloadSheet: View {
             }
             Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 12, verticalSpacing: 8) {
                 GridRow {
-                    label("并发")
+                    SheetFieldLabel("并发")
                     Stepper(value: $download.concurrency, in: 1...16) {
                         Text("\(download.concurrency) 路").monospacedDigit()
                     }
                     .frame(width: 110, alignment: .leading)
-                    label("限速")
+                    SheetFieldLabel("限速")
                     Stepper(value: $download.requestsPerSecond, in: 0...60, step: 4) {
                         Text(download.requestsPerSecond < 1
                              ? "不限"
@@ -253,7 +266,7 @@ struct DownloadSheet: View {
 
     private func statusSection(_ target: TileDownloadModel) -> some View {
         @Bindable var download = target
-        return sectionBox("进度") {
+        return sheetSection("进度") {
             if download.isRunning, let progress = download.progress {
                 ProgressView(value: progress.fraction)
                 HStack(spacing: 10) {
@@ -350,29 +363,6 @@ struct DownloadSheet: View {
     }
 
     // MARK: - 小工具
-
-    private func sectionBox<Content: View>(
-        _ title: String,
-        @ViewBuilder content: () -> Content
-    ) -> some View {
-        // 用系统标准的分组框做容器，深浅色、增强对比度、降低透明度都交给系统。
-        GroupBox {
-            content()
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.top, 2)
-        } label: {
-            Text(title)
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(.secondary)
-        }
-    }
-
-    private func label(_ text: String) -> some View {
-        Text(text)
-            .font(.subheadline)
-            .foregroundStyle(.secondary)
-            .frame(width: 58, alignment: .trailing)
-    }
 
     private func byteText(_ bytes: Int) -> String {
         let formatter = ByteCountFormatter()

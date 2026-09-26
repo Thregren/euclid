@@ -176,7 +176,8 @@ final class TileLayerStack {
         camera: MapCamera,
         viewportSize: CGSize,
         displayScale: Double,
-        showGrid: Bool
+        showGrid: Bool,
+        loadsTiles: Bool = true
     ) -> TileLayerFrame? {
         scale = CGFloat(displayScale)
         guard let provider, viewportSize.width > 1, viewportSize.height > 1 else {
@@ -281,8 +282,13 @@ final class TileLayerStack {
         }
         CATransaction.commit()
 
-        requestMissingTiles(needed: needed, provider: provider)
-        applyFallbackImages(needed: needed, provider: provider)
+        // 手势进行中只挪图层、不取图：解码与磁盘（或网络）一旦插进来，
+        // 快速拖动时每次提交都会掀起一波请求，画面就开始一顿一顿。
+        // 手停下来那一次（loadsTiles = true）才真正去取。
+        if loadsTiles {
+            requestMissingTiles(needed: needed, provider: provider)
+            applyFallbackImages(needed: needed, provider: provider)
+        }
         updateBackdropFrames(camera: camera, offset: offset)
         dropBackdropIfSettled(needed: needed)
         renderGrid(camera: rangeCamera, offset: offset, zoom: zoom, visible: showGrid)
@@ -297,7 +303,7 @@ final class TileLayerStack {
             tileDisplaySize: tileDisplaySize,
             datumOffsetMeters: datumOffsetMeters(for: camera, offset: offset)
         )
-        prefetchSurroundingTiles(camera: rangeCamera, needed: needed)
+        if loadsTiles { prefetchSurroundingTiles(camera: rangeCamera, needed: needed) }
         return frame
     }
 
@@ -350,6 +356,7 @@ final class TileLayerStack {
         pending.sort { distanceSquared($0, center: center) < distanceSquared($1, center: center) }
 
         let budget = max(0, maximumConcurrentRequests - outstanding)
+        Self.tileRequestCount += min(budget, pending.count)
         for tile in pending.prefix(budget) {
             tileTasks[tile] = Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -457,6 +464,7 @@ final class TileLayerStack {
 
         for tile in ordered.prefix(budget) {
             fallbackTasks.insert(tile)
+            Self.tileRequestCount += 1
             Task { @MainActor [weak self] in
                 let ancestor = await Self.firstAvailableAncestor(of: tile, provider: provider)
                 guard let self else { return }
@@ -518,6 +526,7 @@ final class TileLayerStack {
     static func contentsImage(of layer: CALayer) -> CGImage? {
         guard let contents = layer.contents,
               CFGetTypeID(contents as CFTypeRef) == CGImage.typeID else { return nil }
+        // 上面已经用 CFTypeID 核对过类型，这里的桥接是确定的（`as?` 反而会被编译器判为恒成立）。
         return (contents as! CGImage)
     }
 
@@ -647,6 +656,11 @@ final class TileLayerStack {
 
     /// 手势进行中：先不做预取这类后台活，等手停下来再补（见 `TileCanvasNSView` 的平移快路径）。
     var defersBackgroundWork = false
+
+    /// 累计发起的取图次数（含祖先兜底与预取），只用于调试统计：
+    /// `EUCLID_TRACE_SCROLL=1` 时会在手势结束时打出「这次手势取了多少片」。
+    private(set) static var tileRequestCount = 0
+    static func resetTileRequestCount() { tileRequestCount = 0 }
 
     private func distanceSquared(_ tile: SlippyTile, center: CGPoint) -> Double {
         let n = Double(1 << tile.zoom)

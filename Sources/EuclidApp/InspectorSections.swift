@@ -387,24 +387,34 @@ struct MeasurementSection: View {
             }
 
             ExpandableRow(measurement.kind == .circle ? "半径" : "分段明细") {
-                VStack(alignment: .leading, spacing: 4) {
+                // 一行放不下四列（面板只有 250 点宽，之前「18.84 m」会被折成两行、各列错位），
+                // 改成两行：主行给「段 + 长度 + 方位」，转角单独一行。
+                VStack(alignment: .leading, spacing: 6) {
                     ForEach(result.segments, id: \.index) { segment in
-                        HStack(spacing: 8) {
-                            Text(segmentLabel(measurement, index: segment.index))
-                                .frame(width: 60, alignment: .leading)
-                                .foregroundStyle(.secondary)
-                            Text(MeasureFormat.distance(segment.length))
-                                .monospacedDigit()
-                            Spacer()
-                            Text(MeasureFormat.bearing(segment.bearing))
-                                .foregroundStyle(.secondary)
-                                .monospacedDigit()
-                            Text(MeasureFormat.compass(segment.bearing))
-                                .foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 1) {
+                            HStack(spacing: 6) {
+                                Text(segmentLabel(measurement, index: segment.index))
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 44, alignment: .leading)
+                                    .lineLimit(1)
+                                Text(MeasureFormat.distance(segment.length))
+                                    .monospacedDigit()
+                                    .lineLimit(1)
+                                    .layoutPriority(1)
+                                Spacer(minLength: 2)
+                                Text(MeasureFormat.bearing(segment.bearing))
+                                    .monospacedDigit()
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                Text(MeasureFormat.compass(segment.bearing))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
                             if let turn = segment.turn {
                                 Text(String(format: "转角 %+.0f°", turn))
-                                    // 三级/四级色在浅色下只有 1.9:1 / 1.3:1，数据不能用它们。
+                                    .font(.caption)
                                     .foregroundStyle(.secondary)
+                                    .padding(.leading, 50)
                             }
                         }
                         .font(.subheadline)

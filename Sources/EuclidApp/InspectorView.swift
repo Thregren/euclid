@@ -11,10 +11,6 @@ struct InspectorView: View {
     var body: some View {
         Form {
             if model.hasMapContent {
-                if let layer = model.selectedLayer {
-                    LayerPropertiesSection(layer: layer)
-                }
-                OnlineBasemapSection()
                 MeasurementSection()
                 CursorCoordinateSection()
                 if let extent = model.extent {

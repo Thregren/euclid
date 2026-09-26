@@ -256,10 +256,10 @@ public enum MeasureFormat {
 
     /// 方位角：度分。
     public static func bearing(_ degrees: Double) -> String {
-        let value = Geodesy.normalizedDegrees(degrees)
-        let wholeDegrees = floor(value)
-        let minutes = (value - wholeDegrees) * 60
-        return String(format: "%.0f°%02.0f′", wholeDegrees, minutes)
+        // 先取到整分再拆分，并处理进位：59.6′ 要写 60°00′ 那一档（原来会写成「106°60′」）。
+        let totalMinutes = Int((Geodesy.normalizedDegrees(degrees) * 60).rounded()) % (360 * 60)
+        let normalized = totalMinutes < 0 ? totalMinutes + 360 * 60 : totalMinutes
+        return String(format: "%d°%02d′", normalized / 60, normalized % 60)
     }
 
     /// 方位角的中文方位描述。
@@ -268,5 +268,21 @@ public enum MeasureFormat {
         let value = Geodesy.normalizedDegrees(degrees)
         let index = Int(((value + 22.5) / 45).rounded(.down)) % 8
         return directions[index]
+    }
+
+    /// 度分秒（秒保留 0.1″）+ 半球字母。
+    ///
+    /// 先按显示精度取整成整数个「十分之一秒」，再逐级进位：
+    /// 直接对分、秒各自四舍五入会写出 59.96″ → 「60.0″」、59.99′ → 「60′」这类越界值。
+    public static func dms(_ value: Double, hemisphere: String) -> String {
+        let isLongitude = hemisphere == "E" || hemisphere == "W"
+        let limit = (isLongitude ? 180 : 90) * 3600 * 10
+        let tenths = min(Int((abs(value) * 3600 * 10).rounded()), limit)
+        let seconds = tenths % 600                  // 600 个十分之一秒 = 60″
+        let totalMinutes = tenths / 600
+        return String(
+            format: "%.0f°%02d′%04.1f″%@",
+            Double(totalMinutes / 60), totalMinutes % 60, Double(seconds) / 10, hemisphere
+        )
     }
 }

@@ -371,7 +371,7 @@ public struct TilePyramidExporter: Sendable {
         options: TilePyramidOptions,
         summary: TilePyramidProgress
     ) {
-        var lines = [
+        let lines = [
             "# 从单幅影像生成的瓦片",
             "",
             "- 来源文件：\(raster.fileURL.lastPathComponent)",

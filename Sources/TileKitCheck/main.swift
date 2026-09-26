@@ -379,8 +379,15 @@ expect(kilometerText.hasPrefix("1.23") && kilometerText.hasSuffix(" km"), "公�
 expect(MeasureFormat.area(5234) == "5234.0 m²", "小面积格式")
 expect(MeasureFormat.area(52340).contains("公顷"), "中等面积用公顷")
 expect(MeasureFormat.bearing(45.5) == "45°30′", "方位角格式")
-expect(MeasureFormat.bearing(359.999).hasPrefix("359°"), "方位角不产生 360° 进位")
+// 359.999° 取到整分就是 360°00′，必须归一成 0°00′（既不能写 360°，也不能写 359°60′）
+expect(MeasureFormat.bearing(359.999) == "0°00′", "方位角进位后归一，不出现 360° 或 60′")
+expect(MeasureFormat.bearing(359.5) == "359°30′", "方位角格式（不进位那一侧）")
 expect(MeasureFormat.compass(0) == "北" && MeasureFormat.compass(180) == "南" && MeasureFormat.compass(100) == "东", "罗盘方位")
+// 度分秒：秒进位到分、分再进位到度，不出现 60″ / 60′
+expect(MeasureFormat.dms(120.5, hemisphere: "E") == "120°30′00.0″E", "度分秒基本格式")
+expect(MeasureFormat.dms(116.999999, hemisphere: "E") == "117°00′00.0″E", "秒与分一路进位到度")
+expect(MeasureFormat.dms(-89.99999, hemisphere: "S") == "90°00′00.0″S", "纬度夹到 90° 并进位")
+expect(MeasureFormat.dms(0, hemisphere: "N") == "0°00′00.0″N", "零值格式")
 
 section("边界与异常输入")
 expectClose(Geodesy.distance(from: sampleCoordinate, to: sampleCoordinate), 0, accuracy: 1e-9, "同一点距离为零")

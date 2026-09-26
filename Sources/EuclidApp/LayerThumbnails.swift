@@ -16,6 +16,8 @@ final class LayerThumbnailStore {
     private var loading: Set<String> = []
     /// 取过一次没取到就不再反复试（否则每次面板刷新都会再打一轮磁盘或网络）。
     private var failed: Set<String> = []
+    /// 缩略图缓存上限：图层不会太多，但用户反复打开数据集时别让它无限长。
+    private static let maximumCachedImages = 32
 
     /// 某一层的缩略图；还没取到时为 nil。
     func image(for layer: MapLayer) -> CGImage? {
@@ -41,6 +43,11 @@ final class LayerThumbnailStore {
             self.loading.remove(key)
             if let image, let small = Self.downscaled(image) {
                 self.images[key] = small
+                // 简单淘汰：超了就把最早存进去的那个丢掉（字典没有顺序，这里用 keys 的第一个）。
+                if self.images.count > Self.maximumCachedImages,
+                   let oldest = self.images.keys.first(where: { $0 != key }) {
+                    self.images.removeValue(forKey: oldest)
+                }
             } else {
                 self.failed.insert(key)
             }
@@ -59,12 +66,15 @@ final class LayerThumbnailStore {
     ) -> SlippyTile {
         let center = layer.fitRect.map { CGPoint(x: $0.midX, y: $0.midY) } ?? fallbackCenter
         let span = layer.fitRect.map { max($0.width, $0.height) } ?? 0
+        // 层级夹在数据源给的范围里，再夹到 slippy 能表达的 0…22（`1 << zoom` 不能乱来）。
+        let lower = max(0, min(layer.zoomRange.lowerBound, 22))
+        let upper = max(lower, min(layer.zoomRange.upperBound, 22))
         let zoom: Int
         if span > 0, span.isFinite {
             let fitting = Int(log2(1 / span).rounded())
-            zoom = min(max(fitting, layer.zoomRange.lowerBound), layer.zoomRange.upperBound)
+            zoom = min(max(fitting, lower), upper)
         } else {
-            zoom = min(max(fallbackZoom, layer.zoomRange.lowerBound), layer.zoomRange.upperBound)
+            zoom = min(max(fallbackZoom, lower), upper)
         }
         let count = Double(1 << zoom)
         let maximum = (1 << zoom) - 1

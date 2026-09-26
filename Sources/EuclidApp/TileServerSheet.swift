@@ -18,7 +18,7 @@ struct TileServerSheet: View {
             .padding(.bottom, 10)
 
             VStack(alignment: .leading, spacing: 14) {
-                GroupBox("提供的目录") {
+                sheetSection("提供的目录") {
                     VStack(alignment: .leading, spacing: 8) {
                         HStack(spacing: 8) {
                             Text(server.rootURL?.path(percentEncoded: false) ?? "未选择")
@@ -45,7 +45,7 @@ struct TileServerSheet: View {
                     .padding(.vertical, 2)
                 }
 
-                GroupBox("地址模板") {
+                sheetSection("地址模板") {
                     VStack(alignment: .leading, spacing: 8) {
                         HStack(spacing: 8) {
                             Text(server.urlTemplate)

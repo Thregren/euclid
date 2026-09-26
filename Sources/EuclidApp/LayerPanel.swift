@@ -95,6 +95,11 @@ struct LayersPanel: View {
                         model.usesOnlineBasemap = true
                     }
                 }
+                if model.onlineLayer != nil {
+                    Button("只用本地数据（移除在线底图层）") {
+                        model.usesOnlineBasemap = false
+                    }
+                }
             }
             Section("本地数据") {
                 ForEach(model.rasters) { raster in
@@ -106,6 +111,19 @@ struct LayersPanel: View {
                 Divider()
                 Button("打开单幅影像…") { model.promptForRaster() }
                 Button("打开瓦片目录…") { model.promptForFolder() }
+            }
+            // 工具栏原来看图层的那个菜单并到这儿：加图层的地方就是图层工具的地方。
+            Section("瓦片工具") {
+                Button("下载在线瓦片…") { model.showDownloadSheet = true }
+                    .keyboardShortcut("d", modifiers: [.command, .shift])
+                Button("从影像生成瓦片…") { model.promptForTileExport() }
+                    .keyboardShortcut("t", modifiers: [.command, .shift])
+                Button("本地瓦片服务…") { model.showTileServerSheet = true }
+                    .keyboardShortcut("l", modifiers: [.command, .shift])
+            }
+            Section("视图") {
+                Toggle("显示瓦片网格", isOn: Bindable(model).showTileGrid)
+                    .keyboardShortcut("g", modifiers: .command)
             }
         } label: {
             Image(systemName: "plus")
@@ -601,41 +619,6 @@ private struct LayerRow: View {
         case .dataset: return "square.stack.3d.up"
         case .raster: return "photo"
         case .online: return "globe"
-        }
-    }
-}
-
-/// 选中层的属性：跟在检查器里的「图层属性」那一段。
-struct LayerPropertiesSection: View {
-    @Environment(AppModel.self) private var model
-    let layer: MapLayer
-
-    var body: some View {
-        Section("图层属性") {
-            LabeledContent("名称") {
-                Text(layer.name)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-            LabeledContent("不透明度") {
-                HStack(spacing: 8) {
-                    Slider(value: Binding(
-                        get: { layer.opacity },
-                        set: { model.setOpacity(of: layer.id, to: $0) }
-                    ), in: 0...1)
-                    Text("\(Int((layer.opacity * 100).rounded()))%")
-                        .font(.callout)
-                        .monospacedDigit()
-                        .foregroundStyle(.secondary)
-                        .frame(width: 40, alignment: .trailing)
-                }
-            }
-            LabeledContent("来源", value: layer.detail)
-            HStack {
-                Button("移除这一层", role: .destructive) { model.removeLayer(layer.id) }
-                    .controlSize(.small)
-                Spacer()
-            }
         }
     }
 }

@@ -50,14 +50,25 @@ enum MapTool: String, CaseIterable, Hashable, Sendable {
         }
     }
 
-    var help: String {
+    /// 菜单里的快捷键（⌘1–⌘5）。
+    var menuShortcut: String {
+        "⌘\((MapTool.allCases.firstIndex(of: self) ?? 0) + 1)"
+    }
+
+    /// 一句话说明（不含快捷键）。
+    var summary: String {
         switch self {
-        case .browse: return "浏览（V）：滚轮缩放，中键拖动或直接拖动平移"
-        case .point: return "点坐标（C）：点击取点并读取坐标"
-        case .distance: return "测距（D）：点击加点，双击或回车结束"
-        case .area: return "测面积（A）：点击加点，双击或回车闭合"
-        case .circle: return "画圆（O）：先点圆心，再点一次确定半径；之后可拖动半径点或输入半径"
+        case .browse: return "滚轮或捏合缩放，中键、左键拖动或双指滚动平移"
+        case .point: return "点击取点并读取坐标"
+        case .distance: return "点击加点，右键、双击或回车结束"
+        case .area: return "点击加点，右键、双击或回车闭合"
+        case .circle: return "先点圆心，再点一次确定半径；之后可拖动半径点或输入精确半径"
         }
+    }
+
+    /// 悬停提示与菜单说明：功能 + 快捷键 + 一句话说明。
+    var help: String {
+        "\(title)（\(shortcut) / \(menuShortcut)）：\(summary)"
     }
 
     /// 画布底部提示条文案（nil 表示不显示）。

@@ -24,12 +24,8 @@ enum CoordinateText {
         case .latitude:
             hemisphere = value >= 0 ? "N" : "S"
         }
-        let magnitude = abs(value)
-        let degrees = floor(magnitude)
-        let minutesFull = (magnitude - degrees) * 60
-        let minutes = floor(minutesFull)
-        let seconds = (minutesFull - minutes) * 60
-        return String(format: "%.0f°%02.0f′%04.1f″%@", degrees, minutes, seconds, hemisphere)
+        // 进位逻辑在核心库里，自检能覆盖到（见 MeasureFormat.dms）。
+        return MeasureFormat.dms(value, hemisphere: hemisphere)
     }
 
     /// 墨卡托米坐标。

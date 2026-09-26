@@ -86,8 +86,6 @@ struct RootView: View {
                 Label("打开瓦片目录", systemImage: "folder")
             }
             .help("打开瓦片目录（⌘O）")
-
-            basemapMenu
         }
 
         ToolbarItemGroup(placement: .primaryAction) {
@@ -98,55 +96,6 @@ struct RootView: View {
             }
             .help("显示检查器（⌘⌥I）")
         }
-    }
-
-    /// 图层菜单：添加图层、在线底图设置、瓦片工具（参照 Pixelmator 把同类操作收在一个菜单里）。
-    private var basemapMenu: some View {
-        Menu {
-            Section("添加图层") {
-                ForEach(TileSourceTemplate.presets) { preset in
-                    Button("在线 · \(preset.name)") {
-                        model.download.sourceID = preset.id
-                        model.usesOnlineBasemap = true
-                    }
-                }
-                ForEach(model.rasters) { raster in
-                    Button("本地 · \(raster.name)") { model.addLayer(model.makeLayer(raster: raster)) }
-                }
-                ForEach(model.datasets) { dataset in
-                    Button("本地 · \(dataset.name)") { model.addLayer(model.makeLayer(dataset: dataset)) }
-                }
-            }
-            Divider()
-            Picker("底图", selection: Bindable(model).usesOnlineBasemap) {
-                Text("本地数据").tag(false)
-                Text("在线底图").tag(true)
-            }
-            .pickerStyle(.inline)
-            Divider()
-            Picker("在线数据源", selection: Binding(
-                get: { model.download.sourceID },
-                set: { id in
-                    model.download.sourceID = id
-                    model.usesOnlineBasemap = true
-                }
-            )) {
-                ForEach(TileSourceTemplate.presets) { preset in
-                    Text(preset.name).tag(preset.id)
-                }
-            }
-            .pickerStyle(.inline)
-            Divider()
-            Toggle("显示瓦片网格", isOn: Bindable(model).showTileGrid)
-                .keyboardShortcut("g", modifiers: .command)
-            Divider()
-            Button("下载在线瓦片…") { model.showDownloadSheet = true }
-            Button("从影像生成瓦片…") { model.showTileExportSheet = true }
-            Button("本地瓦片服务…") { model.showTileServerSheet = true }
-        } label: {
-            Label("图层", systemImage: "square.3.layers.3d")
-        }
-        .help("添加图层、切换在线底图与瓦片工具（当前：\(model.basemapName)）")
     }
 
     /// 出图、测量导出与测量存档收在同一个菜单里：
@@ -283,7 +232,10 @@ struct MapControls: View {
 /// 上排是工具（互斥，当前工具有底色），下排是视图开关。
 struct ToolStrip: View {
     @Environment(AppModel.self) private var model
-    @State private var hovered: String?
+    /// 当前指针悬停的按钮 id（`EUCLID_DEBUG_HOVER` 可强制显示某一条提示，便于截图核对）。
+    @State private var hovered: String? = ProcessInfo.processInfo.environment["EUCLID_DEBUG_HOVER"]
+    /// 调试用：强制显示的提示（不会被真实悬停覆盖，便于截图核对）。
+    private let forcedHover = ProcessInfo.processInfo.environment["EUCLID_DEBUG_HOVER"]
 
     var body: some View {
         VStack(spacing: 2) {
@@ -314,7 +266,45 @@ struct ToolStrip: View {
         }
         .padding(.vertical, 8)
         .frame(width: InterfaceStyle.toolStripWidth)
-        .panelSurface()
+        // 这一块**不用** panelSurface（Liquid Glass）：玻璃会把内容裁到自己的形状里，
+        // 悬停提示要伸到工具条左侧去，挂在按钮上的话只剩一截。
+        // 面板观感改成「自己画背景」：材质 + 描边 + 投影放在 content 之下，不裁切。
+        .background {
+            let shape = RoundedRectangle(cornerRadius: InterfaceStyle.panelCornerRadius, style: .continuous)
+            shape
+                .fill(.thickMaterial)
+                .overlay(shape.strokeBorder(.separator.opacity(0.6), lineWidth: 0.5))
+                .shadow(color: .black.opacity(0.28), radius: 12, y: 4)
+        }
+    }
+
+    /// 悬停提示条：贴在按钮左侧（每格各自挂在按钮上，纵向天然对齐）。
+    ///
+    /// 文案 = 功能 + 快捷键（单键与 ⌘1–⌘5）+ 一句话说明。除了自绘，按钮上也保留 `.help()`：
+    /// 自绘这条不依赖系统 tooltip 的悬停时机，窗口不是 key 的时候也在。
+    @ViewBuilder
+    private func hoverCaption(id: String, text: String) -> some View {
+        if forcedHover == id || hovered == id {
+            Text(text)
+                .font(.callout)
+                .fixedSize()
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .strokeBorder(.separator.opacity(0.7), lineWidth: 0.5)
+                )
+                .offset(x: -(InterfaceStyle.toolStripWidth + 8))
+                .allowsHitTesting(false)
+                .transition(.opacity)
+        }
+    }
+
+    private var gridTitle: String {
+        model.showTileGrid
+            ? "隐藏瓦片网格（⌘G）：排查瓦片对齐时打开"
+            : "显示瓦片网格（⌘G）：排查瓦片对齐时打开"
     }
 
     private func toolButton(_ tool: MapTool) -> some View {
@@ -331,6 +321,10 @@ struct ToolStrip: View {
                         .fill(fill(isActive: isActive, id: tool.rawValue))
                 )
                 .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                // 对齐方式用 trailing：提示要伸到按钮**左侧**去（工具条贴着窗口右缘）。
+                .overlay(alignment: .trailing) {
+                    hoverCaption(id: tool.rawValue, text: tool.help)
+                }
         }
         .buttonStyle(.plain)
         .help(tool.help)
@@ -355,6 +349,9 @@ struct ToolStrip: View {
                         .fill(fill(isActive: isOn, id: id))
                 )
                 .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                .overlay(alignment: .trailing) {
+                    hoverCaption(id: id, text: id == "grid" ? gridTitle : title)
+                }
         }
         .buttonStyle(.plain)
         .help(title)
