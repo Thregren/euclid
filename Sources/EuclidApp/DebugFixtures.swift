@@ -391,6 +391,13 @@ enum DebugLayerScript {
                     guard let row = Int(value), model.panelOrder.indices.contains(row) else { break }
                     model.activateLayer(model.panelOrder[row].id)
                     log("把第 \(row) 行设为当前数据：\(model.selectedLayer?.name ?? "无")")
+                case "pick":
+                    // 按类型选中一条测量（截取某条测量的明细时用，例如 pick:area）。
+                    guard let kind = MeasurementKind(rawValue: value),
+                          let measurement = model.measurements.measurements.last(where: { $0.kind == kind }) else { break }
+                    model.measurements.selectedID = measurement.id
+                    model.canvas.refreshOverlay()
+                    log("选中一条 \(kind.displayName)：\(measurement.points.count) 点")
                 case "addData":
                     // 把第 n 份已打开的数据加成一层（用来核对「点图层行切数据」这条路）。
                     guard let index = Int(value) else { break }

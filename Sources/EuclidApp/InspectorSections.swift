@@ -35,7 +35,10 @@ struct ExpandableRow<Content: View>: View {
 
     init(_ title: String, initiallyExpanded: Bool = false, @ViewBuilder content: @escaping () -> Content) {
         self.title = title
-        self._isExpanded = State(initialValue: initiallyExpanded)
+        // 调试开关：`EUCLID_DEBUG_EXPAND=1` 时所有折叠块一上来就是展开的，
+        // 无人值守截图能一次把明细都拍下来。
+        let expanded = initiallyExpanded || ProcessInfo.processInfo.environment["EUCLID_DEBUG_EXPAND"] != nil
+        self._isExpanded = State(initialValue: expanded)
         self.content = content
     }
 
