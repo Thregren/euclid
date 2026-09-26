@@ -9,7 +9,7 @@ macOS 原生的正射影像查看器与量测工具，为 **WebODM / ODM 的输�
 按地理参考摆到正确位置，读坐标、测距离、量面积、画圆、导出结果、出图——
 全部在本机完成，没有联网依赖。
 
-当前版本 **1.14.1**，下载见 [Releases](https://github.com/Thregren/euclid/releases/latest)。
+当前版本 **1.14.2**，下载见 [Releases](https://github.com/Thregren/euclid/releases/latest)。
 
 - **系统要求**：macOS 14 或更高；发布包是 Apple Silicon（Intel 机器可从源码构建）
 - **许可**：MIT（见 [LICENSE](LICENSE)）
@@ -365,6 +365,13 @@ docs/                     技术路线、构建与运行、开发进度、使用
 [开发进度](docs/03-进度.md)｜[使用说明](docs/04-使用说明.md)
 
 ## 更新日志
+
+### 1.14.2
+
+- **测量明细里的折叠块改成「整行可点」**：`DisclosureGroup` 在 macOS 上**只有那个小三角能点开**，
+  点「顶点坐标」「分段明细」「半径」「样式」这些文字没反应 —— 现在整行都是按钮
+  （行高 22 点、宽度撑满），点哪都能开合，三角自己画、展开时转 90°，并尊重「减少动态效果」。
+  同样处理了指针坐标里的「跳转到坐标」
 
 ### 1.14.1
 

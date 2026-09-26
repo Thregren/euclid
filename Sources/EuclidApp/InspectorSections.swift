@@ -23,6 +23,56 @@ struct ShortcutButtonLabel: View {
     }
 }
 
+/// 可折叠小节。
+///
+/// 不用 `DisclosureGroup`：macOS 上它的**标签文字不响应点击**，只有左边那个小三角能点开，
+/// 于是「点『顶点坐标』四个字没反应」，看上去就是折叠块点不开。这里整行都是按钮，
+/// 行高 22 点、宽度撑满、`contentShape` 覆盖整块，点哪都能开合；三角自己画，展开时转 90°。
+struct ExpandableRow<Content: View>: View {
+    private let title: String
+    @State private var isExpanded: Bool
+    private let content: () -> Content
+
+    init(_ title: String, initiallyExpanded: Bool = false, @ViewBuilder content: @escaping () -> Content) {
+        self.title = title
+        self._isExpanded = State(initialValue: initiallyExpanded)
+        self.content = content
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button {
+                if InterfaceStyle.reducesMotion {
+                    isExpanded.toggle()
+                } else {
+                    withAnimation(.easeInOut(duration: 0.15)) { isExpanded.toggle() }
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.right")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                    Text(title)
+                        .font(.callout)
+                    Spacer(minLength: 0)
+                }
+                .frame(height: 22)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(isExpanded ? "收起「\(title)」" : "展开「\(title)」")
+            .accessibilityLabel(title)
+            .accessibilityValue(isExpanded ? "已展开" : "已收起")
+
+            if isExpanded {
+                content()
+                    .padding(.leading, 18)
+            }
+        }
+    }
+}
+
 /// 指针坐标分区。
 ///
 /// 单独成视图，是为了让高频更新的指针坐标只重绘这一小块，不影响检查器其余部分。
@@ -31,7 +81,6 @@ struct CursorCoordinateSection: View {
 
     @State private var goToLongitude = ""
     @State private var goToLatitude = ""
-    @State private var showsJumpField = false
 
     var body: some View {
         Section("指针坐标") {
@@ -84,7 +133,7 @@ struct CursorCoordinateSection: View {
                     .foregroundStyle(.secondary)
             }
 
-            DisclosureGroup("跳转到坐标", isExpanded: $showsJumpField) {
+            ExpandableRow("跳转到坐标") {
                 TextField("经度（十进制度）", text: $goToLongitude)
                     .textFieldStyle(.roundedBorder)
                 TextField("纬度（十进制度）", text: $goToLatitude)
@@ -320,7 +369,7 @@ struct MeasurementSection: View {
         }
 
         if measurement.points.count >= 2 {
-            DisclosureGroup("顶点坐标") {
+            ExpandableRow("顶点坐标") {
                 VStack(alignment: .leading, spacing: 3) {
                     ForEach(Array(measurement.points.enumerated()), id: \.offset) { index, coordinate in
                         HStack(spacing: 6) {
@@ -336,9 +385,8 @@ struct MeasurementSection: View {
                     }
                 }
             }
-            .font(.callout)
 
-            DisclosureGroup(measurement.kind == .circle ? "半径" : "分段明细") {
+            ExpandableRow(measurement.kind == .circle ? "半径" : "分段明细") {
                 VStack(alignment: .leading, spacing: 4) {
                     ForEach(result.segments, id: \.index) { segment in
                         HStack(spacing: 8) {
@@ -363,15 +411,13 @@ struct MeasurementSection: View {
                     }
                 }
             }
-            .font(.callout)
         }
 
         // 样式编辑最长（颜色、粗细、填充、批量按钮），默认折叠：
         // 展开时它会把「图层」「数据源」顶到很下面，每次调不透明度都要滚到底。
-        DisclosureGroup("样式") {
+        ExpandableRow("样式") {
             MeasurementStyleEditor(measurement: measurement)
         }
-        .font(.callout)
     }
 
     private func segmentLabel(_ measurement: GeoMeasurement, index: Int) -> String {
