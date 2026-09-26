@@ -204,12 +204,21 @@ final class AppModel {
         pushLayers()
     }
 
-    /// 选中某一层；选中的是另一份本地数据时，顺手把它切换成基准层（测量与相机跟着走）。
+    /// 只改选中态（拖动排序、拖放落点这类操作走它，别顺手把当前数据也换了）。
     func selectLayer(_ id: String) {
+        selectedLayerID = id
+    }
+
+    /// 把某一层**设为当前数据**：本地数据要重建基准层、重算数据范围、恢复这份数据自己的测量存档，
+    /// 因此走 `selectSource`，只改一个 id 是不够的。
+    ///
+    /// 点图层行、⋯ 菜单里的「设为基准层」都走这里 —— 检查器里原先还有个「可用数据」列表能切，
+    /// 那份已经删掉了，这里就是唯一的路。在线层没有基准的概念，只把它选中。
+    func activateLayer(_ id: String) {
         selectedLayerID = id
         guard let layer = layers.first(where: { $0.id == id }),
               !layer.isAnchor, layer.kind != .online else { return }
-        selectedSourceID = layer.sourceID
+        selectSource(layer.sourceID)
     }
 
     /// 移除当前选中层（没有选中时移除最上面那层）。
@@ -231,11 +240,9 @@ final class AppModel {
 
     /// 把某一层设为基准层（测量、存档与相机尺度以它为准）。
     func setAnchorLayer(_ id: String) {
-        guard let index = layers.firstIndex(where: { $0.id == id }), layers[index].kind != .online else { return }
-        for i in layers.indices { layers[i].isAnchor = (i == index) }
-        selectedSourceID = id
-        pushLayers()
-        setStatus("基准层已改为：\(layers[index].name)", autoClearAfter: 5)
+        guard let layer = layers.first(where: { $0.id == id }), layer.kind != .online else { return }
+        activateLayer(id)
+        setStatus("基准层已改为：\(layer.name)", autoClearAfter: 5)
     }
 
     /// 给某一层改名（图层行的右键菜单里用）。
@@ -325,6 +332,12 @@ final class AppModel {
 
     /// 直接加一层（侧栏「添加本地数据 / 添加在线底图」用）。
     func addLayer(_ layer: MapLayer) {
+        var layer = layer
+        // 本地数据加成一层时：实在没有基准层（比如只开了在线底图）才让它顺带当基准层，
+        // 否则一律是普通图层 —— 否则会出现两个「基准」，点它也切不过去。
+        if layer.kind != .online, !layers.contains(where: \.isAnchor) {
+            layer.isAnchor = true
+        }
         layers.append(layer)
         selectedLayerID = layer.id
         pushLayers()
@@ -352,7 +365,9 @@ final class AppModel {
             memoryLimitBytes: 512 * 1024 * 1024,
             maxConcurrentRequests: 8,
             fitRect: extent?.worldRect,
-            isAnchor: true,
+            // 基准层的身份由调用方决定（见 `applyLocalLayer` / `addLayer`）：
+            // 「加一层本地数据」不该顺手把它标成基准层，否则会出现两个「基准」。
+            isAnchor: false,
             detail: "z\(dataset.zoomRange.lowerBound)–z\(dataset.zoomRange.upperBound) · \(dataset.layout.tileSize)px"
         )
     }
@@ -373,7 +388,7 @@ final class AppModel {
             memoryLimitBytes: 512 * 1024 * 1024,
             maxConcurrentRequests: 8,
             fitRect: raster.worldRect,
-            isAnchor: true,
+            isAnchor: false,
             detail: "\(raster.pixelSizeText) · \(raster.isGeoreferenced ? raster.crsName : "未配准")"
         )
     }
@@ -449,7 +464,9 @@ final class AppModel {
         appliedLocalDatasetID = selectedSourceID
         let previousOpacity = anchorLayer?.opacity ?? 1
         let previousVisibility = anchorLayer?.isVisible ?? true
-        layers.removeAll { $0.isAnchor }
+        // 同一份数据在画布上只留一份：「加一层本地数据」加过的那份，在它成为当前数据之后
+        // 由基准层代表，别在列表里留两个一模一样、点起来还各是各的图层。
+        layers.removeAll { $0.isAnchor || $0.sourceID == selectedSourceID }
         var newLayer: MapLayer?
         if let raster = selectedRaster {
             newLayer = makeLayer(raster: raster)
@@ -457,6 +474,8 @@ final class AppModel {
             newLayer = makeLayer(dataset: dataset)
         }
         if var layer = newLayer {
+            // 这一层就是「当前数据」，也就是基准层（测量、存档与相机尺度以它为准）。
+            layer.isAnchor = true
             layer.opacity = previousOpacity
             layer.isVisible = previousVisibility
             layers.insert(layer, at: 0)   // 本地影像放最下层，参考底图叠在它上面

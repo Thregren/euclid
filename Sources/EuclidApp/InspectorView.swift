@@ -10,7 +10,6 @@ struct InspectorView: View {
 
     var body: some View {
         Form {
-            DataSourceSection()
             if model.hasMapContent {
                 if let layer = model.selectedLayer {
                     LayerPropertiesSection(layer: layer)

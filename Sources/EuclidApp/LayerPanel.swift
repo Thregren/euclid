@@ -197,7 +197,8 @@ struct LayersPanel: View {
             layer: layer,
             isSelected: layer.id == model.selectedLayerID,
             thumbnail: model.thumbnails.image(for: layer),
-            onSelect: { model.selectLayer(layer.id) }
+            // 点一下 = 把这份数据设为「当前数据」（本地数据会重建基准层、恢复它自己的测量存档）。
+            onSelect: { model.activateLayer(layer.id) }
         )
         .overlay(alignment: .top) {
             if dropTarget == DropTarget(row: index, above: true) { insertionLine }
@@ -211,6 +212,7 @@ struct LayersPanel: View {
         // 后者在带按钮的行里经常起不来。载荷走自定义类型，别的应用拖来的东西一律不认。
         .onDrag {
             draggingID = layer.id
+            // 拖动排序只改选中态，别顺手把当前数据换掉。
             model.selectLayer(layer.id)
             return LayerDragPayload.provider(for: layer.id)
         }

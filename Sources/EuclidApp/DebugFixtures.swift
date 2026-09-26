@@ -387,6 +387,21 @@ enum DebugLayerScript {
                     guard let row = Int(value), model.panelOrder.indices.contains(row) else { break }
                     model.selectLayer(model.panelOrder[row].id)
                     log("选中第 \(row) 行：\(model.selectedLayer?.name ?? "无")")
+                case "activate":
+                    guard let row = Int(value), model.panelOrder.indices.contains(row) else { break }
+                    model.activateLayer(model.panelOrder[row].id)
+                    log("把第 \(row) 行设为当前数据：\(model.selectedLayer?.name ?? "无")")
+                case "addData":
+                    // 把第 n 份已打开的数据加成一层（用来核对「点图层行切数据」这条路）。
+                    guard let index = Int(value) else { break }
+                    if index < model.rasters.count {
+                        model.addLayer(model.makeLayer(raster: model.rasters[index]))
+                    } else if model.datasets.indices.contains(index - model.rasters.count) {
+                        model.addLayer(model.makeLayer(dataset: model.datasets[index - model.rasters.count]))
+                    } else {
+                        break
+                    }
+                    log("加了一层本地数据：\(order(model))")
                 case "hide", "show":
                     let parts = value.split(separator: ">").compactMap { Int($0) }
                     guard let row = parts.first, model.panelOrder.indices.contains(row) else { break }

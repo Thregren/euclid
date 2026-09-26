@@ -9,7 +9,7 @@ macOS 原生的正射影像查看器与量测工具，为 **WebODM / ODM 的输�
 按地理参考摆到正确位置，读坐标、测距离、量面积、画圆、导出结果、出图——
 全部在本机完成，没有联网依赖。
 
-当前版本 **1.14.3**，下载见 [Releases](https://github.com/Thregren/euclid/releases/latest)。
+当前版本 **1.14.4**，下载见 [Releases](https://github.com/Thregren/euclid/releases/latest)。
 
 - **系统要求**：macOS 14 或更高；发布包是 Apple Silicon（Intel 机器可从源码构建）
 - **许可**：MIT（见 [LICENSE](LICENSE)）
@@ -117,7 +117,7 @@ cd euclid
 
 | 操作 | 怎么做 |
 | --- | --- |
-| 选中一层 | 点这一行（选中的行有强调色底与描边） |
+| 选中一层（本地数据即设为当前数据） | 点这一行（选中的行有强调色底与描边） |
 | 改叠放顺序 | **按住任意一行拖动**：拖到目标行的上半插到它前面、下半插到它后面 |
 | 重命名 / 复制 / 设为基准 / 上下移 / 移除 | **右键点这一行**，或面板顶上的 ⋯ 菜单 |
 | 显示 / 隐藏 | 行尾的勾选框 |
@@ -209,7 +209,7 @@ cd euclid
 | 标注绘制 | `MeasurementOverlay.swift`、`MeasurementPalette.swift` | 描边 / 填充 / 顶点 / 标注 / 半径辅助线各用图层池复用；圆环采样缓存；深浅色与「减少动态效果」适配；出图前的文字翻转补偿 |
 | 界面结构 | `RootView.swift`、`InterfaceStyle.swift` | 画布铺满窗口，左侧图层面板 / 右侧检查器 / 右缘工具条浮在画布之上，底部一条状态栏；面板材质、圆角、投影与语义色解析都在 `InterfaceStyle` 里收敛 |
 | 图层面板 | `LayerPanel.swift`、`LayerThumbnails.swift` | 左栏「图层」：标题行（＋ 添加 / 复制 / ⋯ 更多）、可点选可拖动排序的图层行、底部不透明度与搜索；缩略图直接向图层来源要一张低层级瓦片，取不到就退回类型图标 |
-| 检查器 | `InspectorView.swift`、`InspectorSections.swift`、`DataSourceSections.swift` | 可用数据与最近打开、图层属性、测量、指针坐标、视图与来源详情 |
+| 检查器 | `InspectorView.swift`、`InspectorSections.swift`、`DataSourceSections.swift` | 最近打开、在线底图、图层属性、测量、指针坐标、视图与来源详情 |
 | 状态栏与比例尺 | `StatusBarView.swift`、`ScaleBarView.swift`、`CoordinateText.swift` | 状态栏读数、比例尺（与出图共用刻度算法）、坐标文本格式化 |
 | 底图与下载界面 | `OnlineBasemap.swift`、`TileDownloadModel.swift`、`DownloadSheet.swift` | 在线底图配置与有效性判定；下载面板参数、计划预览、进度与取消 |
 | 出图 | `ViewExporter.swift` | 画面 + 信息栏（数据源、中心坐标、层级、比例尺）合成 PNG，供保存与剪贴板 |
@@ -295,7 +295,7 @@ Sources/EuclidApp/        应用层
   LayerThumbnails.swift     图层面板里的小缩略图
   InspectorView.swift       检查器布局
   InspectorSections.swift   指针坐标与测量分区
-  DataSourceSections.swift  可用数据与最近打开
+  DataSourceSections.swift  最近打开与在线底图
   TileCanvasNSView.swift    AppKit 画布：渲染与交互
   TileMapView.swift         SwiftUI ↔ AppKit 桥接
   TileLayerStack.swift      单条瓦片图层栈
@@ -365,6 +365,19 @@ docs/                     技术路线、构建与运行、开发进度、使用
 [开发进度](docs/03-进度.md)｜[使用说明](docs/04-使用说明.md)
 
 ## 更新日志
+
+### 1.14.4
+
+- **删掉检查器里的「可用数据」**：它跟左栏「图层」面板的 ＋ 菜单完全重复（都是"把已打开的数据
+  加成一层"），列表里点一下的"设为当前数据"也没人会用。现在加数据只在左栏 ＋ 里：
+  在线底图预设 / 已打开的本地数据 / 打开影像 / 打开瓦片目录。
+- **点一条本地图层行 = 把这份数据设为「当前数据」**（也就是基准层）：会重建基准层、重算数据范围、
+  恢复这份数据自己的测量存档。原先这条路的代码只改了一个 id，不做这些事 ——
+  检查器里的可用数据删掉后它就是唯一入口，顺手补全。
+- **修掉「加一层本地数据会被误标成基准层」**：`makeLayer` 原先硬写「这是基准层」，
+  于是又加一份数据就会出现两个「基准」标记，而且点它切不过去（它以为自己已经是基准层了）。
+  现在基准身份由调用方决定：只有「加数据时一个基准层都没有」才顺带当基准层。
+- 同一份数据在图层列表里只留一份：加过的那份在成为当前数据后由基准层代表，不再同时存在两份。
 
 ### 1.14.3
 
