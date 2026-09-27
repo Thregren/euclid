@@ -65,6 +65,14 @@ enum MeasurementExportFormat: String, CaseIterable, Identifiable {
 }
 
 extension AppModel {
+    /// 面积文本：按界面设置的单位格式化（`automatic` 时按数量级自动挑）。
+    ///
+    /// 测量界面里所有显示面积的地方都走它，保证同一块地在哪儿看都是同一个数字。
+    /// 存档与导出不受影响，永远是平方米（见 `MeasurementArchive` / `MeasurementExporter`）。
+    func areaText(_ squareMeters: Double) -> String {
+        MeasureFormat.area(squareMeters, unit: areaUnit)
+    }
+
     /// 复制全部测量结果到剪贴板。
     func copyMeasurements(as format: MeasurementExportFormat = .geoJSON) {
         guard !measurements.measurements.isEmpty, format.isText else { return }
@@ -83,12 +91,25 @@ extension AppModel {
         panel.isExtensionHidden = false
         panel.message = "导出 \(measurements.measurements.count) 条测量结果"
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        do {
-            let payload = format.data(measurements.measurements, datasetName: selectedSourceName)
-            try payload.write(to: url, options: .atomic)
-            setStatus("已导出 \(measurements.measurements.count) 条测量结果到 \(url.lastPathComponent)")
-        } catch {
-            setStatus("导出失败：\(error.localizedDescription)", autoClearAfter: 8)
+        // 拼接与编码放在后台：Excel 要拼 XML 再打 ZIP、CSV/GeoJSON 也是几十万字符的拼装，
+        // 在主线程上做就是「点了导出，窗口先卡一下」；写盘（几 MB）也一并放后台。
+        let snapshot = measurements.measurements
+        let datasetName = selectedSourceName
+        setStatus("正在导出 \(snapshot.count) 条测量…", autoClearAfter: 0)
+        Task {
+            let failure: String? = await Task.detached(priority: .userInitiated) {
+                do {
+                    try format.data(snapshot, datasetName: datasetName).write(to: url, options: .atomic)
+                    return nil
+                } catch {
+                    return error.localizedDescription
+                }
+            }.value
+            if let failure {
+                setStatus("导出失败：\(failure)", autoClearAfter: 8)
+            } else {
+                setStatus("已导出 \(snapshot.count) 条测量结果到 \(url.lastPathComponent)")
+            }
         }
     }
 
@@ -146,21 +167,29 @@ extension AppModel {
         panel.isExtensionHidden = false
         panel.message = "保存 \(measurements.measurements.count) 条测量（JSON，可再次载入编辑）"
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        writeMeasurements(to: url)
+        Task { _ = await writeMeasurements(to: url) }
     }
 
     /// 写到一个具体文件（面板与调试脚本共用同一条路径）。
     @discardableResult
-    func writeMeasurements(to url: URL) -> Bool {
-        guard let data = MeasurementArchive.encode(measurements.measurements) else { return false }
-        do {
-            try data.write(to: url, options: .atomic)
-            setStatus("已保存 \(measurements.measurements.count) 条测量到 \(url.lastPathComponent)")
-            return true
-        } catch {
-            setStatus("保存失败：\(error.localizedDescription)", autoClearAfter: 8)
+    func writeMeasurements(to url: URL) async -> Bool {
+        // 编码与写盘都在后台：几百上千条测量的 JSON 编码不该占着主线程。
+        let snapshot = measurements.measurements
+        let failure: String? = await Task.detached(priority: .userInitiated) {
+            guard let data = MeasurementArchive.encode(snapshot) else { return "编码失败" }
+            do {
+                try data.write(to: url, options: .atomic)
+                return nil
+            } catch {
+                return error.localizedDescription
+            }
+        }.value
+        if let failure {
+            setStatus("保存失败：\(failure)", autoClearAfter: 8)
             return false
         }
+        setStatus("已保存 \(snapshot.count) 条测量到 \(url.lastPathComponent)")
+        return true
     }
 
     /// 从文件里追加测量（不清掉现有的，便于把几次外业的点拼在一起）。
@@ -172,14 +201,18 @@ extension AppModel {
         panel.allowsMultipleSelection = false
         panel.message = "选择之前保存的测量文件"
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        guard loadMeasurements(from: url) == nil else { return }
+        Task { _ = await loadMeasurements(from: url) }
     }
 
     /// 从具体文件追加测量；返回读到的条数，失败返回 nil。
     @discardableResult
-    func loadMeasurements(from url: URL) -> Int? {
-        guard let data = try? Data(contentsOf: url),
-              let loaded = MeasurementArchive.decode(data) else {
+    func loadMeasurements(from url: URL) async -> Int? {
+        // 读盘 + 解码同样放后台（文件可能几 MB）。
+        let loaded: [GeoMeasurement]? = await Task.detached(priority: .userInitiated) {
+            guard let data = try? Data(contentsOf: url) else { return nil }
+            return MeasurementArchive.decode(data)
+        }.value
+        guard let loaded else {
             setStatus("这个文件里没有可识别的测量", autoClearAfter: 6)
             return nil
         }
@@ -223,21 +256,32 @@ extension AppModel {
             setStatus("当前没有可导出的画面")
             return
         }
-        guard let data = viewImageData() else {
-            setStatus("导出失败：画面还没渲染好", autoClearAfter: 8)
-            return
-        }
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyyMMdd-HHmmss"
         let name = "\(basemapName)-\(formatter.string(from: Date())).png"
         let directory = quickExportDirectory
         let url = directory.appending(path: name)
-        do {
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            try data.write(to: url, options: .atomic)
-            setStatus("已快速导出：\(directory.lastPathComponent)/\(name)", autoClearAfter: 8)
-        } catch {
-            setStatus("导出失败：\(error.localizedDescription)", autoClearAfter: 8)
+        setStatus("正在出图…", autoClearAfter: 0)
+        Task {
+            guard let data = await viewImageData() else {
+                setStatus("导出失败：画面还没渲染好", autoClearAfter: 8)
+                return
+            }
+            // 写盘（几 MB）也放后台：主 actor 上的 Task 仍然是主线程，写盘会卡住界面。
+            let failure: String? = await Task.detached(priority: .userInitiated) {
+                do {
+                    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                    try data.write(to: url, options: .atomic)
+                    return nil
+                } catch {
+                    return error.localizedDescription
+                }
+            }.value
+            if let failure {
+                setStatus("导出失败：\(failure)", autoClearAfter: 8)
+            } else {
+                setStatus("已快速导出：\(directory.lastPathComponent)/\(name)", autoClearAfter: 8)
+            }
         }
     }
 
@@ -271,45 +315,66 @@ extension AppModel {
         guard panel.runModal() == .OK, let url = panel.url else { return }
 
         let includesMeasurements = measurementsToggle.state == .on
-        guard let data = viewImageData(info: info, includingMeasurements: includesMeasurements) else {
-            setStatus("导出失败：画面还没渲染好", autoClearAfter: 8)
-            return
-        }
-        do {
-            try data.write(to: url, options: .atomic)
-            setStatus("已导出当前视图到 \(url.lastPathComponent)")
-        } catch {
-            setStatus("导出失败：\(error.localizedDescription)", autoClearAfter: 8)
+        setStatus("正在出图…", autoClearAfter: 0)
+        Task {
+            guard let data = await viewImageData(info: info, includingMeasurements: includesMeasurements) else {
+                setStatus("导出失败：画面还没渲染好", autoClearAfter: 8)
+                return
+            }
+            let failure: String? = await Task.detached(priority: .userInitiated) {
+                do {
+                    try data.write(to: url, options: .atomic)
+                    return nil
+                } catch {
+                    return error.localizedDescription
+                }
+            }.value
+            if let failure {
+                setStatus("导出失败：\(failure)", autoClearAfter: 8)
+            } else {
+                setStatus("已导出当前视图到 \(url.lastPathComponent)")
+            }
         }
     }
 
     /// 把当前视图放进剪贴板，直接粘到聊天窗口或文档里。
     func copyViewToClipboard() {
-        guard let info = viewImageInfo,
-              let data = viewImageData(info: info, includingMeasurements: true),
-              let image = NSImage(data: data) else {
+        guard let info = viewImageInfo else {
             setStatus("当前没有可复制的画面")
             return
         }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.writeObjects([image])
-        setStatus("已复制当前视图（\(image.size.width)×\(image.size.height) 点）")
+        Task {
+            guard let data = await viewImageData(info: info, includingMeasurements: true),
+                  let image = NSImage(data: data) else {
+                setStatus("当前没有可复制的画面")
+                return
+            }
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.writeObjects([image])
+            setStatus("已复制当前视图（\(image.size.width)×\(image.size.height) 点）")
+        }
     }
 
-    private func viewImageData(info: ViewExporter.Info, includingMeasurements: Bool) -> Data? {
+    /// 合成当前画面并编码成 PNG。
+    ///
+    /// 画面本身（图层树）必须在主线程取，合成也就几步绘制；真正贵的是 PNG 编码
+    /// （Retina 上一屏大约几十到一百多毫秒），因此只把编码放到后台。
+    private func viewImageData(info: ViewExporter.Info, includingMeasurements: Bool) async -> Data? {
         guard let map = canvas.mapImage(includingMeasurements: includingMeasurements),
               let composed = ViewExporter.compose(
                 map: map,
                 scale: canvas.backingScale,
                 info: info
               ) else { return nil }
-        return ViewExporter.pngData(composed)
+        return await Task.detached(priority: .userInitiated) {
+            ViewExporter.pngData(composed)
+        }.value
     }
 
     /// 出图用的数据（调试脚本与菜单共用同一条路径）。
-    func viewImageData(includingMeasurements: Bool = true) -> Data? {
+    func viewImageData(includingMeasurements: Bool = true) async -> Data? {
         guard let info = viewImageInfo else { return nil }
-        return viewImageData(info: info, includingMeasurements: includingMeasurements)
+        return await viewImageData(info: info, includingMeasurements: includingMeasurements)
     }
 
     /// 信息栏内容：现在看的是什么、中心在哪、多大比例、量了几条。

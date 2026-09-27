@@ -41,13 +41,18 @@ struct RootView: View {
             DebugVerifyScript.runIfRequested(model: model)
             DebugTileServerScript.runIfRequested(model: model)
             DebugLayerScript.runIfRequested(model: model)
+            DebugInputScript.runIfRequested(model: model)
+            DebugMemoryScript.runIfRequested(model: model)
         }
     }
 
     /// 浮在画布上的三块：左侧图层、右侧检查器、右缘工具条。
     private var floatingPanels: some View {
         HStack(alignment: .top, spacing: 10) {
-            LayersPanel()
+            if model.showLayers {
+                LayersPanel()
+                    .transition(.move(edge: .leading).combined(with: .opacity))
+            }
             Spacer(minLength: 0)
             if model.showInspector {
                 InspectorView()
@@ -60,6 +65,7 @@ struct RootView: View {
         .padding(.leading, 14)
         .padding(.trailing, 2)
         .animation(InterfaceStyle.reducesMotion ? nil : .easeInOut(duration: 0.18), value: model.showInspector)
+        .animation(InterfaceStyle.reducesMotion ? nil : .easeInOut(duration: 0.18), value: model.showLayers)
     }
 
     private var subtitle: String {
@@ -90,6 +96,11 @@ struct RootView: View {
 
         ToolbarItemGroup(placement: .primaryAction) {
             exportMenu
+
+            Toggle(isOn: Bindable(model).showLayers) {
+                Label("图层", systemImage: "sidebar.left")
+            }
+            .help("显示图层面板（⌘⌥L）")
 
             Toggle(isOn: Bindable(model).showInspector) {
                 Label("检查器", systemImage: "sidebar.right")
@@ -170,10 +181,12 @@ struct MapScreen: View {
 
             if model.hasMapContent {
                 MapControls()
-                    // 左栏浮着「图层」面板，画布左下角要让开它的宽度。
-                    .padding(.leading, 14 + InterfaceStyle.layersPanelWidth + 12)
+                    // 左栏浮着「图层」面板时，画布左下角要让开它的宽度；
+                    // 面板收起来之后控件跟着回位，别留一块空白。
+                    .padding(.leading, model.showLayers ? 14 + InterfaceStyle.layersPanelWidth + 12 : 16)
                     .padding(.bottom, 16)
                     .transition(.opacity)
+                    .animation(InterfaceStyle.reducesMotion ? nil : .easeInOut(duration: 0.18), value: model.showLayers)
             }
         }
         .overlay {

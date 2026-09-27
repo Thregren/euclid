@@ -115,7 +115,7 @@ public enum MeasurementExporter {
             }
             let result = measurement.result
             var properties = [
-                "\"name\":\"\(escape(measurement.kind.displayName))\"",
+                "\"name\":\(jsonString(measurement.kind.displayName))",
                 "\"kind\":\"\(measurement.kind.rawValue)\"",
                 "\"pointCount\":\(measurement.points.count)",
             ]
@@ -223,7 +223,7 @@ public enum MeasurementExporter {
                     row.bearing.map(number) ?? "",
                     row.area.map(number) ?? "",
                     row.radius.map(number) ?? "",
-                ].joined(separator: ","))
+                ].map(Self.csvField).joined(separator: ","))
             }
         }
         return lines.joined(separator: "\n")
@@ -363,6 +363,39 @@ public enum MeasurementExporter {
         return formatter.string(from: date)
     }
 
+    /// CSV 字段：含有分隔符、引号或换行时用双引号包起来，内部引号翻倍（RFC 4180）。
+    ///
+    /// 现在导出的文本基本都是固定枚举名与自动编号，看不出问题；但只要以后给测量加上
+    /// 「名字」这类用户输入，不转义就会直接产出坏 CSV（Excel 打开是错位的行）。
+    package static func csvField(_ text: String) -> String {
+        guard text.contains(where: { $0 == "," || $0 == "\"" || $0 == "\n" || $0 == "\r" }) else {
+            return text
+        }
+        return "\"" + text.replacingOccurrences(of: "\"", with: "\"\"") + "\""
+    }
+
+    /// JSON 字符串字面量（含引号）：GeoJSON 里插的是 JSON，不能借用 XML 的转义函数。
+    package static func jsonString(_ text: String) -> String {
+        var result = "\""
+        for scalar in text.unicodeScalars {
+            switch scalar {
+            case "\"": result += "\\\""
+            case "\\": result += "\\\\"
+            case "\n": result += "\\n"
+            case "\r": result += "\\r"
+            case "\t": result += "\\t"
+            default:
+                if scalar.value < 0x20 {
+                    result += String(format: "\\u%04x", scalar.value)
+                } else {
+                    result.unicodeScalars.append(scalar)
+                }
+            }
+        }
+        return result + "\""
+    }
+
+    /// XML 文本转义（KML 与 XLSX 用）。
     private static func escape(_ text: String) -> String {
         text.replacingOccurrences(of: "&", with: "&amp;")
             .replacingOccurrences(of: "<", with: "&lt;")

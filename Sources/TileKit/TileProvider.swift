@@ -61,6 +61,22 @@ public actor TileProvider {
     /// 当前内存缓存里的瓦片数（状态栏 / 自检用）。
     public var cachedTileCount: Int { cache.count }
 
+    /// 当前内存缓存占用的字节数与瓦片数（内存压力与调试输出用）。
+    public var cacheStats: (tiles: Int, bytes: Int) { (cache.count, cachedBytes) }
+
+    /// 把缓存压到给定字节以内：从最久没用到的开始丢（内存压力下由界面调用）。
+    ///
+    /// 只丢缓存、不动在途请求与「缺片」负缓存，因此正在看的这一屏不会被清掉。
+    public func trimCache(keepingBytes limit: Int) {
+        let target = max(0, limit)
+        while cachedBytes > target, let oldest = recency.first {
+            recency.removeFirst()
+            if let image = cache.removeValue(forKey: oldest) {
+                cachedBytes -= cost(of: image)
+            }
+        }
+    }
+
     /// 取瓦片图片；不存在时返回 nil。
     public func image(for tile: SlippyTile) async -> CGImage? {
         if let image = cache[tile] {

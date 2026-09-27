@@ -9,9 +9,9 @@ import TileKit
 /// 正式使用不会触发任何逻辑。
 @MainActor
 enum DebugFixtures {
-    static var isEnabled: Bool {
-        ProcessInfo.processInfo.environment["EUCLID_DEMO_MEASUREMENT"] != nil
-    }
+    /// 是否启用调试示例数据。读一次留成常量：这个判断每次测量变化都会被问到
+    /// （见 `AppModel.scheduleArchiveSave`），而环境字典每读一次都要重拼（约 29 µs）。
+    static let isEnabled = ProcessInfo.processInfo.environment["EUCLID_DEMO_MEASUREMENT"] != nil
 
     /// 在数据集覆盖范围内铺几条示例测量。
     static func populateMeasurements(in extent: DatasetExtent, store: MeasurementStore) {
@@ -515,6 +515,53 @@ enum DebugWindowSnapshotScript {
 ///
 /// `EUCLID_DEBUG_VERIFY=1` 时启动十几秒后依次执行并把结果打到 stderr。
 /// 只用于无人值守核对，正式使用不设置该变量。
+///
+/// 内存与句柄观察：`EUCLID_DEBUG_MEMORY=1` 时每 5 秒打一行
+/// 「内存占用 / 打开的文件描述符数 / 各层瓦片缓存」，用来确认长时间浏览不涨。
+/// （句柄那一项是给「瓦片用 `mappedIfSafe` 读」这条路径做的保险：映射文件会占着 fd。）
+@MainActor
+enum DebugMemoryScript {
+    static func runIfRequested(model: AppModel) {
+        guard ProcessInfo.processInfo.environment["EUCLID_DEBUG_MEMORY"] != nil else { return }
+        let interval = Double(ProcessInfo.processInfo.environment["EUCLID_DEBUG_MEMORY_SECONDS"] ?? "") ?? 5
+        Task { @MainActor in
+            while !Task.isCancelled {
+                let footprint = Self.footprintMegabytes()
+                let descriptors = Self.openFileDescriptorCount()
+                let caches = await model.canvas.cacheSummary()
+                let line = String(
+                    format: "[mem] %.0f MB · fd %d · 测量 %d 条 · %@\n",
+                    footprint, descriptors, model.measurements.measurements.count, caches
+                )
+                FileHandle.standardError.write(Data(line.utf8))
+                try? await Task.sleep(for: .seconds(interval))
+            }
+        }
+    }
+
+    /// 进程的物理内存占用（macOS 上就是活动监视器里的那个「内存」）。
+    private static func footprintMegabytes() -> Double {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size
+        )
+        let result = withUnsafeMutablePointer(to: &info) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { rebound in
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), rebound, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return -1 }
+        return Double(info.phys_footprint) / 1_048_576
+    }
+
+    /// 打开的文件描述符数量（`lsof` 的进程内版本，不需要额外权限）。
+    private static func openFileDescriptorCount() -> Int {
+        let size = proc_pidinfo(getpid(), PROC_PIDLISTFDS, 0, nil, 0)
+        guard size > 0 else { return -1 }
+        return Int(size) / MemoryLayout<proc_fdinfo>.size
+    }
+}
+
 @MainActor
 enum DebugVerifyScript {
     static func runIfRequested(model: AppModel) {
@@ -527,6 +574,10 @@ enum DebugVerifyScript {
             let center = model.viewport.center
             log(String(format: "视图中心 %.5f, %.5f  z%d 底图=%@",
                        center.longitude, center.latitude, model.viewport.dataZoom, model.basemapName))
+            // 这个脚本会故意落点、清空、再读回：结束时必须证明它**没碰**用户的自动存档
+            // （`AppModel.isAutomatedRun` 那道守卫）。以前只顾着声明守卫、忘了接到写盘口上，
+            // 结果自检真的把用户的存档覆盖过一次，所以这里留一条常驻断言。
+            let archiveBefore = Self.archiveStamp()
 
             // 1) 快捷键落点（与「点坐标」同一份数据）
             let before = model.measurements.measurements.count
@@ -538,15 +589,23 @@ enum DebugVerifyScript {
 
             // 2) 测量存档读写（同一个文件：写进去再读回来）
             let file = URL(fileURLWithPath: "/tmp/euclid-verify-measurements.json")
-            _ = model.writeMeasurements(to: file)
+            _ = await model.writeMeasurements(to: file)
             let written = model.measurements.measurements.count
             model.clearMeasurements()
-            let loaded = model.loadMeasurements(from: file) ?? -1
+            let loaded = await model.loadMeasurements(from: file) ?? -1
             log("存档：写出 \(written) 条 → 清空 → 读回 \(loaded) 条（应相等）")
 
             // 3) 快速导出（不弹面板，直接落到快捷导出目录）
             model.quickExportView()
-            log("快速导出：状态=「\(model.statusMessage ?? "无")」")
+            // 出图现在是异步的（PNG 编码在后台），等一下再看结果状态。
+            var exportStatus = model.statusMessage ?? "无"
+            var waited = 0
+            while exportStatus.contains("正在出图"), waited < 40 {
+                try? await Task.sleep(for: .milliseconds(100))
+                exportStatus = model.statusMessage ?? "无"
+                waited += 1
+            }
+            log("快速导出：状态=「\(exportStatus)」")
 
             // 4) 多图层：开关之前应当有本地 + 在线两层，各自独立的不透明度
             @MainActor func layersText() -> String {
@@ -584,6 +643,15 @@ enum DebugVerifyScript {
             try? await Task.sleep(for: .seconds(2))
             log("两层各不相同的不透明度：" + layersText())
 
+            let archiveAfter = Self.archiveStamp()
+            let guardHeld = archiveBefore == archiveAfter
+            log("自动存档守卫：\(archiveBefore) → \(archiveAfter)"
+                + (guardHeld ? "（未被自动化运行改动 ✓）" : "（✗ 被自动化运行改动了）"))
+            if let isolated = Self.isolatedArchiveStamp() {
+                log("  ↳ 隔离存档（EUCLID_DEBUG_ARCHIVE_PATH）：\(isolated)"
+                    + "（有写入 = 写盘这条路验过 ✓）")
+            }
+
             // 5) 关窗是否退出（设置了 EUCLID_DEBUG_VERIFY_CLOSE 时）
             if ProcessInfo.processInfo.environment["EUCLID_DEBUG_VERIFY_CLOSE"] != nil {
                 log("即将关闭主窗口，若程序正常退出则不会再看到后续日志")
@@ -592,6 +660,28 @@ enum DebugVerifyScript {
                 log("关闭窗口后程序仍在运行（这条不该出现）")
             }
         }
+    }
+
+    /// 某个存档文件的「大小 + 修改时间」。
+    private static func stamp(of url: URL?) -> String {
+        guard let url,
+              let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]) else {
+            return "无存档"
+        }
+        let modified = values.contentModificationDate.map { String(format: "%.0f", $0.timeIntervalSince1970) } ?? "?"
+        return "\(values.fileSize ?? -1) 字节 @\(modified)"
+    }
+
+    /// 守卫核对用：比的是**用户真正的存档**（不受 `EUCLID_DEBUG_ARCHIVE_PATH` 覆盖影响），
+    /// 所以「隔离路径 + 显式允许写入」那种验证写盘的模式下，这条断言同样是有效的。
+    private static func archiveStamp() -> String {
+        stamp(of: MeasurementArchive.userArchiveFileURL)
+    }
+
+    /// 隔离存档（覆盖路径）的「大小 + 修改时间」：用来证明「写盘这条路还通」。
+    private static func isolatedArchiveStamp() -> String? {
+        guard MeasurementArchive.overrideFileURL != nil else { return nil }
+        return stamp(of: MeasurementArchive.overrideFileURL)
     }
 }
 
@@ -679,7 +769,7 @@ enum DebugExportScript {
         Task { @MainActor in
             try? await Task.sleep(for: .seconds(20))
             let url = URL(fileURLWithPath: path)
-            guard let data = model.viewImageData() else {
+            guard let data = await model.viewImageData() else {
                 FileHandle.standardError.write(Data("[export] 当前没有可导出的画面\n".utf8))
                 return
             }

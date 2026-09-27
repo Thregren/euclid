@@ -10,6 +10,23 @@ import UniformTypeIdentifiers
 /// 从 `AppModel.swift`（状态中枢）里拆出来，纯搬移：状态与生命周期仍在那边，
 /// 这里只放操作图层的方法。
 extension AppModel {
+    /// 各层瓦片缓存的上限，按物理内存分档。
+    ///
+    /// 一张 512² 的瓦片解码后约 1 MB，所以「512 MB」大致是五百来片（三四个屏幕的活动范围）。
+    /// 以前写死 512 MB（在线 256 MB），两三层叠加在 8 GB 机器上压力偏大；
+    /// 现在按内存分三档：内存小的少缓存、内存大的多缓存。
+    enum TileCacheBudget {
+        static func bytes(for kind: MapLayer.Kind) -> Int {
+            let gigabytes = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824
+            let megabytes: Int
+            switch gigabytes {
+            case ..<9: megabytes = kind == .online ? 96 : 192
+            case ..<17: megabytes = kind == .online ? 192 : 384
+            default: megabytes = kind == .online ? 256 : 768
+            }
+            return megabytes * 1_048_576
+        }
+    }
     // MARK: - 图层操作
 
     /// 改某一层的不透明度。
@@ -22,6 +39,18 @@ extension AppModel {
     /// 只改选中态（拖动排序、拖放落点这类操作走它，别顺手把当前数据也换了）。
     func selectLayer(_ id: String) {
         selectedLayerID = id
+    }
+
+    /// ⌫ / ⌦ 删除选中的图层（画布统一监听键盘，见 `TileCanvasNSView.installFinishMonitor`）。
+    ///
+    /// 只在图层面板开着时生效：面板收起来的时候用户看不到列表，一按退格删掉点什么会很意外。
+    /// 返回是否真的删了（没删就把按键还给系统，别吞掉）。
+    func deleteSelectedLayerFromKeyboard() -> Bool {
+        guard showLayers, let id = selectedLayer?.id else { return false }
+        let name = layers.first { $0.id == id }?.name ?? "图层"
+        removeLayer(id)
+        setStatus("已移除图层：\(name)", autoClearAfter: 5)
+        return true
     }
 
     /// 把某一层**设为当前数据**：本地数据要重建基准层、重算数据范围、恢复这份数据自己的测量存档，
@@ -91,6 +120,12 @@ extension AppModel {
         }
         if removed.kind == .online, layers.last(where: { $0.kind == .online }) == nil {
             usesOnlineBasemap = false
+        }
+        // 这一层是单幅影像、并且没有别的图层还在用同一个文件时，
+        // 把它解出来的块缓存与读句柄一起还回去（复制图层共享同一个文件，所以要看一圈）。
+        if removed.kind == .raster, let raster = removed.source as? RasterTileSource {
+            let stillUsed = layers.contains { ($0.source as? RasterTileSource)?.fileURL == raster.fileURL }
+            if !stillUsed { RasterCache.discard(fileURL: raster.fileURL) }
         }
         normalizeAnchor()
         pushLayers()
@@ -205,7 +240,7 @@ extension AppModel {
             zoomRange: dataset.zoomRange,
             followsDisplayScale: false,
             maximumDataZoom: Double(dataset.zoomRange.upperBound),
-            memoryLimitBytes: 512 * 1024 * 1024,
+            memoryLimitBytes: TileCacheBudget.bytes(for: .dataset),
             maxConcurrentRequests: 8,
             fitRect: extent?.worldRect,
             // 基准层的身份由调用方决定（见 `applyLocalLayer` / `addLayer`）：
@@ -228,7 +263,7 @@ extension AppModel {
             zoomRange: raster.zoomRange,
             followsDisplayScale: false,
             maximumDataZoom: raster.maximumDataZoom,
-            memoryLimitBytes: 512 * 1024 * 1024,
+            memoryLimitBytes: TileCacheBudget.bytes(for: .raster),
             maxConcurrentRequests: 8,
             fitRect: raster.worldRect,
             isAnchor: false,
@@ -249,7 +284,7 @@ extension AppModel {
             zoomRange: basemap.zoomRange,
             followsDisplayScale: true,
             maximumDataZoom: Double(basemap.zoomRange.upperBound),
-            memoryLimitBytes: 256 * 1024 * 1024,
+            memoryLimitBytes: TileCacheBudget.bytes(for: .online),
             maxConcurrentRequests: 24,
             fitRect: extent?.worldRect,
             isAnchor: false,

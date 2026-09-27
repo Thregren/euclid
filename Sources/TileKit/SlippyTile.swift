@@ -8,7 +8,10 @@ public struct SlippyTile: Hashable, Sendable, Comparable, CustomStringConvertibl
     public let y: Int
 
     public init(zoom: Int, x: Int, y: Int) {
-        self.zoom = zoom
+        // 层级兜一次底：`1 << zoom` 在 63 之上会直接崩，而 30 级以上没有任何真实数据源。
+        // 所有调用点本来就夹在 0…30（下载计划、数据集嗅探、相机都在夹），
+        // 这里再兜一道，把「不可达」变成「不可能」。
+        self.zoom = min(max(zoom, 0), 30)
         self.x = x
         self.y = y
     }

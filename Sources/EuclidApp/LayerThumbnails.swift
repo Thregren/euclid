@@ -18,6 +18,8 @@ final class LayerThumbnailStore {
     private var failed: Set<String> = []
     /// 缩略图缓存上限：图层不会太多，但用户反复打开数据集时别让它无限长。
     private static let maximumCachedImages = 32
+    /// 「取不到」的记录也加上限：反复换密钥 / 换底图会让它一直涨。
+    private static let maximumFailedKeys = 64
 
     /// 某一层的缩略图；还没取到时为 nil。
     func image(for layer: MapLayer) -> CGImage? {
@@ -39,9 +41,13 @@ final class LayerThumbnailStore {
         let source = layer.source
         Task { [weak self] in
             let image = await source.image(for: tile)
+            // 缩放是纯绘图，放到后台做：面板的行是主线程建的，缩一张 512 的图要 1~3 ms。
+            let small = await Task.detached(priority: .utility) {
+                image.flatMap { Self.downscaled($0) }
+            }.value
             guard let self else { return }
             self.loading.remove(key)
-            if let image, let small = Self.downscaled(image) {
+            if let small {
                 self.images[key] = small
                 // 简单淘汰：超了就把最早存进去的那个丢掉（字典没有顺序，这里用 keys 的第一个）。
                 if self.images.count > Self.maximumCachedImages,
@@ -49,6 +55,7 @@ final class LayerThumbnailStore {
                     self.images.removeValue(forKey: oldest)
                 }
             } else {
+                if self.failed.count >= Self.maximumFailedKeys { self.failed.removeAll(keepingCapacity: true) }
                 self.failed.insert(key)
             }
         }
@@ -84,7 +91,8 @@ final class LayerThumbnailStore {
     }
 
     /// 缩到行高附近就够：面板上的缩略图只有 40×28 点（Retina 上 80×56 像素）。
-    private static func downscaled(_ image: CGImage, maximumPixel: Int = 96) -> CGImage? {
+    /// `nonisolated`：纯绘图（CGContext + 缩图），调用方会丢到后台任务里做。
+    private nonisolated static func downscaled(_ image: CGImage, maximumPixel: Int = 96) -> CGImage? {
         let longest = max(image.width, image.height)
         guard longest > 0 else { return nil }
         let scale = min(1, Double(maximumPixel) / Double(longest))

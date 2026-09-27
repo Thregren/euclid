@@ -316,7 +316,7 @@ public enum Projection {
                 + (5 - 2 * c1 + 28 * t1 - 3 * c1 * c1 + 8 * ePrimeSquared + 24 * t1 * t1) * pow(d, 5) / 120
         ) / cosPhi1
 
-        if ProcessInfo.processInfo.environment["EUCLID_TM_TRACE"] != nil {
+        if TileKitTrace.transverseMercator {
             let term3 = -(1 + 2 * t1 + c1) * pow(d, 3) / 6
             let term5 = (5 - 2 * c1 + 28 * t1 - 3 * c1 * c1 + 8 * ePrimeSquared + 24 * t1 * t1) * pow(d, 5) / 120
             let line = String(format: "[tm] e2=%.12f ep2=%.12f phi1=%.12f c1=%.12f t1=%.12f d=%.12f\n",

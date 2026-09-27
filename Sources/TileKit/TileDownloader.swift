@@ -90,6 +90,22 @@ public struct URLSessionTileFetcher: TileFetching {
 
 // MARK: - 下载
 
+/// 落盘目录只建一次。
+///
+/// 一次下载里同一个 `<z>/<x>` 目录下面要写几十上百片瓦片，而原先每片都调一次
+/// `createDirectory(withIntermediateDirectories:)`（一万片就是一万次建目录的系统调用）。
+/// 这里记住已经建过的目录，只对没见过的调用文件系统；actor 保证并发安全。
+actor DownloadDirectoryMaker {
+    private var created: Set<String> = []
+
+    func ensure(_ directory: URL) throws {
+        let key = directory.path(percentEncoded: false)
+        guard !created.contains(key) else { return }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        created.insert(key)
+    }
+}
+
 public struct TileDownloadOptions: Sendable {
     public var urlTemplate: String
     public var subdomains: [String]
@@ -276,6 +292,7 @@ public struct TileDownloader: Sendable {
         }
 
         let pacer = RequestPacer(requestsPerSecond: options.requestsPerSecond)
+        let directories = DownloadDirectoryMaker()
         let headers = options.defaultHeaders
         let started = Date()
         var downloaded = 0, skipped = 0, missing = 0, failed = 0, bytes = 0
@@ -334,7 +351,8 @@ public struct TileDownloader: Sendable {
                                 options: options,
                                 headers: headers,
                                 fetcher: fetcher,
-                                pacer: pacer
+                                pacer: pacer,
+                                directories: directories
                             )
                         }
                     }
@@ -382,7 +400,8 @@ public struct TileDownloader: Sendable {
         options: TileDownloadOptions,
         headers: [String: String],
         fetcher: any TileFetching,
-        pacer: RequestPacer
+        pacer: RequestPacer,
+        directories: DownloadDirectoryMaker
     ) async -> Outcome {
         let manager = FileManager.default
         let destination = options.outputDirectory.appending(
@@ -412,10 +431,7 @@ public struct TileDownloader: Sendable {
             do {
                 let result = try await fetcher.fetch(TileRequest(url: url, headers: headers))
                 do {
-                    try manager.createDirectory(
-                        at: destination.deletingLastPathComponent(),
-                        withIntermediateDirectories: true
-                    )
+                    try await directories.ensure(destination.deletingLastPathComponent())
                     try result.data.write(to: destination, options: .atomic)
                 } catch {
                     return .failed("\(tile)：写入失败 \(error.localizedDescription)")

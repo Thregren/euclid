@@ -242,16 +242,82 @@ public enum MeasureFormat {
         return String(format: "%.2f m", meters)
     }
 
-    /// 面积：按数量级选择平方米、公顷、平方公里。
-    public static func area(_ squareMeters: Double) -> String {
-        let magnitude = abs(squareMeters)
-        if magnitude >= 1_000_000 {
-            return String(format: "%.2f km²", squareMeters / 1_000_000)
+    /// 面积的显示单位。
+    ///
+    /// 默认 `automatic`：按数量级在平方米 / 公顷 / 平方公里之间挑一个（原来的行为）。
+    /// 其余几档是显式指定 —— 国内量地常用「亩」，一刀切按数量级换单位反而不好读。
+    public enum AreaUnit: String, CaseIterable, Identifiable, Sendable {
+        case automatic
+        case squareMeters
+        case hectares
+        case squareKilometers
+        case mu
+
+        public var id: String { rawValue }
+
+        public var title: String {
+            switch self {
+            case .automatic: return "自动"
+            case .squareMeters: return "平方米 m²"
+            case .hectares: return "公顷 ha"
+            case .squareKilometers: return "平方公里 km²"
+            case .mu: return "亩"
+            }
         }
-        if magnitude >= 10_000 {
-            return String(format: "%.2f 公顷", squareMeters / 10_000)
+
+        /// 菜单里显示的短标签（比如工具栏那种窄地方）。
+        public var shortTitle: String {
+            switch self {
+            case .automatic: return "自动"
+            case .squareMeters: return "m²"
+            case .hectares: return "公顷"
+            case .squareKilometers: return "km²"
+            case .mu: return "亩"
+            }
         }
-        return String(format: "%.1f m²", squareMeters)
+
+        /// 换算系数（1 单位 = 多少平方米）。`automatic` 没有固定系数。
+        public var squareMetersPerUnit: Double? {
+            switch self {
+            case .automatic: return nil
+            case .squareMeters: return 1
+            case .hectares: return 10_000
+            case .squareKilometers: return 1_000_000
+            case .mu: return 2_000 / 3       // 1 亩 = 666.666… m²（15 亩 = 1 公顷）
+            }
+        }
+    }
+
+    /// 面积：按指定单位格式化；`automatic` 时按数量级自动挑。
+    public static func area(_ squareMeters: Double, unit: AreaUnit = .automatic) -> String {
+        switch unit {
+        case .automatic:
+            let magnitude = abs(squareMeters)
+            if magnitude >= 1_000_000 {
+                return String(format: "%.2f km²", squareMeters / 1_000_000)
+            }
+            if magnitude >= 10_000 {
+                return String(format: "%.2f 公顷", squareMeters / 10_000)
+            }
+            return String(format: "%.1f m²", squareMeters)
+        case .squareMeters:
+            return String(format: "%.1f m²", squareMeters)
+        case .hectares:
+            let hectares = squareMeters / 10_000
+            return abs(hectares) >= 100
+                ? String(format: "%.1f 公顷", hectares)
+                : String(format: "%.3f 公顷", hectares)
+        case .squareKilometers:
+            let kilometers = squareMeters / 1_000_000
+            return abs(kilometers) >= 100
+                ? String(format: "%.1f km²", kilometers)
+                : String(format: "%.3f km²", kilometers)
+        case .mu:
+            let mu = squareMeters / (2_000 / 3)
+            return abs(mu) >= 1_000
+                ? String(format: "%.0f 亩", mu)
+                : String(format: "%.2f 亩", mu)
+        }
     }
 
     /// 方位角：度分。

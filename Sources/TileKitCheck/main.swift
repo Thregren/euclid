@@ -378,6 +378,14 @@ let kilometerText = MeasureFormat.distance(1234.5)
 expect(kilometerText.hasPrefix("1.23") && kilometerText.hasSuffix(" km"), "公里级格式")
 expect(MeasureFormat.area(5234) == "5234.0 m²", "小面积格式")
 expect(MeasureFormat.area(52340).contains("公顷"), "中等面积用公顷")
+// 面积单位可显式指定（界面上的「面积单位」开关走的就是这几档）
+expect(MeasureFormat.area(5234, unit: .squareMeters) == "5234.0 m²", "固定平方米")
+expect(MeasureFormat.area(5234, unit: .hectares) == "0.523 公顷", "固定公顷")
+expect(MeasureFormat.area(5234, unit: .squareKilometers) == "0.005 km²", "固定平方公里")
+expect(MeasureFormat.area(5234, unit: .mu) == "7.85 亩", "固定亩")
+expect(MeasureFormat.area(10_000, unit: .mu) == "15.00 亩", "1 公顷 = 15 亩")
+expect(MeasureFormat.area(5234, unit: .automatic) == "5234.0 m²", "自动档仍按数量级挑")
+expect(MeasureFormat.AreaUnit.allCases.count == 5, "面积单位五档（自动 / m² / 公顷 / km² / 亩）")
 expect(MeasureFormat.bearing(45.5) == "45°30′", "方位角格式")
 // 359.999° 取到整分就是 360°00′，必须归一成 0°00′（既不能写 360°，也不能写 359°60′）
 expect(MeasureFormat.bearing(359.999) == "0°00′", "方位角进位后归一，不出现 360° 或 60′")
@@ -420,6 +428,99 @@ expect(tmsLayout.relativePath(for: SlippyTile(zoom: 0, x: 0, y: 0), fileExtensio
 let source = DirectoryTileSource(rootURL: URL(fileURLWithPath: "/tmp"), layout: .webODM, zoomRange: 0...5)
 expect(source.fileCandidates(for: SlippyTile(zoom: 9, x: 0, y: 0)).isEmpty, "超出层级范围返回空")
 expect(source.fileCandidates(for: SlippyTile(zoom: 5, x: 32, y: 0)).isEmpty, "超出列范围返回空")
+
+// MARK: - 内存安全（畸形输入既不许崩，也不许按声明去申请巨量内存）
+
+section("内存安全：畸形输入")
+
+// 分块尺寸的可信范围：真实影像里 512/1024/4096 很常见，宽条带也合法；
+// 但「十亿见方」这种声明必须在解析阶段就被挡住（解码会按它申请缓冲区）。
+expect(!TIFFLimits.isSaneChunk(width: 1 << 30, height: 1 << 30), "十亿见方的分块不可信")
+expect(!TIFFLimits.isSaneChunk(width: 0, height: 512), "零宽分块不可信")
+expect(!TIFFLimits.isSaneChunk(width: 512, height: 0), "零高分块不可信")
+expect(TIFFLimits.isSaneChunk(width: 512, height: 512), "512 见方分块应可信")
+expect(TIFFLimits.isSaneChunk(width: 4096, height: 4096), "4096 见方分块应可信")
+expect(TIFFLimits.isSaneChunk(width: 100_000, height: 600), "宽条带（10 万 × 600）应可信")
+expect(!TIFFLimits.isSaneChunk(width: 100_000, height: 100_000), "超大条带不可信")
+
+// 端到端：真的写出一个「分块十亿见方」的 TIFF，要求打不开 —— 不崩、也不去申请 4 TB。
+let malformedTIFF = URL(fileURLWithPath: NSTemporaryDirectory())
+    .appending(path: "euclid-malformed-\(UUID().uuidString).tif")
+defer { try? FileManager.default.removeItem(at: malformedTIFF) }
+writeMalformedTiledTIFF(to: malformedTIFF)
+if let raster = try? RasterLoader.load(url: malformedTIFF) {
+    expect(false, "分块尺寸荒谬的 TIFF 不该被打开（拿到了 \(raster.pixelSizeText)）")
+} else {
+    expect(true, "分块尺寸荒谬的 TIFF 在解析阶段被拒绝")
+}
+
+// 截断的压缩块：解出来必须「补齐到容量」或直接拒绝，绝不能返回短数组（调用方是按块尺寸索引像素的）。
+let truncatedLZW = Data([0x80, 0x0B, 0x60, 0x50, 0x22, 0x0C, 0x0C, 0x85, 0x01])
+if let decoded = TIFFCodec.lzwDecode(truncatedLZW, capacity: 64) {
+    expect(decoded.count == 64, "截断的 LZW 结果应补齐到块容量（实际 \(decoded.count)）")
+} else {
+    expect(true, "截断的 LZW 被拒绝（允许，但不能崩）")
+}
+// 截断的 PackBits（字面量段声明 6 字节、只给了 3 字节）：要么整体拒绝，要么补齐到容量，
+// 但绝不能返回短数组（那就是调用方越界的入口）。
+if let decoded = TIFFCodec.packBitsDecode(Data([0x05, 1, 2, 3]), capacity: 16) {
+    expect(decoded.count == 16, "截断的 PackBits 若返回，必须补齐到块容量（实际 \(decoded.count)）")
+} else {
+    expect(true, "截断的 PackBits 被整体拒绝（允许）")
+}
+// 完整但不满一整块：补齐到容量，且前面的字节保持原样。
+if let decoded = TIFFCodec.packBitsDecode(Data([0x02, 7, 8, 9]), capacity: 8) {
+    expect(decoded.count == 8, "不满一块的 PackBits 结果应补齐到容量（实际 \(decoded.count)）")
+    expect(Array(decoded.prefix(3)) == [7, 8, 9], "补齐前应保留解出的字节")
+} else {
+    expect(false, "合法的 PackBits 字面量段应能解出")
+}
+expect(TIFFCodec.packBitsDecode(Data(), capacity: 32) == nil, "空输入应被拒绝")
+expect(TIFFCodec.lzwDecode(Data(), capacity: 32) == nil, "空输入应被拒绝")
+
+// 层级兜底：荒谬的层级不再让 `1 << zoom` 崩。
+expect(SlippyTile(zoom: 99, x: 0, y: 0).zoom == 30, "层级应夹到 30")
+expect(SlippyTile(zoom: -5, x: 0, y: 0).zoom == 0, "层级应夹到 0")
+expect(SlippyTile(zoom: 99, x: 0, y: 0).tileCountAtZoom == 1 << 30, "夹取之后瓦片数应可算")
+
+// 导出转义：CSV 引用规则与 JSON 字符串（今天导出的都是固定文本，靠断言把这条规矩钉住）。
+expect(MeasurementExporter.csvField("普通") == "普通", "CSV 普通字段不加引号")
+expect(MeasurementExporter.csvField("含,逗号") == "\"含,逗号\"", "CSV 含逗号要加引号")
+expect(MeasurementExporter.csvField("含\"引号") == "\"含\"\"引号\"", "CSV 内部引号要翻倍")
+expect(MeasurementExporter.jsonString("含\"引号\\斜杠") == "\"含\\\"引号\\\\斜杠\"", "JSON 要转义引号与反斜杠")
+expect(MeasurementExporter.jsonString("换行\n") == "\"换行\\n\"", "JSON 换行转成 \\n")
+
+/// 写一个「IFD 声称分块是 2³⁰ 见方」的最小 TIFF：只为验证解析阶段会挡掉它。
+func writeMalformedTiledTIFF(to url: URL) {
+    var data = Data()
+    func u16(_ value: UInt16) { withUnsafeBytes(of: value.littleEndian) { data.append(contentsOf: $0) } }
+    func u32(_ value: UInt32) { withUnsafeBytes(of: value.littleEndian) { data.append(contentsOf: $0) } }
+
+    data.append(contentsOf: [0x49, 0x49])   // "II"：小端
+    u16(42)                                  // 经典 TIFF 魔数
+    u32(8)                                   // IFD 在偏移 8
+    let entries: [(UInt16, UInt32)] = [
+        (256, 64),        // ImageWidth
+        (257, 64),        // ImageLength
+        (258, 8),         // BitsPerSample
+        (259, 1),         // Compression = none
+        (262, 1),         // Photometric = BlackIsZero
+        (277, 1),         // SamplesPerPixel
+        (322, 1 << 30),   // TileWidth ← 荒谬
+        (323, 1 << 30),   // TileLength ← 荒谬
+        (324, 8),         // TileOffsets（非空即可）
+        (325, 8),         // TileByteCounts
+    ]
+    u16(UInt16(entries.count))
+    for (tag, value) in entries {
+        u16(tag)
+        u16(4)          // 类型 LONG
+        u32(1)          // 数量 1
+        u32(value)      // 值内联
+    }
+    u32(0)              // 下一个 IFD：没有
+    try? data.write(to: url)
+}
 
 // MARK: - 导出
 
@@ -545,6 +646,59 @@ if let entries = ZIP.parse(workbook) {
 // 少量测量也要能导出（空列表不应崩溃）。
 expect(!MeasurementExporter.excel([]).isEmpty, "空测量列表也应产出可打开的工作簿")
 
+section("ZIP：deflate 压缩与解回")
+
+do {
+    /// 读第一个条目的「压缩方式」字段（本地文件头偏移 8）。
+    func firstEntryMethod(_ data: Data) -> Int {
+        let bytes = [UInt8](data)
+        guard bytes.count > 10 else { return -1 }
+        return Int(bytes[8]) | Int(bytes[9]) << 8
+    }
+
+    // 表格 XML 里成片重复的字段：压完应当明显小一圈。
+    let repetitive = Data(String(repeating: "侧边补测-119.12345678-正射影像-", count: 2000).utf8)
+    let packed = ZIP.stored([("a.xml", repetitive)])
+    let raw = ZIP.stored([("a.xml", repetitive)], compress: false)
+    expect(firstEntryMethod(raw) == 0, "关掉压缩时应写成「存储」方式")
+    expect(firstEntryMethod(packed) == 8, "重复内容应走 deflate（实际方式 \(firstEntryMethod(packed))）")
+    expect(packed.count < raw.count / 2,
+           "重复内容应压到一半以下（\(packed.count) vs \(raw.count) 字节）")
+    if let entries = ZIP.parse(packed) {
+        expect(entries.count == 1 && entries[0].name == "a.xml", "压缩条目应保留文件名")
+        expect(entries[0].data == repetitive, "压缩条目应能逐字节解回")
+    } else {
+        expect(false, "自己压出来的 ZIP 应能自己读回")
+    }
+
+    // 压不动的极小条目要退回「存储」，不能为了走压缩把文件撑大。
+    let tiny = ZIP.stored([("b.txt", Data("abc".utf8))])
+    expect(firstEntryMethod(tiny) == 0, "压不动的极小条目应退回存储方式")
+    if let entries = ZIP.parse(tiny) {
+        expect(entries.first?.data == Data("abc".utf8), "退回存储的条目内容应一致")
+    } else {
+        expect(false, "退回存储的 ZIP 也应能读回")
+    }
+
+    // 压不动的随机内容同样要能原样往返（不能只对「好压的」正确）。
+    var noisy = Data(count: 8 * 1024)
+    var seed: UInt32 = 0x9E37_79B9
+    for index in 0..<noisy.count {
+        seed = seed &* 1_664_525 &+ 1_013_904_223
+        noisy[index] = UInt8((seed >> 16) & 0xFF)
+    }
+    if let entries = ZIP.parse(ZIP.stored([("c.bin", noisy)])) {
+        expect(entries.first?.data == noisy, "随机内容应能原样往返")
+    } else {
+        expect(false, "随机内容的 ZIP 应能读回")
+    }
+
+    // 坏数据不许「读出一个错的还当成功」：把压缩体改一个字节，校验和必须拦住它。
+    var broken = [UInt8](packed)
+    broken[broken.count / 2] ^= 0xFF
+    expect(ZIP.parse(Data(broken)) == nil, "压缩块被改坏后应判为非法，而不是读出错误内容")
+}
+
 // 可选：把样例工作簿写到磁盘，便于用 Excel / Numbers / 脚本复核。
 if let dumpPath = ProcessInfo.processInfo.environment["EUCLID_DUMP_XLSX"] {
     do {
@@ -611,6 +765,102 @@ func datasetCheck(root: URL) {
 /// 打印尺寸、坐标基准、地面分辨率与覆盖范围，再按窗口首屏的样子取几块图，
 /// 并统计首屏耗时（大图没有内建概览时这一步会明显变慢，正好量出来）。
 /// `EUCLID_RASTER_DUMP=<目录>` 时把解出来的瓦片写成 PNG，便于目视核对。
+// MARK: - 影像块缓存的收益实测
+
+/// 量一下「跨瓦片块缓存」在真实影像上的收益（`EUCLID_BENCH_RASTER=1` 且传入影像文件时跑）。
+///
+/// 两个场景，各自比较「每次重铺前清空块缓存」与「缓存热着」两条路：
+/// 1. 一屏瓦片：拖动时一屏要重铺的量；
+/// 2. 连续缩放：同一块影像在相邻层级上被反复取（缩放时最像「边缘一直在加载」的那条路）。
+@MainActor
+func chunkCacheBenchmark(dataset: RasterDataset, source: RasterTileSource) async {
+    section("实测：影像块缓存的收益（\(dataset.name)）")
+    let path = dataset.fileURL.path(percentEncoded: false)
+    let cache = TIFFChunkCache.shared
+    let detailZoom = min(30, max(0, Int(ceil(dataset.maximumDataZoom))))
+    let rect = dataset.worldRect
+
+    func tile(zoom: Int, centerX: Double, centerY: Double) -> SlippyTile {
+        let count = Double(1 << zoom)
+        let limit = (1 << zoom) - 1
+        return SlippyTile(
+            zoom: zoom,
+            x: min(max(Int(centerX * count), 0), limit),
+            y: min(max(Int(centerY * count), 0), limit)
+        )
+    }
+
+    func render(_ tiles: [SlippyTile]) async -> Double {
+        let start = Date()
+        for item in tiles { _ = await source.image(for: item) }
+        return Date().timeIntervalSince(start) * 1000
+    }
+
+    // 场景一：中心往外 4 × 3 块，正好一屏。
+    let centerX = rect.midX, centerY = rect.midY
+    var screen: [SlippyTile] = []
+    for dy in -1...1 {
+        for dx in -2...1 {
+            let count = Double(1 << detailZoom)
+            let limit = (1 << detailZoom) - 1
+            let x = min(max(Int(centerX * count) + dx, 0), limit)
+            let y = min(max(Int(centerY * count) + dy, 0), limit)
+            screen.append(SlippyTile(zoom: detailZoom, x: x, y: y))
+        }
+    }
+    cache.invalidate(path: path)
+    let coldScreen = await render(screen)
+    let warmScreen = await render(screen)
+    print(String(format: "  一屏 %d 张（z%d）：冷 %.0f ms → 热 %.0f ms（%.2f×）",
+                 screen.count, detailZoom, coldScreen, warmScreen, coldScreen / max(warmScreen, 0.001)))
+
+    // 缓存只该省时间，不该换像素：把一屏的内容在「冷 / 热」两条路上各指纹一遍。
+    func fingerprint(_ tiles: [SlippyTile]) async -> UInt64 {
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        for item in tiles {
+            guard let image = await source.image(for: item), let bytes = rgbaBytes(of: image) else {
+                hash = hash &* 31 &+ 0xFFFF
+                continue
+            }
+            for byte in bytes { hash = (hash ^ UInt64(byte)) &* 0x100_0000_01B3 }
+            hash = hash &* 31 &+ UInt64(bytes.count)
+        }
+        return hash
+    }
+    cache.invalidate(path: path)
+    let coldFingerprint = await fingerprint(screen)
+    let warmFingerprint = await fingerprint(screen)
+    expect(coldFingerprint == warmFingerprint,
+           "同一屏在「块缓存冷 / 热」两条路上解出来的像素应完全一致")
+    print(String(format: "  同一屏指纹：冷 %016llx → 热 %016llx", coldFingerprint, warmFingerprint))
+
+    // 场景二：以中心为锚，连续缩放 ±3 级（同一块影像在不同分辨率上被反复取）。
+    let zooms = (-3...3).map { detailZoom + $0 }.filter { (0...30).contains($0) }
+    var zoomTiles: [SlippyTile] = []
+    for zoom in zooms {
+        // 每级都往同一个方向偏一点点（按影像自身尺寸的比例，保证仍然落在影像内），
+        // 模拟「一边缩放一边拖」。
+        zoomTiles.append(tile(
+            zoom: zoom,
+            centerX: centerX + 0.03 * rect.width,
+            centerY: centerY + 0.02 * rect.height
+        ))
+    }
+    var coldZoom = 0.0
+    for item in zoomTiles {
+        cache.invalidate(path: path)
+        coldZoom += await render([item])
+    }
+    _ = await render(zoomTiles)   // 先把缓存烘热，再计时
+    let warmZoom = await render(zoomTiles)
+    print(String(format: "  连续缩放 %d 级：冷 %.0f ms → 热 %.0f ms（%.2f×）",
+                 zoomTiles.count, coldZoom, warmZoom, coldZoom / max(warmZoom, 0.001)))
+
+    let stats = cache.stats()
+    print(String(format: "  块缓存 %d 块 / %.1f MB，命中 %d、未中 %d，句柄 %d 个",
+                 stats.entries, stats.megabytes, stats.hits, stats.misses, stats.readers))
+}
+
 @MainActor
 func rasterCheck(url: URL) async {
     section("单幅影像：\(url.lastPathComponent)")
@@ -714,6 +964,11 @@ func rasterCheck(url: URL) async {
         expect(false, "深缩放瓦片应能取到图（z\(tileZoom)）")
     }
     dump(tileImage, "tile-deep.png")
+
+    // `EUCLID_BENCH_RASTER=1` 时量一下跨瓦片块缓存的收益（要跑很多次取图，默认不开）。
+    if ProcessInfo.processInfo.environment["EUCLID_BENCH_RASTER"] != nil {
+        await chunkCacheBenchmark(dataset: dataset, source: source)
+    }
 
     // `EUCLID_RASTER_PYRAMID=<目录>` 时顺便真生成一套瓦片（用于实测吞吐与产物核对）。
     if let pyramid = ProcessInfo.processInfo.environment["EUCLID_RASTER_PYRAMID"] {
@@ -1512,6 +1767,100 @@ do {
     } else {
         expect(false, "geoTIFF 样本应能打开")
     }
+}
+
+section("影像解码：跨瓦片的块缓存与读句柄池")
+
+do {
+    // 键要同时带上「文件 + 层级 + 块号」：不同影像的 IFD 常常都在同一个偏移、
+    // 块号也都从 0 开始，而内容毫无关系 —— 上面那四个样本正好就是这种情况
+    // （IFD 都在偏移 8、各自的第 0 块内容还不一样），所以那一轮逐点比对
+    // 同时也是「缓存键没漏掉文件」的回归。
+    let sampleKey = TIFFChunkCache.Key(path: "/tmp/a.tif", level: 8, index: 0)
+    expect(sampleKey != TIFFChunkCache.Key(path: "/tmp/b.tif", level: 8, index: 0),
+           "块缓存的键要包含文件路径")
+    expect(sampleKey != TIFFChunkCache.Key(path: "/tmp/a.tif", level: 8, index: 1),
+           "块缓存的键要区分块号")
+    expect(sampleKey != TIFFChunkCache.Key(path: "/tmp/a.tif", level: 16, index: 0),
+           "块缓存的键要区分层级")
+
+    // 同一块区域解两遍：第二遍应当全部命中，不再重新解压。
+    let cache = TIFFChunkCache.shared
+    let url = tiffFixtures.appending(path: "rgba_tile_deflate_p2.tif")
+    if let dataset = try? RasterLoader.load(url: url) {
+        // 前面的小节已经解过这份样本（正好说明缓存跨调用活着），
+        // 这里先把它的块丢掉，从「冷的」开始数一遍。
+        let path = url.path(percentEncoded: false)
+        cache.invalidate(path: path)
+        cache.resetStats()
+        let before = cache.stats()
+        let first = dataset.renderOverview(maxPixelSize: 32)
+        let afterFirst = cache.stats()
+        expect(first != nil, "块缓存样本应能解出")
+        expect(afterFirst.entries > before.entries,
+               "解一遍后块缓存里应有块（\(before.entries) → \(afterFirst.entries)）")
+        expect(afterFirst.bytes > 0, "块缓存应记下字节数（\(afterFirst.bytes)）")
+        expect(afterFirst.misses > 0, "第一遍解应当计成「未命中」")
+
+        let second = dataset.renderOverview(maxPixelSize: 32)
+        let afterSecond = cache.stats()
+        expect(afterSecond.hits > afterFirst.hits,
+               "第二遍解同一区域应命中缓存（命中 \(afterFirst.hits) → \(afterSecond.hits)）")
+        expect(afterSecond.entries == afterFirst.entries, "命中不该再往缓存里加块")
+        if let first, let second,
+           let firstBytes = rgbaBytes(of: first), let secondBytes = rgbaBytes(of: second) {
+            expect(firstBytes == secondBytes, "走缓存解出来的像素应与第一遍完全一致")
+        } else {
+            expect(false, "两遍都应能取出像素")
+        }
+    } else {
+        expect(false, "块缓存自检用的样本应能打开")
+    }
+
+    // 容量与淘汰：用一个小容量实例，别去动全局那份。
+    let small = TIFFChunkCache(byteLimit: 16 * 1024, countLimit: 3, readerLimit: 1)
+    for index in 0..<6 {
+        small.store(
+            pixels: [UInt8](repeating: UInt8(index), count: 4096),
+            for: TIFFChunkCache.Key(path: "/tmp/s.tif", level: 8, index: index)
+        )
+    }
+    expect(small.stats().entries == 3, "块数上限应生效（实际 \(small.stats().entries)）")
+    expect(small.stats().bytes == 3 * 4096, "淘汰后字节数应跟着减（实际 \(small.stats().bytes)）")
+    expect(small.pixels(for: TIFFChunkCache.Key(path: "/tmp/s.tif", level: 8, index: 5)) != nil,
+           "最后放进来的块应还在")
+    expect(small.pixels(for: TIFFChunkCache.Key(path: "/tmp/s.tif", level: 8, index: 0)) == nil,
+           "最早的块应已被淘汰")
+    // 比整个缓存还大的一块不缓存：存进去只会把别的块全挤掉。
+    small.store(
+        pixels: [UInt8](repeating: 1, count: 64 * 1024),
+        for: TIFFChunkCache.Key(path: "/tmp/s.tif", level: 8, index: 99)
+    )
+    expect(small.pixels(for: TIFFChunkCache.Key(path: "/tmp/s.tif", level: 8, index: 99)) == nil,
+           "超过容量的单块不应进缓存")
+    small.trim(toFraction: 0)
+    expect(small.stats().entries == 1, "收缩到 0 应只剩最后一块（实际 \(small.stats().entries)）")
+
+    // 句柄池：同一个文件借两次拿到同一个句柄；正在用的时候不关，归还之后才关。
+    let pool = TIFFChunkCache(byteLimit: 64 * 1024, countLimit: 8, readerLimit: 2)
+    let readerURL = tiffFixtures.appending(path: "rgba_strip_lzw.tif")
+    do {
+        let borrow = try pool.acquireReader(url: readerURL)
+        expect(pool.stats().readers == 1, "借出后池里应有一个句柄")
+        expect(borrow.reader.read(offset: 0, count: 8)?.count == 8, "池里的句柄应能正常读文件头")
+        do {
+            let again = try pool.acquireReader(url: readerURL)
+            expect(borrow.reader === again.reader, "同一个文件的句柄应当复用")
+        }
+        expect(pool.stats().readers == 1, "归还后句柄仍留在池里等复用")
+        pool.invalidate(path: readerURL.path(percentEncoded: false))
+        expect(pool.stats().readers == 1, "还有人在用的时候不能把句柄关掉")
+    } catch {
+        expect(false, "句柄池自检不该抛错：\(error)")
+    }
+    expect(pool.stats().readers == 0, "最后一个借用者归还后，失效的句柄应当真的关掉")
+    expect(pool.pixels(for: TIFFChunkCache.Key(path: readerURL.path(percentEncoded: false), level: 8, index: 0)) == nil,
+           "失效后该文件的块也应丢掉")
 }
 
 section("单幅影像：投影换算（对照 PROJ 9.7）")

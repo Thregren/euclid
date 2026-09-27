@@ -44,6 +44,8 @@ final class TileLayerStack {
     var datum: Datum = .wgs84
 
     private var provider: TileProvider?
+    /// 这一层的瓦片缓存上限（字节），内存压力下按比例裁剪用。
+    private var cacheLimitBytes = 0
     private var baseTileSize: Double = 512
     /// 在线底图按「一张瓦片铺满它的像素数」显示，相机里的边长要跟着设备像素比走。
     private var tileSizeFollowsDisplayScale = false
@@ -65,10 +67,22 @@ final class TileLayerStack {
     /// 少了它，`applyFallbackImages` 的失败分支会一轮接一轮地重新找祖先，
     /// 渲染就变成停不下来的空转：打开数据集时（相机还停在数据之外）每秒能跑两百多轮。
     private var unresolvedTiles: Set<SlippyTile> = []
+    /// 确认缺片的格子最多记这么多。
+    ///
+    /// 这个集合只增不减：在稀疏数据（或数据范围外）来回平移会一直往里塞，虽然只占内存、
+    /// 不影响速度，但一次跑一整天能涨到几十万条。超过上限就整个清掉 —— 代价只是把
+    /// 已经在屏幕外的那些缺片重新探一遍（负缓存丢了不影响正确性）。
+    private static let missingTileLimit = 20_000
     /// 已经排队等下一帧补请求的标记，避免同一帧重复调度。
     private var refillScheduled = false
     /// 上一次预取的「层级 + 视野范围」，用来避免重复预取同一圈。
     private var lastPrefetchKey = ""
+    /// 上一次取图用的「层级 + 视野范围」。
+    ///
+    /// 视野外那一圈只在**视野真的移动了**之后才跟着一起取：瓦片陆续到位时的补跑（refill）
+    /// 只补视野内的片子。否则一路拖到数据外面（或稀疏区）时，每补一片就再探一圈空地，
+    /// 几百个必然落空的请求会把主线程拖住 —— 这正是「边缘加载」最难看的那种卡。
+    private var lastLoadKey = ""
     private var generation = 0
 
     /// 单帧最多渲染的瓦片数量，作为异常情况下的安全阀。
@@ -76,8 +90,14 @@ final class TileLayerStack {
     /// 同时在途的取图任务上限（解码并发由 `TileProvider` 另有限制）。
     /// Retina 上一个整数层级要多铺 4 倍瓦片，这里放宽一点，首屏更快铺满。
     private let maximumConcurrentRequests = 32
-    /// 单次预取的瓦片上限。
-    private static let prefetchLimit = 24
+    /// 单次预取的瓦片上限（视野外半屏那一圈，宽屏时能到两百来片）。
+    private static let prefetchLimit = 256
+    /// 取图时视野外那几圈的上限：拖动时多取的就是它，得有上限，不然拖到数据外面会白探一大片。
+    private static let surroundingTileLimit = 96
+    /// 铺图时视野外也铺两圈（见 `sync` 里的说明）。
+    private static let layoutMarginTiles = 2
+    /// 铺图这一圈的上限。
+    private static let layoutRingLimit = 192
     /// 祖先层级最多回溯几级。数值越大，稀疏数据越不容易露白，但请求也越多。
     private static let maximumFallbackLevels = 4
     /// 同时在找祖先贴图的格子数量上限，避免一屏几十个空格同时发起请求。
@@ -114,6 +134,7 @@ final class TileLayerStack {
             memoryLimitBytes: memoryLimitBytes,
             maxConcurrentDecodes: maxConcurrentRequests
         )
+        cacheLimitBytes = memoryLimitBytes
         self.name = name
         baseTileSize = Double(max(1, tileSize))
         tileSizeFollowsDisplayScale = followsDisplayScale
@@ -165,6 +186,7 @@ final class TileLayerStack {
         unresolvedTiles.removeAll()
         missingTiles.removeAll()
         lastPrefetchKey = ""
+        lastLoadKey = ""
         gridLayer.isHidden = true
         gridLayer.path = nil
     }
@@ -229,8 +251,23 @@ final class TileLayerStack {
 
         // 换层级时把即将摘掉的图层图片先接过来，作为新瓦片的**同帧**兜底。
         // 否则新图层会先闪一帧占位色，等磁盘读完才出图 —— 连续缩放时看着就是「一闪一闪」。
+        //
+        // 另外多铺一圈（`layoutMarginTiles`）：手势期间画面靠 `hostLayer.transform` 整体位移，
+        // 而布局只在「位移攒够 120 点」时才重做 —— 不多铺这一圈的话，这段还没提交的位移
+        // 在画面边缘就会先露出底色，等下一次提交才补上，看着就是「边缘一直在加载」。
+        // 这一圈不进 `needed`（读数、兜底、缺片统计仍只算视野内），只多几个图层而已。
+        let layoutRing = surroundingTiles(
+            zoom: zoom,
+            columns: columns,
+            rows: rows,
+            margin: Self.layoutMarginTiles,
+            limit: Self.layoutRingLimit,
+            excluding: needed
+        )
+        let laidOut = layoutRing.isEmpty ? needed : needed.union(layoutRing)
+
         var recycledImages: [SlippyTile: CGImage] = [:]
-        for (tile, layer) in tileLayers where !needed.contains(tile) {
+        for (tile, layer) in tileLayers where !laidOut.contains(tile) {
             if let image = Self.contentsImage(of: layer) {
                 recycledImages[tile] = image
             }
@@ -240,7 +277,7 @@ final class TileLayerStack {
             fallbackTasks.remove(tile)
         }
 
-        for tile in needed {
+        for tile in laidOut {
             let worldX = Double(tile.x) / Double(1 << zoom)
             let worldY = Double(tile.y) / Double(1 << zoom)
             // 图形本身按偏移后的位置落位，于是该基准的栅格与工作基准的坐标对齐。
@@ -286,20 +323,44 @@ final class TileLayerStack {
         // 快速拖动时每次提交都会掀起一波请求，画面就开始一顿一顿。
         // 手停下来那一次（loadsTiles = true）才真正去取。
         if loadsTiles {
-            requestMissingTiles(needed: needed, provider: provider)
+            // 视野外再取一圈：拖动时新露出来的那一圈不该等到手停下来才有图。
+            // 取图按「离视野中心远近」排序，所以这一圈自然排在视野内那些之后，不抢它们的额度。
+            let loadKey = "\(zoom):\(columns.lowerBound)-\(columns.upperBound):\(rows.lowerBound)-\(rows.upperBound)"
+            let includesSurroundings = loadKey != lastLoadKey
+            lastLoadKey = loadKey
+            requestMissingTiles(
+                needed: includesSurroundings
+                    ? needed.union(surroundingTiles(
+                        zoom: zoom,
+                        columns: columns,
+                        rows: rows,
+                        margin: outwardMarginTiles,
+                        limit: Self.surroundingTileLimit,
+                        excluding: needed
+                    ))
+                    : needed,
+                provider: provider
+            )
             applyFallbackImages(needed: needed, provider: provider)
         }
         updateBackdropFrames(camera: camera, offset: offset)
         dropBackdropIfSettled(needed: needed)
         renderGrid(camera: rangeCamera, offset: offset, zoom: zoom, visible: showGrid)
 
+        // 读数只算视野内的那一批（铺图多铺的那一圈不进读数）。
+        let loadedVisible = needed.filter { layerImageSource[$0] == $0 }.count
+        let fallbackVisible = needed.filter { tile in
+            guard let source = layerImageSource[tile] else { return false }
+            return source != tile
+        }.count
+        let missingVisible = needed.filter { missingTiles.contains($0) }.count
         let frame = TileLayerFrame(
             name: name,
             zoom: zoom,
             needed: needed.count,
-            loaded: layerImageSource.filter { $0.key == $0.value }.count,
-            fallback: layerImageSource.count - layerImageSource.filter { $0.key == $0.value }.count,
-            missing: missingTiles.count,
+            loaded: loadedVisible,
+            fallback: fallbackVisible,
+            missing: missingVisible,
             tileDisplaySize: tileDisplaySize,
             datumOffsetMeters: datumOffsetMeters(for: camera, offset: offset)
         )
@@ -364,6 +425,9 @@ final class TileLayerStack {
                 guard self.generation == currentGeneration else { return }
                 self.tileTasks[tile] = nil
                 guard let image else {
+                    if self.missingTiles.count >= Self.missingTileLimit {
+                        self.missingTiles.removeAll(keepingCapacity: true)
+                    }
                     self.missingTiles.insert(tile)
                     self.scheduleRefill()
                     return
@@ -371,7 +435,8 @@ final class TileLayerStack {
                 if let layer = self.tileLayers[tile] {
                     // 首次出现也做一次很短的淡入：瓦片是按解码完成的先后落下来的，
                     // 硬贴上去就是一块块「啪」地跳出来，一屏几十块看着就是闪。
-                    self.install(image, in: layer, source: tile, for: tile, animated: true)
+                    // 但拖动 / 缩放当中不淡入：那会儿图上一直在动，淡入看着就像边缘在「加载」。
+                    self.install(image, in: layer, source: tile, for: tile, animated: !self.isInteracting)
                 }
                 // 并发额度腾出来了，把这一帧没排上队的瓦片接着取。
                 self.scheduleRefill()
@@ -569,15 +634,59 @@ final class TileLayerStack {
 
     // MARK: - 预取与网格
 
+    /// 视野外一圈一圈往外扩的瓦片（不含视野内已有的那些）。
+    ///
+    /// 拖动时新露出来的边正好落在这一圈里：把它们跟视野内的瓦片一起取，
+    /// 手一直在动的时候边上也有图，而不是等松手才一片片补上来。
+    ///
+    /// 从里往外一圈一圈取、取够 `limit` 就停：这样「离视野越近越先取」是天然的，
+    /// 也保证了一次手势最多只会多探这么多片（拖到数据外面时这些请求都会落空，得有上限）。
+    private func surroundingTiles(
+        zoom: Int,
+        columns: ClosedRange<Int>,
+        rows: ClosedRange<Int>,
+        margin: Int,
+        limit: Int,
+        excluding visible: Set<SlippyTile>
+    ) -> [SlippyTile] {
+        guard margin > 0, limit > 0 else { return [] }
+        let maximum = (1 << zoom) - 1
+        var seen = Set<SlippyTile>()
+        var result: [SlippyTile] = []
+        for step in 1...margin {
+            let stepColumns = (columns.lowerBound - step)...(columns.upperBound + step)
+            let stepRows = (rows.lowerBound - step)...(rows.upperBound + step)
+            ring: for row in stepRows {
+                for column in stepColumns {
+                    if result.count >= limit { break ring }
+                    // 只取这一圈的边：里面几圈上一轮已经取过了。
+                    let onEdge = row == stepRows.lowerBound || row == stepRows.upperBound
+                        || column == stepColumns.lowerBound || column == stepColumns.upperBound
+                    guard onEdge else { continue }
+                    guard (0...maximum).contains(column), (0...maximum).contains(row) else { continue }
+                    let tile = SlippyTile(zoom: zoom, x: column, y: row)
+                    guard !visible.contains(tile) else { continue }
+                    guard seen.insert(tile).inserted else { continue }
+                    result.append(tile)
+                }
+            }
+            if result.count >= limit { break }
+        }
+        return result
+    }
+
     /// 预取视野外一圈的瓦片，让接下来的平移不必再等磁盘或网络。
     ///
-    /// 只在当前视野已经没有待取瓦片时做（不跟首屏抢并发额度），
+    /// 范围是「半屏、至少两格」：一次甩动大致就是半屏，正好盖住。
+    /// 只在当前视野没有在途取图时做（不跟首屏抢并发额度），
     /// 并用「层级 + 视野行列范围」当键，视野没动就不重复预取。
     private func prefetchSurroundingTiles(camera: MapCamera, needed: Set<SlippyTile>) {
         guard let provider else { return }
         guard !defersBackgroundWork else { return }
+        // 「视野内都在途了」就够：不必等每一片都落屏 —— 拖动中间也要能把这一圈补上，
+        // 否则就成了「手一停才补、手一动又露白」。
         let settled = needed.allSatisfy { tile in
-            layerImageSource[tile] == tile || missingTiles.contains(tile) || unresolvedTiles.contains(tile)
+            layerImageSource[tile] == tile || tileTasks[tile] == nil
         }
         guard settled else { return }
 
@@ -588,21 +697,20 @@ final class TileLayerStack {
         guard key != lastPrefetchKey else { return }
         lastPrefetchKey = key
 
-        let maximumIndex = (1 << zoom) - 1
-        var ring: [SlippyTile] = []
-        for row in (rows.lowerBound - 1)...(rows.upperBound + 1) {
-            for column in (columns.lowerBound - 1)...(columns.upperBound + 1) {
-                guard (0...maximumIndex).contains(column), (0...maximumIndex).contains(row) else { continue }
-                let tile = SlippyTile(zoom: zoom, x: column, y: row)
-                guard !needed.contains(tile) else { continue }
-                ring.append(tile)
-            }
-        }
+        // 半屏（至少两格）：视野 6×4 时往外各 3 格，正好顶住一次半屏的甩动。
+        let margin = max(2, Int((Double(max(columns.count, rows.count)) * 0.5).rounded(.up)))
+        let ring = surroundingTiles(
+            zoom: zoom,
+            columns: columns,
+            rows: rows,
+            margin: margin,
+            limit: Self.prefetchLimit,
+            excluding: needed
+        )
         guard !ring.isEmpty else { return }
 
-        let batch = Array(ring.prefix(Self.prefetchLimit))
         Task.detached(priority: .utility) {
-            await provider.prefetch(batch)
+            await provider.prefetch(ring)
         }
     }
 
@@ -651,11 +759,34 @@ final class TileLayerStack {
     /// 补跑同步的回调（画布注入）。
     var needsSync: (() -> Void)?
 
+    /// 把这一层的瓦片缓存压到上限的给定比例（内存压力下由画布统一调用）。
+    func trimCache(toFraction fraction: Double) {
+        guard let provider, cacheLimitBytes > 0 else { return }
+        let target = Int(Double(cacheLimitBytes) * min(max(fraction, 0), 1))
+        Task { await provider.trimCache(keepingBytes: target) }
+    }
+
+    /// 调试用：这一层缓存了多少片、多少字节。
+    func cacheStats() async -> (tiles: Int, bytes: Int)? {
+        await provider?.cacheStats
+    }
+
     /// 更新排序基准（画布在同步前调用）。
     func updateSortCenter(_ center: CGPoint) { cameraCenter = center }
 
-    /// 手势进行中：先不做预取这类后台活，等手停下来再补（见 `TileCanvasNSView` 的平移快路径）。
+    /// 正在拖窗口改大小：先不做预取这类后台活，等拖完再补（见 `TileCanvasNSView` 的 live resize 处理）。
     var defersBackgroundWork = false
+
+    /// 手势（拖动 / 缩放）进行中。
+    ///
+    /// 拖动时视野外多取一圈：新露出来的边要是还得等，就成了「手一动边上就白、手一停才补上」，
+    /// 看着像边缘一直在加载。这一圈跟视野内的瓦片一起排队（按离视野中心的远近排序），
+    /// 所以不会抢视野内的额度；同时新到的图不做淡入 —— 拖动中淡入本身也像在「加载」。
+    var isInteracting = false
+
+    /// 视野外再取几格：拖动时多取两圈（按每秒两千点的手速，约等于大半秒的提前量），
+    /// 停下后回到一格（更外面那半屏由预取负责）。
+    private var outwardMarginTiles: Int { isInteracting ? 3 : 1 }
 
     /// 累计发起的取图次数（含祖先兜底与预取），只用于调试统计：
     /// `EUCLID_TRACE_SCROLL=1` 时会在手势结束时打出「这次手势取了多少片」。

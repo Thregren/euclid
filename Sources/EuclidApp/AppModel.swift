@@ -84,7 +84,22 @@ final class CanvasController {
     func attach(_ view: TileCanvasNSView) {
         self.view = view
         view.measurementStore = measurements
+        view.areaUnit = areaUnit
+        view.onDeleteLayer = onDeleteLayer
         pending?()
+    }
+
+    /// 面积显示单位：界面改了要同步到画布上的面积标注。
+    ///
+    /// 注意这里自己存一份：设置可能发生在画布视图建好之前（比如启动时读设置），
+    /// 只往 view 上写一次会丢。
+    var areaUnit: MeasureFormat.AreaUnit = .automatic {
+        didSet { view?.areaUnit = areaUnit }
+    }
+
+    /// 退格 / 前向删除的落点：画布监听键盘，模型决定「要不要删掉选中的图层」。
+    var onDeleteLayer: (() -> Bool)? {
+        didSet { view?.onDeleteLayer = onDeleteLayer }
     }
 
     private weak var measurements: MeasurementStore?
@@ -110,6 +125,20 @@ final class CanvasController {
 
     func setTileGrid(_ isVisible: Bool) {
         view?.showTileGrid = isVisible
+    }
+
+    /// 调试用：各层瓦片缓存的摘要（`EUCLID_DEBUG_MEMORY=1` 定期打印）。
+    func cacheSummary() async -> String {
+        guard let view else { return "画布未就绪" }
+        return await view.debugCacheSummary()
+    }
+
+    /// 内存压力下把各层瓦片缓存压小（比例 0…1）。
+    func trimTileCaches(toFraction fraction: Double) {
+        view?.trimTileCaches(toFraction: fraction)
+        // 影像的「解好的块」缓存也一起压：它虽然小（几十 MB），
+        // 但正好是能立刻还回去、又只影响一次解码的那部分。
+        RasterCache.trim(toFraction: fraction)
     }
 
     func fit(to worldRect: CGRect) { view?.fitToWorldRect(worldRect) }
@@ -155,6 +184,32 @@ final class AppModel {
     var recentFolders: [URL] = []
 
     var showInspector = true
+    /// 左侧「图层」浮窗是否显示（与右侧检查器同款开关，工具栏与「视图」菜单都能切）。
+    var showLayers = true
+    /// 面积显示单位（自动 / m² / 公顷 / km² / 亩）—— 只影响界面显示，存档与导出始终是平方米。
+    var areaUnit: MeasureFormat.AreaUnit = .automatic {
+        didSet {
+            guard areaUnit != oldValue else { return }
+            UserDefaults.standard.set(areaUnit.rawValue, forKey: Self.areaUnitKey)
+            canvas.areaUnit = areaUnit
+        }
+    }
+    static let areaUnitKey = "areaUnit"
+    /// 无人值守的调试 / 自检运行（任何 `EUCLID_*` 环境变量都算）。
+    ///
+    /// 这些脚本会真的落点、清空、再读回，跑一遍就会往用户的自动存档里塞测试数据
+    /// （本机踩过一次：自检脚本的两条测试点被写进了福清那份存档）。因此自动化运行
+    /// 一律不写自动存档 —— 调试要的东西由脚本自己指定的文件装。
+    static let isAutomatedRun = ProcessInfo.processInfo.environment.keys
+        .contains { $0.hasPrefix("EUCLID_") }
+
+    /// 这次运行要不要**跳过**自动存档的写入。
+    ///
+    /// 默认：自动化 / 调试运行（任何 `EUCLID_*`）都不写，避免自检把用户的存档覆盖掉。
+    /// 例外：`EUCLID_DEBUG_ARCHIVE_WRITE=1` 显式打开写入 —— 只给「验证写盘这条路还通」用，
+    /// 配套做法是跑在临时 `HOME` 下，别真写到用户的存档上。
+    static let skipsArchiveWrites = isAutomatedRun
+        && ProcessInfo.processInfo.environment["EUCLID_DEBUG_ARCHIVE_WRITE"] == nil
     var showTileGrid = false {
         didSet { canvas.setTileGrid(showTileGrid) }
     }
@@ -227,6 +282,9 @@ final class AppModel {
     /// 启动时待打开的数据集目录。真正的扫描延后到窗口出现之后，避免在 App 初始化阶段触发状态变化。
     var initialURL: URL?
 
+    /// 内存压力监听：系统发警告时把瓦片缓存压小（见 `installMemoryPressureMonitor`）。
+    private var memoryPressureSource: DispatchSourceMemoryPressure?
+
     init() {
         canvas.bind(measurements: measurements)
         download.onStatus = { [weak self] message in
@@ -242,11 +300,51 @@ final class AppModel {
         measurements.onChange = { [weak self] in
             self?.scheduleArchiveSave()
         }
+        // ⌫ / ⌦：图层面板开着、且没在画测量时，删掉选中的图层（画布那边统一监听键盘）。
+        canvas.onDeleteLayer = { [weak self] in
+            self?.deleteSelectedLayerFromKeyboard() ?? false
+        }
         recentFolders = Self.loadRecentFolders()
+        // 面积单位跟着上次的选择（读的时候不走 didSet，别回头再写一遍）。
+        if let raw = UserDefaults.standard.string(forKey: Self.areaUnitKey),
+           let saved = MeasureFormat.AreaUnit(rawValue: raw) {
+            areaUnit = saved
+        }
+        // 调试开关：无人值守截图时把面积单位与两个面板的显示状态固定下来。
+        if let raw = ProcessInfo.processInfo.environment["EUCLID_DEBUG_AREA_UNIT"],
+           let debugUnit = MeasureFormat.AreaUnit(rawValue: raw) {
+            areaUnit = debugUnit
+        }
+        if ProcessInfo.processInfo.environment["EUCLID_DEBUG_HIDE_LAYERS"] != nil {
+            showLayers = false
+        }
         if let saved = UserDefaults.standard.string(forKey: "lastRootFolder"),
            FileManager.default.fileExists(atPath: saved) {
             initialURL = URL(fileURLWithPath: saved)
         }
+        installMemoryPressureMonitor()
+    }
+
+    /// 系统报内存紧张时，把各层的瓦片缓存压到上限的一半（严重时压到四分之一）。
+    ///
+    /// 缓存本身有上限，但「上限之和」在内存小的机器上仍然偏大；被系统警告之后再清，
+    /// 比等到换页抖动好。只丢最久没用到的瓦片，正在看的那一屏不受影响。
+    private func installMemoryPressureMonitor() {
+        let source = DispatchSource.makeMemoryPressureSource(
+            eventMask: [.warning, .critical],
+            queue: .main
+        )
+        source.setEventHandler { [weak self] in
+            guard let self, let source = self.memoryPressureSource else { return }
+            let critical = source.data.contains(.critical)
+            self.canvas.trimTileCaches(toFraction: critical ? 0.25 : 0.5)
+            self.setStatus(
+                critical ? "内存紧张：已清掉大部分瓦片缓存" : "内存偏紧：已清掉一部分瓦片缓存",
+                autoClearAfter: 6
+            )
+        }
+        source.resume()
+        memoryPressureSource = source
     }
 
     static func loadRecentFolders() -> [URL] {
@@ -273,16 +371,20 @@ final class AppModel {
     // MARK: - 测量存档
 
     private func scheduleArchiveSave() {
-        // 调试用的示例测量（EUCLID_DEMO_MEASUREMENT）只是铺上去截图核对的，
-        // 不能写进存档：那会覆盖掉用户自己量的结果。
-        guard !DebugFixtures.isEnabled else { return }
+        // 无人值守的调试 / 自检运行会真的落点、清空、再读回，**一律不写**用户的自动存档；
+        // 演示样本（EUCLID_DEMO_MEASUREMENT）同理。这条守卫必须留在唯一的那条写盘入口上。
+        guard !DebugFixtures.isEnabled, !Self.skipsArchiveWrites else { return }
         guard let path = selectedSourcePath else { return }
         let snapshot = measurements.measurements
         archiveTask?.cancel()
         archiveTask = Task {
             try? await Task.sleep(for: .seconds(0.8))
             guard !Task.isCancelled else { return }
-            MeasurementArchive.save(snapshot, for: path)
+            // 编解码与写盘在存档 actor 上做（不在主线程）；失败时在状态栏说一句，
+            // 而不是像以前那样把错误吞掉 —— 自动存档失败等于用户的测量悄悄丢了。
+            if let failure = await MeasurementArchive.shared.save(snapshot, for: path) {
+                setStatus(failure, autoClearAfter: 10)
+            }
         }
     }
 
@@ -340,4 +442,3 @@ final class AppModel {
 
 
 }
-

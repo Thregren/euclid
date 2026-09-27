@@ -52,7 +52,10 @@ enum ViewExporter {
     }
 
     /// 导出成 PNG 数据。
-    static func pngData(_ image: CGImage) -> Data? {
+    ///
+    /// `nonisolated`：这一步是纯 ImageIO 编码，一屏 Retina 图要几十毫秒，
+    /// 调用方会把它丢到后台任务里做（见 `AppModel.viewImageData`）。
+    nonisolated static func pngData(_ image: CGImage) -> Data? {
         let data = NSMutableData()
         guard let destination = CGImageDestinationCreateWithData(
             data, "public.png" as CFString, 1, nil

@@ -450,7 +450,7 @@ public struct RasterTileSource: TileImageSource {
         )
 
         var canvas = [UInt8](repeating: 0, count: tileSize * tileSize * 4)
-        if ProcessInfo.processInfo.environment["EUCLID_RASTER_TRACE"] != nil {
+        if TileKitTrace.raster {
             let line = String(
                 format: "[raster] 瓦片 %@ 世界=(%.8f,%.8f) 影像世界=(%.8f,%.8f,%.2e,%.2e) "
                     + "像素矩形=(%.1f,%.1f,%.1f,%.1f) 层级=%d×%d 源=(%.1f,%.1f,%.1f,%.1f)\n",
@@ -539,31 +539,62 @@ public struct RasterTileSource: TileImageSource {
 /// 因此缓存大小与影像有多大无关。
 final class TIFFFileCache: @unchecked Sendable {
     static let shared = TIFFFileCache()
+
+    /// 一份文件的「时间戳 + 大小」，用来发现文件被外部换掉了。
+    private struct Stamp: Equatable {
+        var modifiedAt: Date?
+        var size: Int
+    }
+
+    private struct Entry {
+        var file: TIFFFile
+        var stamp: Stamp
+    }
+
     private let lock = NSLock()
-    private var files: [String: TIFFFile] = [:]
+    private var files: [String: Entry] = [:]
     private var order: [String] = []
     private let limit = 4
+    /// 检查文件是否被改过的最短间隔：每块瓦片都 stat 一次太浪费，一秒一次足够。
+    private var lastStampCheck = Date.distantPast
+    private let stampCheckInterval: TimeInterval = 1
 
     func file(for url: URL) -> TIFFFile? {
         let key = url.path(percentEncoded: false)
+        let now = Date()
+        let shouldCheckStamp = now.timeIntervalSince(lastStampCheck) >= stampCheckInterval
+        let stamp = shouldCheckStamp ? Self.stamp(of: url) : nil
+
         lock.lock()
         if let cached = files[key] {
+            // 文件没被改过（或者这次还没到该检查的时候）就直接用解析结果；
+            // 改过就丢掉重解析 —— 否则用户重新导出一份同名影像，界面还按旧结构解码。
+            if stamp == nil || cached.stamp == stamp {
+                lock.unlock()
+                return cached.file
+            }
+            files.removeValue(forKey: key)
+            order.removeAll { $0 == key }
             lock.unlock()
-            return cached
+            // 文件被换掉了：结构要重解析，已经解出来的块也不能再用（尺寸/分块都可能变了）。
+            TIFFChunkCache.shared.invalidate(path: key)
+        } else {
+            lock.unlock()
         }
-        lock.unlock()
+        if shouldCheckStamp { lastStampCheck = now }
 
-        guard let file = try? TIFFReader.parse(url: url) else { return nil }
+        guard let parsed = try? TIFFReader.parse(url: url) else { return nil }
+        let entry = Entry(file: parsed, stamp: stamp ?? Self.stamp(of: url))
         lock.lock()
         if files[key] == nil {
-            files[key] = file
+            files[key] = entry
             order.append(key)
             while order.count > limit {
                 files.removeValue(forKey: order.removeFirst())
             }
         }
         lock.unlock()
-        return file
+        return parsed
     }
 
     /// 丢弃某个文件的解析结果（文件被外部改动后用）。
@@ -573,6 +604,12 @@ final class TIFFFileCache: @unchecked Sendable {
         files.removeValue(forKey: key)
         order.removeAll { $0 == key }
         lock.unlock()
+        TIFFChunkCache.shared.invalidate(path: key)
+    }
+
+    private static func stamp(of url: URL) -> Stamp {
+        let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+        return Stamp(modifiedAt: values?.contentModificationDate, size: values?.fileSize ?? -1)
     }
 }
 

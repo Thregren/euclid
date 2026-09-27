@@ -53,10 +53,17 @@ enum TIFFDecoder {
         guard level.chunkWidth > 0, level.chunkHeight > 0, !level.chunks.isEmpty else {
             throw TIFFError.decodeFailed("没有可读的数据块")
         }
+        // 再兜一道底：解析时已经校验过分块尺寸（`TIFFLimits`），
+        // 但这里直接按它申请缓冲区，值得再确认一次（外部改过元数据 / 将来新增解析路径）。
+        guard TIFFLimits.isSaneChunk(width: level.chunkWidth, height: level.chunkHeight) else {
+            throw TIFFError.unsupported("分块尺寸不可信（\(level.chunkWidth) × \(level.chunkHeight)）")
+        }
 
-        let reader = try TIFFSourceFile(url: file.url)
-        defer { reader.close() }
-        let store = ChunkStore(reader: reader, file: file, level: level)
+        // 句柄走池子（借用凭据交给 store 持有，直到这一屏解完才还回去），
+        // 解出来的块走跨瓦片缓存 —— 相邻瓦片、连续缩放都吃同一份数据，
+        // 一个块只解一次。
+        let lease = try TIFFChunkCache.shared.acquireReader(url: file.url)
+        let store = ChunkStore(lease: lease, file: file, level: level)
 
         let destinationWidth = max(1.0, destination.width)
         let destinationHeight = max(1.0, destination.height)
@@ -119,21 +126,22 @@ enum TIFFDecoder {
 
 /// 数据块的解码缓存：同一块会被相邻的若干目标像素反复取到。
 private final class ChunkStore {
-    private let reader: TIFFSourceFile
+    /// 借用凭据（而不是句柄本身）：只要这个 store 还活着，池子就不会关掉它的句柄。
+    private let lease: TIFFReaderLease
+    private var reader: TIFFSourceFile { lease.reader }
     private let file: TIFFFile
     private let level: TIFFImageFileDirectory
-    private var cache: [Int: [UInt8]] = [:]
-    private var order: [Int] = []
-    private let limit = 24
+    private let path: String
     /// 上一次取到的块。相邻采样点几乎总是落在同一块里，
     /// 记一份就能把「每个采样点查一次字典」降到一次整数比较。
     private var lastIndex = -1
     private var lastPixels: [UInt8] = []
 
-    init(reader: TIFFSourceFile, file: TIFFFile, level: TIFFImageFileDirectory) {
-        self.reader = reader
+    init(lease: TIFFReaderLease, file: TIFFFile, level: TIFFImageFileDirectory) {
+        self.lease = lease
         self.file = file
         self.level = level
+        self.path = file.url.path(percentEncoded: false)
     }
 
     /// 取某个源像素的 RGBA；越界返回 nil。
@@ -160,13 +168,11 @@ private final class ChunkStore {
     }
 
     private func chunkPixels(_ index: Int) throws -> [UInt8] {
-        if let cached = cache[index] { return cached }
+        // 跨瓦片缓存：这一块在别的瓦片 / 上一次缩放里已经解过就直接拿。
+        let key = TIFFChunkCache.Key(path: path, level: level.offset, index: index)
+        if let cached = TIFFChunkCache.shared.pixels(for: key) { return cached }
         let pixels = try decodeChunk(index)
-        cache[index] = pixels
-        order.append(index)
-        while order.count > limit {
-            cache.removeValue(forKey: order.removeFirst())
-        }
+        TIFFChunkCache.shared.store(pixels: pixels, for: key)
         return pixels
     }
 
@@ -275,7 +281,11 @@ private final class ChunkStore {
 }
 
 /// 压缩与颜色转换的纯函数部分。
-enum TIFFCodec {
+/// 压缩与颜色转换的纯函数部分。
+///
+/// `package` 是为了让同包的自检程序（`TileKitCheck`）能直接喂损坏数据进来 ——
+/// 「截断的块不许崩」这类断言只能在编解码器这一层做。
+package enum TIFFCodec {
     /// TIFF 的 Deflate 解压。
     ///
     /// 规范里 TIFF 的 Deflate 是 zlib 包装（RFC 1950：2 字节头 + 裸 deflate + 4 字节 Adler-32），
@@ -313,7 +323,7 @@ enum TIFFCodec {
                 )
             }
         }
-        if written == 0, ProcessInfo.processInfo.environment["EUCLID_TIFF_TRACE"] != nil {
+        if written == 0, TileKitTrace.tiff {
             FileHandle.standardError.write(Data(
                 "[tiff-probe] inflate 失败：读到 \(data.count) 字节，期望容量 \(capacity)，头 4 字节 "
                     .appending(data.prefix(4).map { String(format: "%02x", $0) }.joined())
@@ -322,7 +332,7 @@ enum TIFFCodec {
             return nil
         }
         guard written > 0 else { return nil }
-        if written != capacity, ProcessInfo.processInfo.environment["EUCLID_RASTER_TRACE"] != nil {
+        if written != capacity, TileKitTrace.raster {
             let line = "[tiff] 解压只得到 \(written) / 期望 \(capacity) 字节（输入 \(data.count)）\n"
             FileHandle.standardError.write(Data(line.utf8))
         }
@@ -333,7 +343,7 @@ enum TIFFCodec {
     }
 
     /// PackBits（TIFF 6.0 的 RLE）。
-    static func packBitsDecode(_ data: Data, capacity: Int) -> [UInt8]? {
+    package static func packBitsDecode(_ data: Data, capacity: Int) -> [UInt8]? {
         let bytes = [UInt8](data)
         var output: [UInt8] = []
         output.reserveCapacity(capacity)
@@ -365,14 +375,18 @@ enum TIFFCodec {
     ///
     /// 位宽增长的时机（「提前一位」）各家写法偶有出入，所以两种规则都试一遍：
     /// 先按规范（提前一位）解，长度不对再按不提前解；哪个正好填满就采用哪个。
-    static func lzwDecode(_ data: Data, capacity: Int) -> [UInt8]? {
+    package static func lzwDecode(_ data: Data, capacity: Int) -> [UInt8]? {
         if let decoded = lzwDecode(data, capacity: capacity, earlyChange: true), decoded.count == capacity {
             return decoded
         }
         if let decoded = lzwDecode(data, capacity: capacity, earlyChange: false), decoded.count == capacity {
             return decoded
         }
-        return lzwDecode(data, capacity: capacity, earlyChange: true)
+        // 两种规则都没正好填满（截断 / 损坏的块）：按「解出多少算多少」补齐到容量再交出去。
+        // 调用方是**按块尺寸索引像素**的，返回一个短数组会让它越界。
+        guard let decoded = lzwDecode(data, capacity: capacity, earlyChange: true) else { return nil }
+        if decoded.count >= capacity { return Array(decoded.prefix(capacity)) }
+        return decoded + [UInt8](repeating: 0, count: capacity - decoded.count)
     }
 
     private static func lzwDecode(_ data: Data, capacity: Int, earlyChange: Bool) -> [UInt8]? {
@@ -541,7 +555,11 @@ enum TIFFCodec {
                                     return Int(source.u16(at: offset, order: order)) >> 8
                                 case 1, 2, 4:
                                     let bitIndex = (y * width + x) * samplesPerPixel * bits + index * bits
-                                    let byte = source[bitIndex / 8]
+                                    // 打包位样本：块数据可能比声明的容量短（损坏 / 截断），
+                                    // 这里的下标必须自己挡一下，否则就是数组越界。
+                                    let byteIndex = bitIndex / 8
+                                    guard byteIndex >= 0, byteIndex < raw.count else { return 0 }
+                                    let byte = source[byteIndex]
                                     let shift = 8 - bits - (bitIndex % 8)
                                     let mask = (1 << bits) - 1
                                     let value = (Int(byte) >> shift) & mask

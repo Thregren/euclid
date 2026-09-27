@@ -20,6 +20,14 @@ struct ViewportSnapshot: Sendable {
 final class TileCanvasNSView: NSView {
     private let overlay = MeasurementOverlay()
 
+    /// 面积显示单位（跟随界面设置，只影响画面上的面积标注文字）。
+    var areaUnit: MeasureFormat.AreaUnit = .automatic {
+        didSet {
+            guard areaUnit != oldValue else { return }
+            refreshOverlay()
+        }
+    }
+
     /// 画布底色（影像之外的「桌面」）。
     ///
     /// 单独一层铺在所有瓦片之下，而不是直接给视图图层设 `backgroundColor`：
@@ -79,6 +87,8 @@ final class TileCanvasNSView: NSView {
     private var hoveredVertex: (measurementID: UUID?, index: Int)?
     /// 回车结束测量的键盘监视器（见 `installFinishMonitor`）。
     private var finishMonitor: Any?
+    /// 退格 / 前向删除时问一句「要删图层吗」（由 AppModel 注入，返回是否删掉了）。
+    var onDeleteLayer: (() -> Bool)?
     /// 窗口失焦的订阅（见 `viewDidMoveToWindow`）。
     private var resignObserver: (any NSObjectProtocol)?
     /// 平移手势累计但尚未提交的位移（视图点，y 向上）。
@@ -97,6 +107,31 @@ final class TileCanvasNSView: NSView {
     private var pendingReadoutPoint: CGPoint?
     /// 手势进行中：期间暂时关掉预取这类后台活，别和拖动抢主线程与磁盘。
     private var isGestureActive = false
+
+    /// 现在要不要「只铺图、不取图」。
+    ///
+    /// 只对**拖窗口改大小**生效：那会儿每个事件都重铺一次，再顺带取图就变成
+    /// 「一边拖窗口一边解一屏新图」。拖动视图反过来要照常取图 —— 不取的话手一动边上就白，
+    /// 手停下来才一片片补上来，看着就是「边缘一直在加载」；取图本身是异步的，
+    /// 每 120 点才提交一次，主线程该干的活（重铺 + 标注）现在都在 0.4 ms 量级。
+    private var defersTileWork: Bool {
+        inLiveResize || (!Self.loadsTilesDuringGesture && isGestureActive)
+    }
+
+    /// `EUCLID_PAN_NO_TILES=1` 时回到「手势期间一片都不取」的老口径（只用于对照测量）。
+    private static let loadsTilesDuringGesture =
+        ProcessInfo.processInfo.environment["EUCLID_PAN_NO_TILES"] == nil
+
+    /// 调试开关都在这里读一次。
+    ///
+    /// `ProcessInfo.processInfo.environment` **每读一次都要把整份环境重新拼成一个字典**
+    /// （本机实测约 29 µs，是同一件事的上千倍慢于查一个留住的字典）。放在每事件 / 每帧的
+    /// 判断里，光这一下就吃掉双指平移每次事件 90 µs 里的五六十微秒，因此统一提前读成常量。
+    private static let tracesScroll = ProcessInfo.processInfo.environment["EUCLID_TRACE_SCROLL"] != nil
+    private static let tracesView = ProcessInfo.processInfo.environment["EUCLID_TRACE_VIEW"] != nil
+    private static let reportsReadoutDuringPan =
+        ProcessInfo.processInfo.environment["EUCLID_PAN_NO_REPORT"] == nil
+    private static let debugSnapshotDirectory = ProcessInfo.processInfo.environment["EUCLID_DEBUG_SNAPSHOT"]
     /// 喂给界面的读数更新间隔（秒）：状态栏与检查器不需要每个事件都刷新。
     private static let reportInterval: TimeInterval = 1.0 / 30.0
     private var lastCursorReport = Date.distantPast
@@ -108,6 +143,23 @@ final class TileCanvasNSView: NSView {
     private var scrollTraceTotal = 0.0
     private var scrollTraceWorst = 0.0
     private var scrollTraceCommits = 0
+
+    /// 「重铺瓦片」的耗时统计（`EUCLID_TRACE_SYNC=1`）：次数、合计与最慢一次。
+    /// 瓦片陆续到位时每一轮都会回来重铺，失控时主线程就会一直忙在重铺上，这个计数最直观。
+    private static let tracesSync = ProcessInfo.processInfo.environment["EUCLID_TRACE_SYNC"] != nil
+    private var syncTraceCount = 0
+    private var syncTraceTotal = 0.0
+    private var syncTraceWorst = 0.0
+
+    /// 取走并清零重铺统计（调试与基准脚本用）。
+    func takeSyncTrace() -> (count: Int, total: Double, worst: Double) {
+        defer {
+            syncTraceCount = 0
+            syncTraceTotal = 0
+            syncTraceWorst = 0
+        }
+        return (syncTraceCount, syncTraceTotal, syncTraceWorst)
+    }
     private var scrollTraceLatencyTotal = 0.0
     private var scrollTraceLatencyWorst = 0.0
     /// 本次手势**进行中**发起的取图次数（收尾那一次不算：那是手停下来之后正常要取的）。
@@ -178,6 +230,15 @@ final class TileCanvasNSView: NSView {
             commitPan(finished: true)
         } else {
             installFinishMonitor()
+            // 打开窗口后让画布拿住焦点：方向键、V/C/D/A/O、⌘= 这些不用先点一下画布才有反应。
+            // 只在「当前没人在用焦点」时抢，免得把键盘焦点从某个输入框上夺走。
+            if window?.firstResponder == nil || window?.firstResponder === window {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, let window = self.window else { return }
+                    guard window.firstResponder == nil || window.firstResponder === window else { return }
+                    window.makeFirstResponder(self)
+                }
+            }
             // 用 block 版观察者并弱引用自己：视图先于窗口销毁也不会留下悬空指针。
             resignObserver = NotificationCenter.default.addObserver(
                 forName: NSWindow.didResignKeyNotification,
@@ -213,15 +274,39 @@ final class TileCanvasNSView: NSView {
     private func installFinishMonitor() {
         guard finishMonitor == nil else { return }
         finishMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self,
-                  event.window === self.window,
-                  event.keyCode == 36 || event.keyCode == 76,   // Return / 小键盘 Enter
-                  self.tool != .browse,
-                  let store = self.measurementStore,
-                  !store.draft.isEmpty,
-                  !Self.isTypingText(in: self.window) else { return event }
-            self.finishDraft()
-            return nil      // 已经用它结束了，别再往下传（否则按钮会「哔」一声）
+            guard let self, event.window === self.window else { return event }
+            // 文本框里的回车与退格是「确认输入 / 删除字符」，不能被我方截走。
+            guard !Self.isTypingText(in: self.window) else { return event }
+
+            switch event.keyCode {
+            case 36, 76:   // Return / 小键盘 Enter：结束当前测量
+                guard self.tool != .browse,
+                      let store = self.measurementStore,
+                      !store.draft.isEmpty else { return event }
+                self.finishDraft()
+                return nil
+
+            case 51, 117:  // ⌫ / ⌦：画着测量时撤掉刚点的一个点，否则删掉选中的图层
+                if self.tool != .browse, let store = self.measurementStore, !store.draft.isEmpty {
+                    store.removeLastDraftPoint()
+                    self.refreshOverlay()
+                    return nil
+                }
+                if self.onDeleteLayer?() == true { return nil }
+                return event
+
+            case 123, 124, 125, 126:   // 方向键：平移视图
+                // 装在监视器里而不是只靠 `keyDown`：`keyDown` 只有画布是第一响应者时才来，
+                // 而用户点过检查器、折叠块、面板空白处之后焦点就跑了，方向键会「没反应」。
+                // 正在输入文字、或焦点在「自己要吃方向键」的控件（滑杆 / 步进器 / 列表 / 弹出菜单）上时让路。
+                guard !Self.wantsArrowKeys(in: self.window) else { return event }
+                let accelerated = event.modifierFlags.contains(.shift)
+                guard self.panByArrowKey(event.keyCode, accelerated: accelerated) else { return event }
+                return nil
+
+            default:
+                return event
+            }
         }
     }
 
@@ -231,6 +316,19 @@ final class TileCanvasNSView: NSView {
         if responder is NSTextView || responder is NSTextField { return true }
         // SwiftUI 的 TextField 背后是 NSTextView（字段编辑器），统一在上一层判断。
         return (responder as? NSView)?.isKind(of: NSTextView.self) ?? false
+    }
+
+    /// 当前第一响应者是不是「方向键另有用途」的控件。
+    ///
+    /// 这些控件上方向键有自己的含义（调滑杆、换选项、走列表），不能抢：
+    /// 抢了就会变成「拖不透明度滑杆时按到 ←，地图跑了」。
+    private static func wantsArrowKeys(in window: NSWindow?) -> Bool {
+        guard let responder = window?.firstResponder else { return false }
+        if responder is NSTextView || responder is NSTextField { return true }
+        if responder is NSSlider || responder is NSStepper { return true }
+        if responder is NSTableView || responder is NSOutlineView { return true }
+        if responder is NSPopUpButton || responder is NSSegmentedControl { return true }
+        return false
     }
 
     override func viewDidChangeBackingProperties() {
@@ -548,6 +646,16 @@ final class TileCanvasNSView: NSView {
         syncLayers()
     }
 
+    /// 拖窗口改大小时也要重铺，但**别在拖动过程中去取图**。
+    ///
+    /// AppKit 在 live resize 期间每个事件都会走一次 `layout()`：照原样每帧都发起一批瓦片请求，
+    /// 就变成「一边拖窗口一边解码一屏新瓦片」，边框拖动会明显发顿、也白读一堆盘。
+    /// 这里沿用「手势期间只位移不取图」那套口径：拖动时只重铺，松手那一次再补图。
+    override func viewDidEndLiveResize() {
+        super.viewDidEndLiveResize()
+        syncLayers()
+    }
+
     /// 当前屏幕的设备像素比。
     private var displayScale: Double { Double(window?.backingScaleFactor ?? 2) }
 
@@ -575,13 +683,36 @@ final class TileCanvasNSView: NSView {
 
     /// 把两条图层都同步一遍：下层先铺，上层后铺，叠加顺序天然正确。
     private func syncLayers() {
+        let traceStarted = Self.tracesSync ? CFAbsoluteTimeGetCurrent() : 0
+        var traceDetail = ""
+        defer {
+            if Self.tracesSync {
+                let cost = (CFAbsoluteTimeGetCurrent() - traceStarted) * 1000
+                syncTraceCount += 1
+                syncTraceTotal += cost
+                syncTraceWorst = max(syncTraceWorst, cost)
+                // 单次重铺超过 8 ms 就是掉帧级别：把当时的层级与瓦片规模一起记下来，
+                // 方便分清是「换层级那一下」还是「某个规模下的常态」。
+                if cost > 8 {
+                    let line = String(
+                        format: "[sync] %.1f ms · 相机 z=%.2f · 层 %d · 上一次可见 %d 片%@\n",
+                        cost, camera.zoomLevel, stacks.count, lastVisibleTiles,
+                        traceDetail.isEmpty ? "" : " · " + traceDetail
+                    )
+                    FileHandle.standardError.write(Data(line.utf8))
+                }
+            }
+        }
         guard bounds.width > 1, bounds.height > 1 else { return }
         camera.viewportSize = bounds.size
         for stack in stacks.values { stack.updateSortCenter(camera.center) }
-        // 手势进行中（或刚提交的这一刻仍在拖）先不做预取：别跟用户的手抢磁盘与网络。
-        for stack in stacks.values { stack.defersBackgroundWork = isGestureActive }
-        // 手势期间只挪图层、不取图；手停下来那一次才真正把缺的瓦片取回来。
-        let loadsTiles = !isGestureActive
+        // 拖窗口期间先不做预取这类后台活；拖动视图时反过来要预取，边上才有图。
+        for stack in stacks.values {
+            stack.defersBackgroundWork = defersTileWork
+            stack.isInteracting = isGestureActive
+        }
+        // 拖窗口期间只挪图层、不取图；拖动视图时照常取（见 `defersTileWork`）。
+        let loadsTiles = !defersTileWork
 
         let activeStacks = orderedStacks.filter { $0.isActive }
         guard !activeStacks.isEmpty, !awaitingExtent else {
@@ -623,6 +754,7 @@ final class TileCanvasNSView: NSView {
         for frame in frames { Self.traceView(layer: frame, camera: camera, zoomBounds: zoomBounds) }
         reportTileStats(loadedTiles: loadedTiles, missingTiles: missingTiles, loadsTiles: loadsTiles)
         reportViewport(visibleTiles: visibleTiles)
+        traceDetail = "需要 \(visibleTiles) 片 · 已上屏 \(loadedTiles) · 缺 \(missingTiles)"
         setAccessibilityValue("z\(currentDataZoom)")
     }
 
@@ -649,7 +781,7 @@ final class TileCanvasNSView: NSView {
 
     /// 调试用：`EUCLID_TRACE_VIEW=1` 时把每次渲染的关键数字打到 stderr。
     static func traceView(layer: TileLayerFrame, camera: MapCamera, zoomBounds: ClosedRange<Double>) {
-        guard ProcessInfo.processInfo.environment["EUCLID_TRACE_VIEW"] != nil else { return }
+        guard tracesView else { return }
         var line = String(
             format: "[view] %@ z=%.2f 层级=%d 范围=%.2f…%.2f 需要=%d 已载入=%d 祖先兜底=%d 缺片=%d 瓦片边长=%.0fpt 中心=(%.5f,%.5f)",
             layer.name, camera.zoomLevel, layer.zoom,
@@ -667,7 +799,7 @@ final class TileCanvasNSView: NSView {
         FileHandle.standardError.write(Data(line.utf8))
     }
     func writeDebugSnapshot(index: Int) {
-        guard let directory = ProcessInfo.processInfo.environment["EUCLID_DEBUG_SNAPSHOT"] else { return }
+        guard let directory = Self.debugSnapshotDirectory else { return }
         guard let image = renderMapImage() else { return }
         let url = URL(fileURLWithPath: directory)
             .appending(path: String(format: "frame-%02d.png", index))
@@ -676,8 +808,36 @@ final class TileCanvasNSView: NSView {
         CGImageDestinationFinalize(destination)
     }
 
+    /// 内存压力下把各层的瓦片缓存压小（系统发通知时由 `AppModel` 调用）。
+    func trimTileCaches(toFraction fraction: Double) {
+        for stack in stacks.values { stack.trimCache(toFraction: fraction) }
+    }
+
+    /// 调试用：各层缓存条数 + 标注重绘的图层池大小（`EUCLID_DEBUG_MEMORY=1` 会定期打出来）。
+    func debugCacheSummary() async -> String {
+        var parts: [String] = []
+        for (id, stack) in stacks {
+            let stats = await stack.cacheStats()
+            let tiles = stats?.tiles ?? 0
+            let megabytes = Double(stats?.bytes ?? 0) / 1_048_576
+            parts.append("\(id.prefix(8))… \(tiles) 片/\(String(format: "%.1f", megabytes)) MB")
+        }
+        // 影像解码的块缓存也报一行，方便确认它没在涨。
+        parts.append(RasterCache.debugSummary())
+        return parts.joined(separator: " · ")
+    }
+
     /// 当前画布的设备像素比（导出图片时用来定字号与线宽）。
     var backingScale: CGFloat { CGFloat(displayScale) }
+
+    /// 调试用：当前有效视野的中心（含手势期间还没提交的位移）。
+    var debugCenterText: String {
+        let coordinate = WebMercator.coordinate(fromNormalized: effectiveCamera.center)
+        return String(format: "%.5f, %.5f", coordinate.longitude, coordinate.latitude)
+    }
+
+    /// 调试用：当前相机层级（含手势期间还没提交的位移）。
+    var debugZoomLevel: Double { effectiveCamera.zoomLevel }
 
     /// 把当前画面离屏渲染成位图：瓦片、网格与测量标注都在里面，
     /// 不含 SwiftUI 那几块浮在画布上的控件（缩放按钮、比例尺、提示条）。
@@ -749,7 +909,8 @@ final class TileCanvasNSView: NSView {
             liveCoordinate: store.liveCoordinate,
             hoveredVertex: hoveredCoordinate,
             camera: camera,
-            showLabels: store.showLabels
+            showLabels: store.showLabels,
+            areaUnit: areaUnit
         )
     }
 
@@ -1070,9 +1231,7 @@ final class TileCanvasNSView: NSView {
             // 手势期间**不**逐个事件喂 SwiftUI 状态：坐标读数与视图读数攒到「手停一下」再刷。
             // 这是拖动卡顿的主因（实测：每个事件都刷时输入延迟 25 ms、事件掉到 1/4；
             // 手势期间不刷则 3.5 ms、事件全到）。`EUCLID_PAN_NO_REPORT=1` 可完全关掉读数刷新对照。
-            if ProcessInfo.processInfo.environment["EUCLID_PAN_NO_REPORT"] == nil {
-                scheduleReadoutRefresh(for: point)
-            }
+            if Self.reportsReadoutDuringPan { scheduleReadoutRefresh(for: point) }
         }
     }
 
@@ -1179,7 +1338,7 @@ final class TileCanvasNSView: NSView {
 
     /// 记一次平移事件的处理耗时与输入延迟。
     func tracePan(startedAt: CFTimeInterval, timestamp: TimeInterval) {
-        guard ProcessInfo.processInfo.environment["EUCLID_TRACE_SCROLL"] != nil else { return }
+        guard Self.tracesScroll else { return }
         let elapsed = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
         // 事件从「发出」到「被处理」之间的延迟：主线程越忙，这个数越大（也是掉帧的直接体感）。
         // `NSEvent.timestamp` 是「开机以来的秒数」，与 `systemUptime` 同一基准。
@@ -1196,7 +1355,7 @@ final class TileCanvasNSView: NSView {
 
     /// 手势结束：把统计打出来并清零。
     func finishPanTrace() {
-        guard ProcessInfo.processInfo.environment["EUCLID_TRACE_SCROLL"] != nil,
+        guard Self.tracesScroll,
               scrollTraceEvents > 0 else { return }
         let average = scrollTraceEvents > 0 ? scrollTraceTotal / Double(scrollTraceEvents) : 0
         let latencyAverage = scrollTraceEvents > 0 ? scrollTraceLatencyTotal / Double(scrollTraceEvents) : 0
@@ -1234,7 +1393,6 @@ final class TileCanvasNSView: NSView {
     }
 
     override func keyDown(with event: NSEvent) {
-        let panStep: CGFloat = event.modifierFlags.contains(.shift) ? 120 : 40
         if let store = measurementStore {
             switch event.keyCode {
             case 53:   // Esc
@@ -1279,22 +1437,38 @@ final class TileCanvasNSView: NSView {
         case "0":
             fitToData()
         default:
-            switch event.keyCode {
-            case 123:
-                camera = camera.translated(byViewDelta: CGPoint(x: panStep, y: 0))
-                syncLayers()
-            case 124:
-                camera = camera.translated(byViewDelta: CGPoint(x: -panStep, y: 0))
-                syncLayers()
-            case 125:
-                camera = camera.translated(byViewDelta: CGPoint(x: 0, y: -panStep))
-                syncLayers()
-            case 126:
-                camera = camera.translated(byViewDelta: CGPoint(x: 0, y: panStep))
-                syncLayers()
-            default:
+            guard panByArrowKey(event.keyCode, accelerated: event.modifierFlags.contains(.shift)) else {
                 super.keyDown(with: event)
+                return
             }
         }
     }
+
+    // MARK: - 方向键平移
+
+    /// 方向键把视图挪一格（按住 `Shift` 挪三格）。
+    ///
+    /// 方向按地图的惯例：按 ← 看更西边、按 ↑ 看北边（画面内容朝反方向走）。
+    /// 返回是否吃掉了这个键。
+    @discardableResult
+    func panByArrowKey(_ keyCode: UInt16, accelerated: Bool) -> Bool {
+        let step = accelerated ? Self.arrowPanStepFast : Self.arrowPanStep
+        let delta: CGPoint
+        switch keyCode {
+        case 123: delta = CGPoint(x: step, y: 0)      // ←
+        case 124: delta = CGPoint(x: -step, y: 0)     // →
+        // 纵向与横向的符号不同：视图坐标 y 向上，而「看北边」对应画面内容向下走。
+        case 125: delta = CGPoint(x: 0, y: step)      // ↓：看南边
+        case 126: delta = CGPoint(x: 0, y: -step)     // ↑：看北边
+        default: return false
+        }
+        markViewPositioned()
+        camera = camera.translated(byViewDelta: delta).clamped(zoomLevelRange: zoomBounds)
+        syncLayers()
+        return true
+    }
+
+    /// 一步的位移（点）；按住 `Shift` 走 `arrowPanStepFast`。
+    private static let arrowPanStep: CGFloat = 40
+    private static let arrowPanStepFast: CGFloat = 120
 }

@@ -35,11 +35,6 @@ enum MeasurementPalette {
         measurement.style.fill.map(NSColor.init(components:)) ?? color(at: measurement.colorIndex)
     }
 
-    /// 实际用于绘制的填充色（填充色 × 填充不透明度）。
-    static func resolvedFillColor(of measurement: GeoMeasurement) -> NSColor {
-        fillColor(of: measurement).withAlphaComponent(fillOpacity(of: measurement))
-    }
-
     static func fillOpacity(of measurement: GeoMeasurement) -> CGFloat {
         let style = measurement.style.sanitized()
         return CGFloat(style.fillOpacity)
@@ -47,16 +42,6 @@ enum MeasurementPalette {
 
     static func lineWidth(of measurement: GeoMeasurement) -> CGFloat {
         CGFloat(measurement.style.sanitized().strokeWidth)
-    }
-
-    /// 草稿（尚未完成的测量）使用的颜色。
-    static func draftStrokeColor(at index: Int, style: MeasurementStyle) -> NSColor {
-        style.stroke.map(NSColor.init(components:)) ?? color(at: index)
-    }
-
-    static func draftFillColor(at index: Int, style: MeasurementStyle) -> NSColor {
-        let base = style.fill.map(NSColor.init(components:)) ?? color(at: index)
-        return base.withAlphaComponent(CGFloat(style.sanitized().fillOpacity))
     }
 }
 

@@ -4,7 +4,8 @@ import UniformTypeIdentifiers
 
 /// 左侧「图层」面板。
 ///
-/// 版式照 Pixelmator Pro 的左栏：标题行右侧成组放「添加 / 复制 / 更多」，
+/// 版式照 Pixelmator Pro 的左栏：标题行右侧成组放「添加 / 更多」（复制图层走行的右键菜单，
+/// 标题行不单放一个复制按钮：图层多的时候那个按钮既占地方、又容易和目标层对不上号），
 /// 中间是可点选、可**按住拖动排序**的图层行（缩略图 + 名称 + 来源 + 显示开关），
 /// 底部是所选层的混合模式、不透明度，以及按名字过滤的搜索框。
 ///
@@ -24,6 +25,9 @@ struct LayersPanel: View {
     /// 正在改名的图层（右键菜单里的「重命名…」）。
     @State private var renamingLayerID: String?
     @State private var renameText = ""
+    /// 正在等用户填密钥的在线底图（没填就切过去只会「点了没反应」）。
+    @State private var keyPromptPreset: TileSourceTemplate?
+    @State private var keyDraft = ""
 
     /// 行高：拖动落点判断「上半还是下半」也要用它。
     static let rowHeight: CGFloat = 46
@@ -49,6 +53,17 @@ struct LayersPanel: View {
         } message: {
             Text("只改显示名，不影响数据来源。")
         }
+        .alert("这个在线底图需要密钥", isPresented: isAskingKey) {
+            TextField("开发者密钥（天地图是 tk）", text: $keyDraft)
+            Button("取消", role: .cancel) { keyPromptPreset = nil }
+            Button("用这个密钥") {
+                if let preset = keyPromptPreset { applyBasemap(preset, key: keyDraft) }
+                keyPromptPreset = nil
+            }
+        } message: {
+            Text("\(keyPromptPreset?.name ?? "这个数据源") 需要开发者密钥才能取图。密钥只放在内存里，退出程序后需要重填；"
+                 + "以后也可以在「下载在线瓦片」面板里改。")
+        }
     }
 
     private var isRenaming: Binding<Bool> {
@@ -56,6 +71,57 @@ struct LayersPanel: View {
             get: { renamingLayerID != nil },
             set: { if !$0 { renamingLayerID = nil } }
         )
+    }
+
+    private var isAskingKey: Binding<Bool> {
+        Binding(
+            get: { keyPromptPreset != nil },
+            set: { if !$0 { keyPromptPreset = nil } }
+        )
+    }
+
+    // MARK: - 在线底图与密钥
+
+    /// 当前在线数据源对应的预设（自定义模板时返回 nil）。
+    private var currentPreset: TileSourceTemplate? {
+        TileSourceTemplate.preset(id: model.download.sourceID)
+    }
+
+    /// 当前在线数据源是否需要密钥。
+    private var needsKeyNow: Bool {
+        currentPreset?.needsKey ?? model.download.needsKey
+    }
+
+    /// 菜单里的名字：需要密钥的源直接标出来，别让用户点了才发现没反应。
+    private func presetTitle(_ preset: TileSourceTemplate) -> String {
+        guard preset.needsKey else { return preset.name }
+        let filled = currentPreset?.id == preset.id && !model.download.key.trimmingCharacters(in: .whitespaces).isEmpty
+        return filled ? "\(preset.name)（已填密钥）" : "\(preset.name)（需密钥）"
+    }
+
+    /// 选在线底图：需要密钥而没填时**先把密钥问出来**再切过去。
+    /// （原先直接切，图层因为缺密钥装配不上，用户看到的就是「点了没反应」。）
+    private func chooseBasemap(_ preset: TileSourceTemplate) {
+        if preset.needsKey {
+            let hasKey = currentPreset?.id == preset.id
+                && !model.download.key.trimmingCharacters(in: .whitespaces).isEmpty
+            if !hasKey {
+                askForKey(preset)
+                return
+            }
+        }
+        applyBasemap(preset)
+    }
+
+    private func askForKey(_ preset: TileSourceTemplate?) {
+        keyDraft = model.download.key
+        keyPromptPreset = preset ?? currentPreset ?? TileSourceTemplate.presets.first { $0.needsKey }
+    }
+
+    private func applyBasemap(_ preset: TileSourceTemplate, key: String? = nil) {
+        if let key { model.download.key = key }
+        model.download.sourceID = preset.id
+        model.usesOnlineBasemap = true
     }
 
     // MARK: - 标题行
@@ -66,19 +132,6 @@ struct LayersPanel: View {
                 .font(.headline)
             Spacer(minLength: 4)
             addMenu
-            Button {
-                if let id = model.selectedLayer?.id { model.duplicateLayer(id) }
-            } label: {
-                Image(systemName: "plus.square.on.square")
-                    .frame(
-                        width: InterfaceStyle.iconButtonHitSize,
-                        height: InterfaceStyle.iconButtonHitSize
-                    )
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.borderless)
-            .disabled(model.selectedLayer == nil)
-            .help("复制选中的图层")
             moreMenu
         }
         .padding(.horizontal, 10)
@@ -90,15 +143,15 @@ struct LayersPanel: View {
         Menu {
             Section("在线底图") {
                 ForEach(TileSourceTemplate.presets) { preset in
-                    Button(preset.name) {
-                        model.download.sourceID = preset.id
-                        model.usesOnlineBasemap = true
-                    }
+                    Button(presetTitle(preset)) { chooseBasemap(preset) }
                 }
                 if model.onlineLayer != nil {
                     Button("只用本地数据（移除在线底图层）") {
                         model.usesOnlineBasemap = false
                     }
+                }
+                if needsKeyNow {
+                    Button("填写在线底图密钥…") { askForKey(currentPreset) }
                 }
             }
             Section("本地数据") {
@@ -278,6 +331,9 @@ struct LayersPanel: View {
             renamingLayerID = layer.id
         }
         Button("复制这一层") { model.duplicateLayer(layer.id) }
+        if layer.kind == .online, needsKeyNow {
+            Button("填写密钥…") { askForKey(currentPreset) }
+        }
         Button(layer.isAnchor ? "已经是基准层" : "设为基准层") {
             model.setAnchorLayer(layer.id)
         }

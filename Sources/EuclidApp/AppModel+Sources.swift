@@ -78,7 +78,9 @@ extension AppModel {
 
         guard let basemap, basemap.invalidReason == nil else {
             if let reason = basemap?.invalidReason {
-                setStatus(reason, autoClearAfter: 6)
+                // 配置不全（最典型的是没填密钥）时**不作自动消失**：用户点了底图却什么都没发生，
+                // 这句说明得一直留在状态栏，直到他填好密钥或切走。
+                setStatus(reason, autoClearAfter: 0)
             }
             pushLayers()
             return
@@ -117,6 +119,26 @@ extension AppModel {
     var selectedSourcePath: String? {
         selectedDataset?.rootURL.path(percentEncoded: false)
             ?? selectedRaster?.fileURL.path(percentEncoded: false)
+    }
+
+    /// 恢复某份数据自己的测量存档。
+    ///
+    /// 读盘是文件 IO，放到后台去：切换数据源（以及启动时自动打开上次的目录）不该为了读一个
+    /// JSON 文件卡住一下。存档 actor 是串行的，因此也不会和正在进行的自动存档打架。
+    /// 期间用户又切走了，或者已经动手量了新东西，就丢弃这份结果。
+    private func restoreMeasurements(for archivePath: String, sourceID: String) {
+        guard !DebugFixtures.isEnabled else { return }
+        Task {
+            let saved = await MeasurementArchive.shared.measurements(for: archivePath)
+            if let notice = await MeasurementArchive.shared.takeNotice() {
+                setStatus(notice, autoClearAfter: 12)
+            }
+            guard selectedSourceID == sourceID else { return }
+            guard measurements.measurements.isEmpty, measurements.draft.isEmpty else { return }
+            guard !saved.isEmpty else { return }
+            measurements.restore(saved)
+            canvas.refreshOverlay()
+        }
     }
 
 
@@ -255,8 +277,7 @@ extension AppModel {
             extent = raster.extent
             applyLocalLayer(force: true)
             applyOnlineLayer()
-            measurements.restore(MeasurementArchive.measurements(for: raster.id))
-            canvas.refreshOverlay()
+            restoreMeasurements(for: raster.id, sourceID: raster.id)
             reportRaster(raster)
             if DebugFixtures.isEnabled {
                 DebugFixtures.populateMeasurements(in: raster.extent, store: measurements)
@@ -276,8 +297,7 @@ extension AppModel {
         // 选数据集就重装本地图层；在线底图是否叠加由 `usesOnlineBasemap` 决定，互不影响。
         applyLocalLayer(force: true)
         applyOnlineLayer()
-        measurements.restore(MeasurementArchive.measurements(for: dataset.rootURL.path(percentEncoded: false)))
-        canvas.refreshOverlay()
+        restoreMeasurements(for: dataset.id, sourceID: dataset.id)
         // 数据范围要扫完目录才知道，这期间画布先不铺图（在错误位置铺一屏空占位只会闪）。
         setStatus("正在读取数据范围…", autoClearAfter: 0)
         isResolvingExtent = true

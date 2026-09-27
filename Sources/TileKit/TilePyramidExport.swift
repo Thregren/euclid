@@ -205,8 +205,12 @@ public struct TilePyramidExporter: Sendable {
             var completed = 0
             var written = 0, skipped = 0, failed = 0, bytes = 0
             var lastZoom = plan.zoomRange.lowerBound
+            /// 进度回调节流：一万片瓦片就是一万个回调，界面那边每个回调还要跳一次主线程、
+            /// 再触发一次 SwiftUI 刷新 —— 生成过程中窗口反而被这些刷新拖住。
+            /// 与下载那条路一个口径：最快 10 Hz，收尾时强制补一次。
+            var lastReport = Date.distantPast
 
-            func record(_ outcome: TilePyramidOutcome) async {
+            func record(_ outcome: TilePyramidOutcome, force: Bool = false) async {
                 completed += 1
                 switch outcome {
                 case .written(let size, let zoom):
@@ -223,6 +227,9 @@ public struct TilePyramidExporter: Sendable {
                     completed: completed, total: total, written: written,
                     skipped: skipped, failed: failed, bytes: bytes, zoom: lastZoom
                 ))
+                let now = Date()
+                guard force || now.timeIntervalSince(lastReport) >= 0.1 else { return }
+                lastReport = now
                 onProgress?(await counter.snapshot())
             }
 
@@ -254,6 +261,8 @@ public struct TilePyramidExporter: Sendable {
             while let outcome = await group.next() {
                 await record(outcome)
             }
+            // 收尾补一次，保证「最后一格」的状态一定发出去。
+            onProgress?(await counter.snapshot())
         }
 
         let final = await counter.snapshot()

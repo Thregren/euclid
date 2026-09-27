@@ -212,7 +212,9 @@ public enum TileURLTemplate {
             let hosts = subdomains.isEmpty ? [""] : subdomains
             // 按坐标轮转子域，避免所有请求都落在同一台机器上。
             let index = abs(tile.x &+ tile.y &* 31) % hosts.count
-            text = text.replacingOccurrences(of: "{s}", with: hosts[index])
+            // 子域同样是用户可填的，按查询值转义一次，别让它破坏 URL 结构。
+            let host = hosts[index].addingPercentEncoding(withAllowedCharacters: queryValueAllowed) ?? hosts[index]
+            text = text.replacingOccurrences(of: "{s}", with: host)
         }
 
         if text.contains("{key}") {

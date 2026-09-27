@@ -118,6 +118,9 @@ public struct TIFFGeoTags: Sendable, Hashable {
 
 /// 一个 IFD（主图或某一级概览）里我们关心的字段。
 struct TIFFImageFileDirectory: Sendable {
+    /// 这一级 IFD 在文件里的偏移。解析出来的结构本身没有唯一编号，
+    /// 而跨瓦片的块缓存需要一个稳定的键，偏移天然就满足（同一份文件里不会重复）。
+    var offset = 0
     var width = 0
     var height = 0
     var samplesPerPixel = 1
@@ -182,10 +185,30 @@ public enum TIFFError: Error, CustomStringConvertible {
     }
 }
 
+/// 分块 / 条带尺寸的可信范围。
+///
+/// `TileWidth / TileHeight`（以及条带的 `RowsPerStrip`）完全由文件说了算，而解码时会按
+/// 「宽 × 高 × 4」直接申请缓冲区 —— 一个损坏或恶意写出的 IFD（例如声称分块是 10⁶ × 10⁶）
+/// 就能让应用去申请几个 T 的内存、被系统直接杀掉。这里给一个宽松但确定的上限：
+/// 单块 2²⁶ 像素（RGBA 约 268 MB）足以覆盖合法的超大条带（例如宽 10 万 × 条带高 600），
+/// 同时把「声明出来的天文数字」挡在门外。
+package enum TIFFLimits {
+    /// 单个分块 / 条带允许的最大像素数。
+    package static let maximumChunkPixels = 1 << 26
+    /// 允许的最大边长（宽松值，主要拦明显荒谬的数字）。
+    package static let maximumChunkSide = 1_000_000
+
+    package static func isSaneChunk(width: Int, height: Int) -> Bool {
+        guard width > 0, height > 0 else { return false }
+        guard width <= maximumChunkSide, height <= maximumChunkSide else { return false }
+        return height <= maximumChunkPixels / width
+    }
+}
+
 // MARK: - 文件读取
 
 /// 按偏移读字节的小工具（解码时反复用到，所以保留一个句柄）。
-final class TIFFSourceFile: @unchecked Sendable {
+package final class TIFFSourceFile: @unchecked Sendable {
     private let handle: FileHandle
     private let lock = NSLock()
     let byteCount: Int
@@ -196,7 +219,7 @@ final class TIFFSourceFile: @unchecked Sendable {
         byteCount = size ?? 0
     }
 
-    func read(offset: Int, count: Int) -> Data? {
+    package func read(offset: Int, count: Int) -> Data? {
         guard offset >= 0, count > 0 else { return nil }
         lock.lock()
         defer { lock.unlock() }
@@ -359,6 +382,7 @@ public enum TIFFReader {
         }
 
         var directory = TIFFImageFileDirectory()
+        directory.offset = offset
         directory.width = int(256) ?? 0
         directory.height = int(257) ?? 0
         guard directory.width > 0, directory.height > 0 else { throw TIFFError.truncated }
@@ -397,6 +421,10 @@ public enum TIFFReader {
         let tileOffsets = ints(324)
         let tileCounts = ints(325)
         if let tileWidth, let tileHeight, !tileOffsets.isEmpty {
+            // 分块尺寸先过一遍可信范围：后面解码会按它申请缓冲区（见 TIFFLimits）。
+            guard TIFFLimits.isSaneChunk(width: tileWidth, height: tileHeight) else {
+                throw TIFFError.unsupported("分块尺寸不可信（\(tileWidth) × \(tileHeight)）")
+            }
             directory.isTiled = true
             directory.chunkWidth = tileWidth
             directory.chunkHeight = tileHeight
@@ -408,7 +436,13 @@ public enum TIFFReader {
             let rowsPerStrip = int(278) ?? directory.height
             directory.isTiled = false
             directory.chunkWidth = directory.width
-            directory.chunkHeight = max(1, rowsPerStrip)
+            // `RowsPerStrip` 常用 0xFFFFFFFF 表示「整幅一条」，也可能写成一个荒谬的大数：
+            // 条带不可能比影像本身还高，夹到影像高度既符合语义、又挡住超大分配。
+            let stripHeight = min(max(1, rowsPerStrip), directory.height)
+            guard TIFFLimits.isSaneChunk(width: directory.width, height: stripHeight) else {
+                throw TIFFError.unsupported("条带尺寸不可信（\(directory.width) × \(stripHeight)）")
+            }
+            directory.chunkHeight = stripHeight
             directory.chunks = zip(stripOffsets, stripCounts.isEmpty ? stripOffsets.map { _ in 0 } : stripCounts)
                 .map { TIFFChunk(offset: $0.0, byteCount: $0.1) }
         }

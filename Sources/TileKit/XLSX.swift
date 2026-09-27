@@ -1,9 +1,10 @@
+import Compression
 import Foundation
 
 /// 极简 XLSX（OOXML 电子表格）生成器。
 ///
 /// 不引入任何第三方依赖：先按 OOXML 规范拼出工作表的 XML 部件，
-/// 再用文件内自带的 ZIP 打包器（仅存储、不压缩）装成一个 `.xlsx`。
+/// 再用文件内自带的 ZIP 打包器（deflate 压缩，压不小就退回存储）装成一个 `.xlsx`。
 /// 生成的文件可以被 Excel、Numbers、WPS、LibreOffice 直接打开。
 public enum XLSX {
     /// 单元格内容。
@@ -253,11 +254,16 @@ public enum XLSX {
     }
 }
 
-/// 仅供 xlsx 使用的 ZIP 打包器：只做「存储」，不做压缩。
+/// 仅供 xlsx 使用的 ZIP 打包器：默认 deflate 压缩，压不小就退回「存储」。
 ///
-/// OOXML 允许成员以 store 方式存放，省掉一整套 deflate 实现。
+/// OOXML 允许成员以 store 方式存放，所以压缩是可选的；但表格 XML 里同名字段成片重复，
+/// 几千行导出时压完常常只剩两三成，值得走一趟。压缩用的是系统 `Compression`，
+/// 不引入任何第三方库。
 public enum ZIP {
-    public static func stored(_ entries: [(name: String, data: Data)]) -> Data {
+    /// 打包。
+    ///
+    /// - Parameter compress: 是否尝试 deflate（默认尝试；单个成员压完更大时自动改存）。
+    public static func stored(_ entries: [(name: String, data: Data)], compress: Bool = true) -> Data {
         var output = Data()
         var directory = Data()
         // 固定为 2000-01-01 00:00:00 的 DOS 时间戳，保证输出可复现。
@@ -267,32 +273,39 @@ public enum ZIP {
         for entry in entries {
             let nameData = Data(entry.name.utf8)
             let checksum = crc32(entry.data)
+            // 压完不比原样小就用存储：小部件（几百字节的 rels）本来就没什么余量，
+            // 压缩后反而多几十字节的头。
+            let deflated = compress ? deflate(entry.data) : nil
+            let useDeflate = deflated.map { $0.count < entry.data.count } ?? false
+            let payload = useDeflate ? (deflated ?? entry.data) : entry.data
+            let method: UInt16 = useDeflate ? 8 : 0
             let size = UInt32(entry.data.count)
+            let packedSize = UInt32(payload.count)
             let offset = UInt32(output.count)
 
             output.appendLittleEndian(UInt32(0x0403_4B50))
             output.appendLittleEndian(UInt16(20))
             output.appendLittleEndian(UInt16(0))
-            output.appendLittleEndian(UInt16(0))
+            output.appendLittleEndian(method)
             output.appendLittleEndian(dosTime)
             output.appendLittleEndian(dosDate)
             output.appendLittleEndian(checksum)
-            output.appendLittleEndian(size)
+            output.appendLittleEndian(packedSize)
             output.appendLittleEndian(size)
             output.appendLittleEndian(UInt16(nameData.count))
             output.appendLittleEndian(UInt16(0))
             output.append(nameData)
-            output.append(entry.data)
+            output.append(payload)
 
             directory.appendLittleEndian(UInt32(0x0201_4B50))
             directory.appendLittleEndian(UInt16(20))
             directory.appendLittleEndian(UInt16(20))
             directory.appendLittleEndian(UInt16(0))
-            directory.appendLittleEndian(UInt16(0))
+            directory.appendLittleEndian(method)
             directory.appendLittleEndian(dosTime)
             directory.appendLittleEndian(dosDate)
             directory.appendLittleEndian(checksum)
-            directory.appendLittleEndian(size)
+            directory.appendLittleEndian(packedSize)
             directory.appendLittleEndian(size)
             directory.appendLittleEndian(UInt16(nameData.count))
             directory.appendLittleEndian(UInt16(0))
@@ -328,10 +341,60 @@ public enum ZIP {
         return crc ^ 0xFFFF_FFFF
     }
 
-    /// 读出一个「存储方式」ZIP 的全部条目并逐条校验 CRC。
+    /// 压缩方式 8 用的**裸 deflate**（带 2 字节 zlib 头的是 zlib 格式，ZIP 不用那个）。
+    ///
+    /// 系统 `Compression` 里的 `COMPRESSION_ZLIB` 名字容易引起误会：它编出来的正是裸流，
+    /// 与 ZIP 需要的字节完全一致，不需要额外剥壳。
+    package static func deflate(_ data: Data) -> Data? {
+        guard !data.isEmpty else { return nil }
+        // 压缩后的长度理论上可能略大于原始（极小或随机数据），留一点余量；
+        // `compression_encode_buffer` 放不下时返回 0，那就把缓冲翻倍再试。
+        var capacity = data.count + (data.count >> 3) + 1024
+        for _ in 0..<4 {
+            var output = [UInt8](repeating: 0, count: capacity)
+            let written = output.withUnsafeMutableBytes { destination -> Int in
+                data.withUnsafeBytes { source -> Int in
+                    guard let sourceBase = source.bindMemory(to: UInt8.self).baseAddress,
+                          let destinationBase = destination.bindMemory(to: UInt8.self).baseAddress
+                    else { return 0 }
+                    return compression_encode_buffer(
+                        destinationBase, capacity,
+                        sourceBase, data.count,
+                        nil, COMPRESSION_ZLIB
+                    )
+                }
+            }
+            if written > 0 { return Data(output[0..<written]) }
+            capacity *= 2
+        }
+        return nil
+    }
+
+    /// 解一个 deflate 块；`capacity` 是原始（未压缩）长度。
+    package static func inflate(_ data: Data, capacity: Int) -> Data? {
+        guard capacity > 0 else { return nil }
+        var output = [UInt8](repeating: 0, count: capacity)
+        let written = output.withUnsafeMutableBytes { destination -> Int in
+            data.withUnsafeBytes { source -> Int in
+                guard let sourceBase = source.bindMemory(to: UInt8.self).baseAddress,
+                      let destinationBase = destination.bindMemory(to: UInt8.self).baseAddress
+                else { return 0 }
+                return compression_decode_buffer(
+                    destinationBase, capacity,
+                    sourceBase, data.count,
+                    nil, COMPRESSION_ZLIB
+                )
+            }
+        }
+        // 少一个字节都说明块坏了：ZIP 的长度字段是可信的，解不满就整体判失败。
+        guard written == capacity else { return nil }
+        return Data(output)
+    }
+
+    /// 读出一个 ZIP 的全部条目（支持存储与 deflate）并逐条校验 CRC。
     ///
     /// 用于自检与排错：能读出来就说明文件结构合法、内容没被写坏。
-    /// 遇到压缩条目或结构损坏时返回 `nil`。
+    /// 遇到其它压缩方式或结构损坏时返回 `nil`。
     public static func parse(_ data: Data) -> [(name: String, data: Data)]? {
         let bytes = [UInt8](data)
         guard bytes.count >= 22 else { return nil }
@@ -354,9 +417,11 @@ public enum ZIP {
 
         for _ in 0..<entryCount {
             guard readUInt32(bytes, offset) == 0x0201_4B50 else { return nil }
-            guard readUInt16(bytes, offset + 10) == 0 else { return nil }   // 仅支持存储方式
+            let method = readUInt16(bytes, offset + 10)
+            guard method == 0 || method == 8 else { return nil }
             let checksum = readUInt32(bytes, offset + 16)
-            let size = Int(readUInt32(bytes, offset + 20))
+            let packedSize = Int(readUInt32(bytes, offset + 20))
+            let size = Int(readUInt32(bytes, offset + 24))
             let nameLength = Int(readUInt16(bytes, offset + 28))
             let extraLength = Int(readUInt16(bytes, offset + 30))
             let commentLength = Int(readUInt16(bytes, offset + 32))
@@ -370,9 +435,16 @@ public enum ZIP {
             let localNameLength = Int(readUInt16(bytes, localOffset + 26))
             let localExtraLength = Int(readUInt16(bytes, localOffset + 28))
             let dataStart = localOffset + 30 + localNameLength + localExtraLength
-            guard dataStart >= 0, dataStart + size <= bytes.count else { return nil }
+            guard dataStart >= 0, dataStart + packedSize <= bytes.count else { return nil }
 
-            let payload = Data(bytes[dataStart..<(dataStart + size)])
+            let raw = Data(bytes[dataStart..<(dataStart + packedSize)])
+            let payload: Data
+            if method == 8 {
+                guard let inflated = inflate(raw, capacity: size) else { return nil }
+                payload = inflated
+            } else {
+                payload = raw
+            }
             guard crc32(payload) == checksum else { return nil }
             entries.append((name, payload))
             offset = nameStart + nameLength + extraLength + commentLength

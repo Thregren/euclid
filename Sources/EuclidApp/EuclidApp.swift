@@ -114,6 +114,10 @@ struct Euclid: App {
                 .keyboardShortcut("z", modifiers: [.command, .shift])
         }
         CommandGroup(after: .toolbar) {
+            Toggle(isOn: Bindable(model).showLayers) {
+                Text("显示图层面板")
+            }
+            .keyboardShortcut("l", modifiers: [.command, .option])
             Toggle(isOn: Bindable(model).showInspector) {
                 Text("显示检查器")
             }

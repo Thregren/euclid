@@ -171,7 +171,7 @@ struct MeasurementSection: View {
         let store = model.measurements
         Section {
             if !store.draft.isEmpty {
-                draftBlock(store)
+                DraftMeasurementBlock()
             }
 
             // 新的在最上面：画完一条抬头就能看到它，不用滚到列表底部。
@@ -215,65 +215,12 @@ struct MeasurementSection: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
         } header: {
-            Text("测量")
-        }
-    }
-
-    @ViewBuilder
-    private func draftBlock(_ store: MeasurementStore) -> some View {
-        let result = store.draftResult
-        VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
-                Image(systemName: store.draftKind.symbolName)
-                    .foregroundStyle(.tint)
-                Text("正在\(store.draftKind.displayName)")
-                    .font(.callout.weight(.medium))
+                Text("测量")
                 Spacer()
-                Text("\(store.draft.count) 点")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
+                areaUnitMenu(store)
             }
-            if let area = result.area {
-                LabeledContent("面积", value: MeasureFormat.area(area))
-            }
-            if result.totalLength > 0 {
-                LabeledContent(lengthTitle(for: store.draftKind),
-                               value: MeasureFormat.distance(result.totalLength))
-            }
-            if store.draftKind == .circle {
-                RadiusField(meters: store.draftCircleRadius) { store.setDraftCircleRadius($0) }
-                if store.draftCircleRadius == nil, let preview = store.draftLiveRadius {
-                    LabeledContent("预览半径", value: MeasureFormat.distance(preview))
-                }
-            }
-            HStack {
-                Button {
-                    store.finishDraft()
-                    model.canvas.refreshOverlay()
-                } label: {
-                    ShortcutButtonLabel(title: "结束", shortcut: "↩")
-                }
-                .disabled(store.draft.count < (store.draftKind == .area ? 3 : 2))
-                .help("结束当前测量（回车）")
-                Button {
-                    store.removeLastDraftPoint()
-                    model.canvas.refreshOverlay()
-                } label: {
-                    ShortcutButtonLabel(title: "撤销一点", shortcut: "⌫")
-                }
-                .help("撤掉刚点下的那个点（退格）")
-                Button {
-                    store.cancelDraft()
-                    model.canvas.refreshOverlay()
-                } label: {
-                    ShortcutButtonLabel(title: "取消", shortcut: "esc")
-                }
-                .help("取消整条草稿（Esc）")
-            }
-            .controlSize(.small)
         }
-        .padding(.vertical, 2)
     }
 
     @ViewBuilder
@@ -351,7 +298,7 @@ struct MeasurementSection: View {
             LabeledContent("坐标", value: CoordinateText.decimal(coordinate, precision: 7))
         }
         if let area = result.area {
-            LabeledContent("面积", value: MeasureFormat.area(area))
+            LabeledContent("面积", value: model.areaText(area))
         }
         if measurement.kind != .point {
             LabeledContent(lengthTitle(for: measurement.kind),
@@ -437,6 +384,29 @@ struct MeasurementSection: View {
         "\(measurement.pointLabel(at: index))–\(measurement.pointLabel(at: index + 1))"
     }
 
+    /// 面积单位切换（只影响显示：存档与导出始终是平方米）。
+    @ViewBuilder
+    private func areaUnitMenu(_ store: MeasurementStore) -> some View {
+        Menu {
+            Picker("面积单位", selection: Bindable(model).areaUnit) {
+                ForEach(MeasureFormat.AreaUnit.allCases) { unit in
+                    Text(unit.title).tag(unit)
+                }
+            }
+            .pickerStyle(.inline)
+        } label: {
+            HStack(spacing: 3) {
+                Image(systemName: "squareshape.split.2x2.dotted")
+                Text(model.areaUnit.shortTitle)
+            }
+            .font(.caption)
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("面积显示单位：自动按数量级切换，也可以固定成平方米 / 公顷 / 平方公里 / 亩（只影响显示，存档与导出仍是平方米）")
+    }
+
     private func lengthTitle(for kind: MeasurementKind) -> String {
         switch kind {
         case .area, .circle: return "周长"
@@ -453,9 +423,83 @@ struct MeasurementSection: View {
         case .distance:
             return MeasureFormat.distance(result.totalLength)
         case .area:
-            return result.area.map { MeasureFormat.area($0) } ?? "—"
+            return result.area.map { model.areaText($0) } ?? "—"
         case .circle:
             return result.radius.map { "R " + MeasureFormat.distance($0) } ?? "—"
+        }
+    }
+}
+
+/// 正在画的那条草稿。
+///
+/// 单独成视图的理由和「视图读数」小节一样：草稿的实时长度与预览半径**每次移动指针都在变**，
+/// 写在 `MeasurementSection` 的 body 里就会连带把下面整张测量列表重算一遍 —— 测量越多越贵。
+/// 拆出来之后，移动指针只重绘这一小节，列表那几十行完全不碰。
+private struct DraftMeasurementBlock: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        let store = model.measurements
+        let result = store.draftResult
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: store.draftKind.symbolName)
+                    .foregroundStyle(.tint)
+                Text("正在\(store.draftKind.displayName)")
+                    .font(.callout.weight(.medium))
+                Spacer()
+                Text("\(store.draft.count) 点")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
+            if let area = result.area {
+                LabeledContent("面积", value: model.areaText(area))
+            }
+            if result.totalLength > 0 {
+                LabeledContent(Self.lengthTitle(for: store.draftKind),
+                               value: MeasureFormat.distance(result.totalLength))
+            }
+            if store.draftKind == .circle {
+                RadiusField(meters: store.draftCircleRadius) { store.setDraftCircleRadius($0) }
+                if store.draftCircleRadius == nil, let preview = store.draftLiveRadius {
+                    LabeledContent("预览半径", value: MeasureFormat.distance(preview))
+                }
+            }
+            HStack {
+                Button {
+                    store.finishDraft()
+                    model.canvas.refreshOverlay()
+                } label: {
+                    ShortcutButtonLabel(title: "结束", shortcut: "↩")
+                }
+                .disabled(store.draft.count < (store.draftKind == .area ? 3 : 2))
+                .help("结束当前测量（回车）")
+                Button {
+                    store.removeLastDraftPoint()
+                    model.canvas.refreshOverlay()
+                } label: {
+                    ShortcutButtonLabel(title: "撤销一点", shortcut: "⌫")
+                }
+                .help("撤掉刚点下的那个点（退格）")
+                Button {
+                    store.cancelDraft()
+                    model.canvas.refreshOverlay()
+                } label: {
+                    ShortcutButtonLabel(title: "取消", shortcut: "esc")
+                }
+                .help("取消整条草稿（Esc）")
+            }
+            .controlSize(.small)
+        }
+        .padding(.vertical, 2)
+    }
+
+    private static func lengthTitle(for kind: MeasurementKind) -> String {
+        switch kind {
+        case .area, .circle: return "周长"
+        case .distance: return "总长度"
+        case .point: return "长度"
         }
     }
 }

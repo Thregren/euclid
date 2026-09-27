@@ -75,7 +75,7 @@ enum MapTool: String, CaseIterable, Hashable, Sendable {
     func hint(draftCount: Int) -> String? {
         switch self {
         case .browse:
-            return "P 记下指针位置的点（与「点坐标」工具同一份数据）· 滚轮缩放 · 中键或拖动平移"
+            return "P 记下指针位置的点 · 滚轮/捏合缩放 · 拖动、双指或方向键（⇧ 加速）平移"
         case .point:
             return "点击地图取点，坐标显示在检查器中"
         case .distance:
