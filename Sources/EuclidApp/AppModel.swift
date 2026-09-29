@@ -58,6 +58,9 @@ struct MapLayer: Identifiable {
     var sourceKey: String
     var tileSize: Int
     var zoomRange: ClosedRange<Int>
+    /// 瓦片编号的网格。经纬度网格（EPSG:4490）的行按纬度等分，
+    /// 铺到墨卡托世界里同一层每张瓦片的高度都不一样，铺图与读数都要按它算。
+    var grid: TileGrid = .webMercator
     /// 在线底图按地图约定（瓦片铺满自身像素数），本地影像按设备像素 1:1。
     var followsDisplayScale: Bool
     var maximumDataZoom: Double

@@ -235,9 +235,10 @@ extension AppModel {
             kind: .dataset,
             name: dataset.name,
             source: dataset.source,
-            sourceKey: "dataset|\(dataset.id)|\(dataset.layout.tileSize)",
+            sourceKey: "dataset|\(dataset.id)|\(dataset.layout.tileSize)|\(dataset.grid.kind.rawValue)",
             tileSize: dataset.layout.tileSize,
             zoomRange: dataset.zoomRange,
+            grid: dataset.grid,
             followsDisplayScale: false,
             maximumDataZoom: Double(dataset.zoomRange.upperBound),
             memoryLimitBytes: TileCacheBudget.bytes(for: .dataset),
@@ -246,8 +247,16 @@ extension AppModel {
             // 基准层的身份由调用方决定（见 `applyLocalLayer` / `addLayer`）：
             // 「加一层本地数据」不该顺手把它标成基准层，否则会出现两个「基准」。
             isAnchor: false,
-            detail: "z\(dataset.zoomRange.lowerBound)–z\(dataset.zoomRange.upperBound) · \(dataset.layout.tileSize)px"
+            detail: Self.detail(of: dataset)
         )
+    }
+
+    /// 数据集在图层行 / 检查器里的副标题。
+    static func detail(of dataset: TileDataset) -> String {
+        var parts = ["z\(dataset.zoomRange.lowerBound)–z\(dataset.zoomRange.upperBound) · \(dataset.layout.tileSize)px"]
+        if dataset.isArchive { parts.append("zip 分卷") }
+        if dataset.grid.kind != .webMercator { parts.append(dataset.grid.shortTitle) }
+        return parts.joined(separator: " · ")
     }
 
     /// 由单幅影像造一层。

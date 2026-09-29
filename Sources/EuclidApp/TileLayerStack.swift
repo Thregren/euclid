@@ -28,6 +28,8 @@ final class TileLayerStack {
     private(set) var name = ""
     /// 数据源实际提供的整数层级范围。
     private(set) var dataZoomRange: ClosedRange<Int> = 0...22
+    /// 这一层的瓦片网格（墨卡托 / 经纬度）。铺图位置、网格线、瓦片读数都按它算。
+    private(set) var grid: TileGrid = .webMercator
     /// 数据源自身的最大层级（「原始比例」用）。
     private(set) var maximumDataZoom: Double = 20
     /// 相机上下限（真实层级 ± 余量）。
@@ -121,6 +123,7 @@ final class TileLayerStack {
         name: String,
         tileSize: Int,
         zoomRange: ClosedRange<Int>,
+        grid: TileGrid = .webMercator,
         followsDisplayScale: Bool,
         maximumDataZoom: Double,
         memoryLimitBytes: Int = 512 * 1024 * 1024,
@@ -137,6 +140,7 @@ final class TileLayerStack {
         cacheLimitBytes = memoryLimitBytes
         self.name = name
         baseTileSize = Double(max(1, tileSize))
+        self.grid = grid
         tileSizeFollowsDisplayScale = followsDisplayScale
         dataZoomRange = zoomRange
         self.maximumDataZoom = maximumDataZoom
@@ -156,6 +160,31 @@ final class TileLayerStack {
     /// 相机里的瓦片边长（视图点）。
     func cameraTileSize(displayScale: Double) -> Double {
         baseTileSize * (tileSizeFollowsDisplayScale ? displayScale : 1)
+    }
+
+    /// 「一屏还铺得出来」的最低相机层级。
+    ///
+    /// 相机缩到比数据最低层级还小时，这一层会把瓦片层级夹在数据的最低层级上，
+    /// 一屏要铺的瓦片数就按 4 的幂往上涨（缩出去 3 级就是一屏六千多片）。
+    /// 超过 `maximumTilesPerFrame` 这个安全阀，`sync` 只能清空画布 —— 那看起来
+    /// 就跟「数据没打开」一样（整省 z12 的数据在「适应窗口」下正好会踩到）。
+    ///
+    /// 这里按当前视口反推「还能铺得出来」的最低层级，交给相机的缩放下限用：
+    /// 想看全貌就停在还能铺出来的那一档，画面仍然是真实几何（不做抽样拉伸 ——
+    /// 这是个测量工具，宁可少看一点，也不能让影像错位）。
+    func affordableCameraZoom(viewportSize: CGSize, displayScale: Double) -> Double {
+        let tilePoints = cameraTileSize(displayScale: displayScale)
+        guard isActive, tilePoints > 0, viewportSize.width > 1, viewportSize.height > 1 else {
+            return zoomLevelRange.lowerBound
+        }
+        // 换算口径统一放在 `TileBudget` 里（连设备像素比一起算），这里只喂参数。
+        return TileBudget.affordableZoomLevel(
+            viewportSize: viewportSize,
+            tilePixelSize: tilePoints,
+            displayScale: displayScale,
+            minimumDataZoom: dataZoomRange.lowerBound,
+            maximumTiles: Self.maximumTilesPerFrame
+        )
     }
 
     func setContentsScale(_ scale: CGFloat) {
@@ -211,10 +240,11 @@ final class TileLayerStack {
         // 取图行列按「偏移后的相机」算：得到的编号是该基准下的瓦片编号。
         let offset = worldOffset(for: camera)
         let rangeCamera = self.rangeCamera(camera, offset: offset)
-        guard let columns = rangeCamera.tileColumnRange(zoom: zoom),
-              let rows = rangeCamera.tileRowRange(zoom: zoom) else {
+        guard let range = grid.tileRange(zoom: zoom, worldRect: rangeCamera.visibleWorldRect) else {
             return nil
         }
+        let columns = range.columns
+        let rows = range.rows
         let total = columns.count * rows.count
         guard total <= Self.maximumTilesPerFrame else {
             // 超出安全阀时宁可清空，也不要留着上一帧的残影误导判读。
@@ -223,8 +253,7 @@ final class TileLayerStack {
                                   fallback: 0, missing: missingTiles.count, tileDisplaySize: 0)
         }
 
-        let tileWorldSize = 1.0 / Double(1 << zoom)
-        let tileDisplaySize = CGFloat(camera.pixelsPerWorldUnit * tileWorldSize)
+        let tileDisplaySize = CGFloat(camera.pixelsPerWorldUnit / Double(1 << zoom))
 
         var needed = Set<SlippyTile>()
         needed.reserveCapacity(total)
@@ -278,12 +307,13 @@ final class TileLayerStack {
         }
 
         for tile in laidOut {
-            let worldX = Double(tile.x) / Double(1 << zoom)
-            let worldY = Double(tile.y) / Double(1 << zoom)
+            // 经纬度网格的行按纬度等分，换算到墨卡托世界后每张瓦片的高度都不一样，
+            // 因此 frame 必须**逐片**按自己的世界矩形算（墨卡托网格下等价于原来的正方形）。
+            let world = grid.worldRect(zoom: zoom, column: tile.x, row: tile.y)
             // 图形本身按偏移后的位置落位，于是该基准的栅格与工作基准的坐标对齐。
             let origin = camera.layerPoint(forWorldPoint: CGPoint(
-                x: worldX + offset.x,
-                y: worldY + offset.y
+                x: world.minX + offset.x,
+                y: world.minY + offset.y
             ))
             // 瓦片铺在非整数倍比例上时，图层边缘会带出半像素的采样渗色，
             // 一整片白底影像上就是每隔一片一条浅灰细线。把每格的 frame 撑开半个点，
@@ -291,8 +321,8 @@ final class TileLayerStack {
             let frame = CGRect(
                 x: origin.x - Self.tileSeamOverlap,
                 y: origin.y - Self.tileSeamOverlap,
-                width: tileDisplaySize + Self.tileSeamOverlap * 2,
-                height: tileDisplaySize + Self.tileSeamOverlap * 2
+                width: CGFloat(world.width * camera.pixelsPerWorldUnit) + Self.tileSeamOverlap * 2,
+                height: CGFloat(world.height * camera.pixelsPerWorldUnit) + Self.tileSeamOverlap * 2
             )
 
             let layer: CALayer
@@ -463,13 +493,17 @@ final class TileLayerStack {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         for (tile, layer) in backdropLayers {
-            let count = Double(1 << tile.zoom)
-            let size = CGFloat(camera.pixelsPerWorldUnit / count)
+            let world = grid.worldRect(zoom: tile.zoom, column: tile.x, row: tile.y)
             let origin = camera.layerPoint(forWorldPoint: CGPoint(
-                x: Double(tile.x) / count + offset.x,
-                y: Double(tile.y) / count + offset.y
+                x: world.minX + offset.x,
+                y: world.minY + offset.y
             ))
-            layer.frame = CGRect(x: origin.x, y: origin.y, width: size, height: size)
+            layer.frame = CGRect(
+                x: origin.x,
+                y: origin.y,
+                width: CGFloat(world.width * camera.pixelsPerWorldUnit),
+                height: CGFloat(world.height * camera.pixelsPerWorldUnit)
+            )
         }
         CATransaction.commit()
     }
@@ -691,8 +725,9 @@ final class TileLayerStack {
         guard settled else { return }
 
         let zoom = dataZoom(for: camera)
-        guard let columns = camera.tileColumnRange(zoom: zoom),
-              let rows = camera.tileRowRange(zoom: zoom) else { return }
+        guard let range = grid.tileRange(zoom: zoom, worldRect: camera.visibleWorldRect) else { return }
+        let columns = range.columns
+        let rows = range.rows
         let key = "\(zoom):\(columns.lowerBound)-\(columns.upperBound):\(rows.lowerBound)-\(rows.upperBound)"
         guard key != lastPrefetchKey else { return }
         lastPrefetchKey = key
@@ -716,12 +751,13 @@ final class TileLayerStack {
 
     private func renderGrid(camera: MapCamera, offset: CGPoint, zoom: Int, visible: Bool) {
         guard visible,
-              let columns = camera.tileColumnRange(zoom: zoom),
-              let rows = camera.tileRowRange(zoom: zoom) else {
+              let range = grid.tileRange(zoom: zoom, worldRect: camera.visibleWorldRect) else {
             gridLayer.isHidden = true
             gridLayer.path = nil
             return
         }
+        let columns = range.columns
+        let rows = range.rows
         let path = CGMutablePath()
         let count = Double(1 << zoom)
         for column in columns.lowerBound...columns.upperBound + 1 {
@@ -733,9 +769,10 @@ final class TileLayerStack {
             path.addLine(to: CGPoint(x: x, y: camera.viewportSize.height))
         }
         for row in rows.lowerBound...rows.upperBound + 1 {
+            // 经纬度网格的横线落在纬度边界上，得先换算成墨卡托 y —— 直接按行号等分会错位。
             let y = camera.layerPoint(forWorldPoint: CGPoint(
                 x: offset.x,
-                y: Double(row) / count + offset.y
+                y: grid.worldRowBoundary(zoom: zoom, row: row) + offset.y
             )).y
             path.move(to: CGPoint(x: 0, y: y))
             path.addLine(to: CGPoint(x: camera.viewportSize.width, y: y))
@@ -794,9 +831,12 @@ final class TileLayerStack {
     static func resetTileRequestCount() { tileRequestCount = 0 }
 
     private func distanceSquared(_ tile: SlippyTile, center: CGPoint) -> Double {
-        let n = Double(1 << tile.zoom)
-        let dx = (Double(tile.x) + 0.5) / n - center.x
-        let dy = (Double(tile.y) + 0.5) / n - center.y
+        // 用瓦片在世界里的真实中心：经纬度网格的瓦片不是正方形，中心也不在
+        // `(行号 + 0.5) / n` 上（高纬处偏得更明显）。这个值只用来排序「谁先取」，
+        // 但排序偏了就会先取边缘的、后取眼前的。
+        let rect = grid.worldRect(zoom: tile.zoom, column: tile.x, row: tile.y)
+        let dx = rect.midX - center.x
+        let dy = rect.midY - center.y
         return dx * dx + dy * dy
     }
 }

@@ -755,7 +755,16 @@ func datasetCheck(root: URL) {
             x: 1 << (dataset.zoomRange.upperBound - 1),
             y: 1 << (dataset.zoomRange.upperBound - 1)
         )
-        expect(source.fileCandidates(for: mid).count == dataset.layout.fileExtensions.count, "\(dataset.name) 生成候选路径")
+        // 散文件目录按「布局 + 扩展名」拼路径；zip 分卷按「行/列 + 扩展名」在包内找名字。
+        if let directory = source as? DirectoryTileSource {
+            expect(directory.fileCandidates(for: mid).count == dataset.layout.fileExtensions.count,
+                   "\(dataset.name) 生成候选路径")
+        } else if let archive = source as? ZipTileSource {
+            expect(!archive.fileExtensions.isEmpty, "\(dataset.name) 应有候选扩展名")
+            expect(archive.parts[dataset.zoomRange.upperBound] != nil, "\(dataset.name) 应有该层级的分卷")
+        } else {
+            expect(false, "\(dataset.name) 的数据来源类型不认识")
+        }
     }
     expect(discovered.count >= 1, "应在测试目录中找到至少 1 个数据集")
 }
@@ -2028,6 +2037,509 @@ do {
     } else {
         expect(false, "JPEG 瓦片应能读回")
     }
+}
+
+// MARK: - 瓦片网格（墨卡托 / 经纬度）
+
+section("瓦片网格")
+
+// 墨卡托分支必须与 `SlippyTile` 逐位一致：铺图位置只要差一个浮点尾数，
+// 相邻瓦片之间就会渗出细缝。
+for zoom in [0, 3, 12, 18] {
+    let n = 1 << zoom
+    for (column, row) in [(0, 0), (n - 1, n - 1), (n / 2, n / 3)] {
+        let reference = SlippyTile(zoom: zoom, x: column, y: row).worldRect
+        let rect = TileGrid.webMercator.worldRect(zoom: zoom, column: column, row: row)
+        expect(rect == reference, "z\(zoom) 墨卡托瓦片矩形应与 SlippyTile 逐位一致")
+    }
+}
+
+// 经纬度网格的行是「纬度等分」，列与墨卡托一致。z12 的福州（119.3, 26.08）落在
+// 3405 列、727 行，而墨卡托网格里的同一位置在 1740 行 —— 必须区分两种网格的原因就在这。
+let fuzhou = GeoCoordinate(longitude: 119.3, latitude: 26.08)
+let geographicTile = TileGrid.geographic.tile(at: fuzhou, zoom: 12)
+expect(geographicTile.column == 3405, "z12 经纬度网格的列号应为 3405（实际 \(geographicTile.column)）")
+expect(geographicTile.row == 727, "z12 经纬度网格的行号应为 727（实际 \(geographicTile.row)）")
+let mercatorTile = TileGrid.webMercator.tile(at: fuzhou, zoom: 12)
+expect(mercatorTile.column == 3405, "两种网格的列号应当一致")
+expect(mercatorTile.row == 1740, "z12 墨卡托网格的行号应为 1740（实际 \(mercatorTile.row)）")
+
+// 经纬度网格的边界值（后面的 bbox 用例直接引用这几个数）。
+let northWestTile = TileGrid.geographic.bounds(zoom: 12, column: 3366, row: 701)
+expectClose(northWestTile.west, 115.83984375, accuracy: 1e-12, "列 3366 的西边界")
+expectClose(northWestTile.east, 115.927734375, accuracy: 1e-12, "列 3366 的东边界")
+expectClose(northWestTile.north, 28.388671875, accuracy: 1e-12, "行 701 的北边界")
+expectClose(northWestTile.south, 28.30078125, accuracy: 1e-12, "行 701 的南边界")
+expectClose(northWestTile.east - northWestTile.west, 360 / 4096, accuracy: 1e-12, "经纬度瓦片的经度跨度")
+
+// 经纬度瓦片在墨卡托世界里不再是正方形：越往高纬越「高」，所以每片的 frame 要各算各的。
+let geographicRect = TileGrid.geographic.worldRect(zoom: 12, column: 3366, row: 701)
+let mercatorRect = TileGrid.webMercator.worldRect(zoom: 12, column: 3366, row: 701)
+expectClose(mercatorRect.width, mercatorRect.height, accuracy: 1e-12, "墨卡托瓦片在世界上是正方形")
+expect(geographicRect.height > geographicRect.width, "经纬度瓦片在墨卡托世界里的高度应大于宽度")
+expectClose(geographicRect.width, mercatorRect.width, accuracy: 1e-12, "两种网格的列宽在世界上应当相同")
+// 瓦片的上下边界必须与行边界函数给出的是同一个值（画网格线与铺图共用它）。
+expectClose(geographicRect.minY, TileGrid.geographic.worldRowBoundary(zoom: 12, row: 701),
+            accuracy: 1e-12, "瓦片北边界应与行边界一致")
+expectClose(geographicRect.maxY, TileGrid.geographic.worldRowBoundary(zoom: 12, row: 702),
+            accuracy: 1e-12, "瓦片南边界应与下一行边界一致")
+expectClose(TileGrid.webMercator.worldRowBoundary(zoom: 12, row: 701), 701.0 / 4096,
+            accuracy: 1e-15, "墨卡托行边界就是 row / n")
+// 极区落在墨卡托的截断纬度之外，高度只能给 0，不能变成负数（负高度会把 frame 翻过来）。
+expect(TileGrid.geographic.worldRect(zoom: 12, column: 0, row: 0).height >= 0,
+       "两极附近的经纬度瓦片高度不应为负")
+
+// 福建数据集的 bbox 应恰好盖住 3366…3418 列、701…756 行。
+let fujianBounds = GeoBounds(west: 115.84259, south: 23.483276, east: 120.4953, north: 28.322754)
+if let range = TileGrid.geographic.tileRange(zoom: 12, worldRect: fujianBounds.normalizedRect) {
+    // bbox 的东边界 120.4953 落在第 3418 列「里面」（3418 列覆盖 120.4101…120.4980），
+    // 所以覆盖到的列是 3366…3418 共 53 列 —— 这正好与 manifest 的 53 × 56 − 196 缺片 = 2772 对上。
+    expect(range.columns.lowerBound == 3366 && range.columns.upperBound == 3418,
+           "bbox 应覆盖 3366…3418 列（实际 \(range.columns.lowerBound)…\(range.columns.upperBound)）")
+    expect(range.rows.lowerBound == 701 && range.rows.upperBound == 756,
+           "bbox 应覆盖 701…756 行（实际 \(range.rows.lowerBound)…\(range.rows.upperBound)）")
+    let planned = (range.columns.count) * (range.rows.count)
+    expect(planned == 53 * 56, "z12 的规划瓦片数应为 53 × 56（实际 \(planned)）")
+} else {
+    expect(false, "bbox 应能算出瓦片行列范围")
+}
+
+// 行列 → 世界矩形 → 行列：铺图用的就是这个换算，必须能回到同一格。
+var roundTripFailure: String?
+for (column, row) in [(3405, 727), (3366, 701), (3419, 756), (3370, 750)] {
+    let rect = TileGrid.geographic.worldRect(zoom: 12, column: column, row: row)
+    // 瓦片中心回代：这不是边界，必须一格不差。
+    let center = WebMercator.coordinate(fromNormalized: CGPoint(x: rect.midX, y: rect.midY))
+    let back = TileGrid.geographic.tile(at: center, zoom: 12)
+    if back.column != column || back.row != row {
+        roundTripFailure = "中心回代得到 \(back.column)/\(back.row)，期望 \(column)/\(row)"
+        break
+    }
+    // 覆盖范围必须包住这张瓦片；边界处 floor / ceil 允许 1 格的浮点偏差。
+    guard let cover = TileGrid.geographic.tileRange(zoom: 12, worldRect: rect) else {
+        roundTripFailure = "\(column)/\(row) 的覆盖范围算不出来"
+        break
+    }
+    if cover.columns.lowerBound > column || cover.columns.upperBound < column
+        || cover.rows.lowerBound > row + 1 || cover.rows.upperBound < row - 1 {
+        roundTripFailure = "\(column)/\(row) 的覆盖范围 \(cover.columns) / \(cover.rows) 偏离过大"
+        break
+    }
+}
+expect(roundTripFailure == nil, "经纬度网格的「行列 → 世界矩形 → 行列」应往返一致（\(roundTripFailure ?? "通过")）")
+
+// 地面分辨率：两种网格在同一个层级、同一条纬线上必须给出同一个数。
+let geographicResolution = TileGrid.geographic.metersPerPixel(zoom: 18, latitude: 26)
+expectClose(geographicResolution, TileGrid.webMercator.metersPerPixel(zoom: 18, latitude: 26),
+            accuracy: 1e-9, "两种网格在 z18 / 26°N 的地面分辨率应一致")
+expectClose(geographicResolution, 0.53673, accuracy: 1e-4, "z18 / 26°N 的地面分辨率")
+expect(TileGrid.geographic.metersPerPixel(zoom: 19, latitude: 26) < geographicResolution,
+       "经纬度网格的地面分辨率应随层级变细")
+// 层级越界不许把 `1 << zoom` 弄崩。
+expect(TileGrid.webMercator.tileCount(zoom: 99) == 1 << 30, "过大的层级应夹到 30")
+expect(TileGrid.geographic.tileCount(zoom: -3) == 1, "负层级应夹到 0")
+
+// MARK: - ZIP 分卷瓦片包
+
+section("ZIP 分卷瓦片包")
+
+// MARK: - 铺图预算（一屏铺得出来的最低层级）
+
+section("铺图预算（一屏片数与缩放下限）")
+
+// 口径来自实机：福建全省 z12、Retina 2 倍、1340×836 点的画布。
+// 整数层级上一张 256px 的瓦片占 128 个视图点，一屏正好 10.47 × 6.53 ≈ 68.4 片。
+let retinaViewport = CGSize(width: 1340, height: 836)
+let perScreen = TileBudget.tilesPerScreen(
+    viewportSize: retinaViewport, tilePixelSize: 256, displayScale: 2
+)
+expectClose(perScreen, 68.37, accuracy: 0.05, "一屏片数（1340×836 点 / 256px 瓦片 / 2 倍屏）")
+// 少除一次显示比例就会得到 17.09 —— 正是「下限掉到 z9.14、一屏 3388 片被清空」的那个错。
+expect(perScreen > 60, "一屏片数不能漏算设备像素比（漏了会得到 17 左右）")
+
+// 相机比瓦片层级浅时，每浅一级一屏的片数是上一档的 4 倍。
+expectClose(
+    TileBudget.tilesPerScreen(
+        viewportSize: retinaViewport, tilePixelSize: 256, displayScale: 2,
+        cameraZoom: 11, dataZoom: 12
+    ),
+    perScreen * 4, accuracy: 1e-6, "浅一级应正好翻两番"
+)
+expectClose(
+    TileBudget.tilesPerScreen(
+        viewportSize: retinaViewport, tilePixelSize: 256, displayScale: 2,
+        cameraZoom: 14, dataZoom: 12
+    ),
+    perScreen, accuracy: 1e-6, "相机比瓦片层级深时按整屏算"
+)
+// 估算必须偏保守：z9.141 那档实机铺出来 3388 片，估算不能比它小。
+let estimateAtOldFloor = TileBudget.tilesPerScreen(
+    viewportSize: retinaViewport, tilePixelSize: 256, displayScale: 2,
+    cameraZoom: 9.141, dataZoom: 12
+)
+expect(estimateAtOldFloor > 3388, "z9.141 的估算片数应不小于实机铺出的 3388 片")
+
+let affordable = TileBudget.affordableZoomLevel(
+    viewportSize: retinaViewport, tilePixelSize: 256, displayScale: 2,
+    minimumDataZoom: 12, maximumTiles: 1200
+)
+expectClose(affordable, 10.14, accuracy: 0.02, "福建全省 z12 在 1340×836 视口下的最低可铺层级")
+expect(affordable > 9.5, "最低可铺层级不能因为漏算显示比例而掉到 9.1 那一档")
+// 下限这一档的估算片数要落在安全阀里，否则「适应窗口」还是会被清空。
+let tilesAtAffordable = TileBudget.tilesPerScreen(
+    viewportSize: retinaViewport, tilePixelSize: 256, displayScale: 2,
+    cameraZoom: affordable, dataZoom: 12
+)
+expect(tilesAtAffordable <= 1200, "最低可铺层级的一屏片数应在安全阀以内（实际 \(tilesAtAffordable)）")
+
+// 返回的下限不会比「数据最低层级再往外半级」更靠里（更保守）：正常缩放不受影响。
+// 数据本来就浅（z6）时一屏只要几十片，限制会落到预算真正撑不住的位置 —— 比半级更外。
+let shallowData = TileBudget.affordableZoomLevel(
+    viewportSize: retinaViewport, tilePixelSize: 256, displayScale: 2,
+    minimumDataZoom: 6, maximumTiles: 1200
+)
+expectClose(shallowData, 4.14, accuracy: 0.02, "浅层数据（z6）的最低可铺层级")
+expect(shallowData <= 6 - 0.5 + 1e-9, "下限不该比「数据最低层级再往外半级」更靠里")
+// 窗口越大，一屏能铺的片数越多，下限就越靠近数据最低层级。
+let wideAffordable = TileBudget.affordableZoomLevel(
+    viewportSize: CGSize(width: 2680, height: 1672), tilePixelSize: 256, displayScale: 2,
+    minimumDataZoom: 12, maximumTiles: 1200
+)
+expect(wideAffordable > affordable, "视口大一倍时下限应更高（更靠近数据最低层级）")
+// 退化输入不许崩、不许返回 NaN。
+expectClose(
+    TileBudget.affordableZoomLevel(
+        viewportSize: .zero, tilePixelSize: 256, displayScale: 2,
+        minimumDataZoom: 12, maximumTiles: 1200
+    ),
+    11.5, accuracy: 1e-9, "零视口应退回「数据最低层级再往外半级」"
+)
+expectClose(
+    TileBudget.affordableZoomLevel(
+        viewportSize: retinaViewport, tilePixelSize: 0, displayScale: 2,
+        minimumDataZoom: 12, maximumTiles: 1200
+    ),
+    11.5, accuracy: 1e-9, "瓦片边长为 0 时不许算出 NaN"
+)
+expect(TileBudget.tilesPerScreen(viewportSize: .zero, tilePixelSize: 256, displayScale: 2) == 0,
+       "零视口的一屏片数应为 0")
+expect(TileBudget.tilesPerScreen(viewportSize: retinaViewport, tilePixelSize: 256, displayScale: 0).isFinite,
+       "显示比例为 0 时不许返回 inf / NaN")
+let archiveRoot = URL(fileURLWithPath: NSTemporaryDirectory())
+    .appending(path: "euclid-zip-\(UUID().uuidString)")
+do {
+    try FileManager.default.createDirectory(at: archiveRoot, withIntermediateDirectories: true)
+} catch {
+    expect(false, "构造 zip 测试目录失败：\(error)")
+}
+defer { try? FileManager.default.removeItem(at: archiveRoot) }
+
+/// 造一段「好压」的假瓦片内容；长度与 CRC 才是这里要验的东西。
+func fakeTile(_ tag: String, repeats: Int) -> Data {
+    Data(String(repeating: "瓦片-\(tag)-", count: repeats).utf8)
+}
+
+/// 打开一个文件，把失败原因取出来（成功时返回 nil）。
+func zipOpeningError(_ url: URL) -> ZipArchive.ZipError? {
+    do {
+        _ = try ZipArchive(url: url)
+        return nil
+    } catch {
+        return error as? ZipArchive.ZipError
+    }
+}
+
+let zipEntries: [(name: String, data: Data)] = [
+    ("701/3375.jpg", fakeTile("A", repeats: 512)),
+    ("701/3376.png", fakeTile("B", repeats: 40)),
+    ("702/3376.png", fakeTile("C", repeats: 200)),
+]
+
+for useDeflate in [false, true] {
+    let label = useDeflate ? "deflate" : "存储"
+    let url = archiveRoot.appending(path: "sample-\(label).zip")
+    do {
+        try ZIP.stored(zipEntries, compress: useDeflate).write(to: url)
+    } catch {
+        expect(false, "\(label)：写出 zip 失败（\(error)）")
+        continue
+    }
+
+    guard let archive = try? ZipArchive(url: url) else {
+        expect(false, "\(label)：自己压出来的 zip 应当能打开")
+        continue
+    }
+    expect(archive.entryCount == 3, "\(label)：应认出 3 条记录（实际 \(archive.entryCount)）")
+    expect(!archive.isZip64, "\(label)：小包不该被当成 ZIP64")
+    expect(archive.indexedRows == [701, 702], "\(label)：索引里的行号应为 701、702（实际 \(archive.indexedRows)）")
+    expect(archive.entryNames(inRow: "701") == ["701/3375.jpg", "701/3376.png"], "\(label)：行 701 的条目名")
+    expect(archive.columnNumbers(inRow: "701") == [3375, 3376], "\(label)：行 701 的列号")
+    expect(archive.columnNumbers(inRow: "702") == [3376], "\(label)：行 702 的列号")
+    expect(archive.entryNames(inRow: "999").isEmpty, "\(label)：不存在的行应当为空")
+    expect(archive.entry(named: "701/9999.jpg") == nil, "\(label)：不存在的条目应为 nil")
+
+    var allMatched = true
+    for item in zipEntries {
+        guard let entry = archive.entry(named: item.name),
+              let data = try? archive.data(for: entry),
+              data == item.data else {
+            allMatched = false
+            continue
+        }
+    }
+    expect(allMatched, "\(label)：每条记录都应能按名字读出且逐字节一致")
+    // 压缩方式确实走到了想验的那条分支。
+    let method = archive.entry(named: "701/3375.jpg")?.method
+    expect(method == (useDeflate ? 8 : 0),
+           "\(label)：压缩方式应为 \(useDeflate ? 8 : 0)（实际 \(method.map(String.init) ?? "nil")）")
+
+    // 改坏数据体：必须抛错，绝不能「读出错的内容还当成功」。
+    if let entry = archive.entry(named: "701/3375.jpg"),
+       let raw = try? Data(contentsOf: url) {
+        // 本地文件头 30 字节 + 名字，之后就是数据；ZIP.stored 不写扩展字段。
+        let dataOffset = Int(entry.localHeaderOffset) + 30 + "701/3375.jpg".utf8.count
+        let target = dataOffset + Int(entry.compressedSize) / 2
+        if target < raw.count {
+            var broken = raw
+            broken[target] ^= 0xFF
+            let brokenURL = archiveRoot.appending(path: "broken-\(label).zip")
+            try? broken.write(to: brokenURL)
+            if let brokenArchive = try? ZipArchive(url: brokenURL),
+               let brokenEntry = brokenArchive.entry(named: "701/3375.jpg") {
+                expect((try? brokenArchive.data(for: brokenEntry)) == nil,
+                       "\(label)：数据体被改坏后必须报错，而不是返回坏内容")
+            } else {
+                expect(false, "\(label)：改坏数据体不该影响中央目录的解析")
+            }
+        } else {
+            expect(false, "\(label)：算出来的数据偏移越界了")
+        }
+    } else {
+        expect(false, "\(label)：应能定位到 701/3375.jpg")
+    }
+}
+
+// 截断：中央目录都没了（正在下载、只写了一半的分卷就是这样），必须当场报错。
+let truncatedURL = archiveRoot.appending(path: "truncated.zip")
+try? ZIP.stored(zipEntries, compress: false).prefix(120).write(to: truncatedURL)
+expect(zipOpeningError(truncatedURL) != nil, "被截断的 zip 应当打不开")
+
+// 中央目录自称越过了文件末尾：要报「截断」，不能被当成正常文件。
+do {
+    var forged = ZIP.stored(zipEntries, compress: false)
+    // 从尾部往前找 EOCD（0x06054B50），把其中的「中央目录大小」字段改成谎报的值。
+    var eocd = forged.count - 22
+    while eocd >= 0 {
+        if forged[eocd] == 0x50, forged[eocd + 1] == 0x4B, forged[eocd + 2] == 0x05, forged[eocd + 3] == 0x06 {
+            break
+        }
+        eocd -= 1
+    }
+    if eocd >= 0 {
+        forged[eocd + 12] = 0xFE
+        forged[eocd + 13] = 0xFF
+        forged[eocd + 14] = 0xFF
+        forged[eocd + 15] = 0xFF
+        let forgedURL = archiveRoot.appending(path: "forged.zip")
+        try? forged.write(to: forgedURL)
+        if let error = zipOpeningError(forgedURL), case .truncated = error {
+            expect(true, "谎报中央目录大小的 zip 应报「截断」")
+        } else {
+            expect(false, "谎报中央目录大小的 zip 应报「截断」（实际 \(String(describing: zipOpeningError(forgedURL)))）")
+        }
+    } else {
+        expect(false, "应能在自己压出来的 zip 里找到 EOCD")
+    }
+}
+
+// 垃圾文件：不该被当成 zip（打开面板拖进来的任何文件都会走这条路）。
+do {
+    let garbageURL = archiveRoot.appending(path: "garbage.zip")
+    try? Data((0..<4096).map { UInt8(($0 &* 37) & 0xFF) }).write(to: garbageURL)
+    let isNotAZip: Bool
+    if let error = zipOpeningError(garbageURL), case .notAZip = error { isNotAZip = true } else { isNotAZip = false }
+    expect(isNotAZip, "垃圾文件应当报「不是 ZIP」而不是别的错")
+    // 空文件同理（这里是 0 字节，连 EOCD 都没有）。
+    let emptyURL = archiveRoot.appending(path: "empty.zip")
+    try? Data().write(to: emptyURL)
+    expect(zipOpeningError(emptyURL) != nil, "空文件应当打不开")
+    // 文件根本不存在时也不能崩。
+    expect(zipOpeningError(archiveRoot.appending(path: "missing.zip")) != nil, "不存在的文件应当打不开")
+}
+
+// 中央目录谎报记录长度（32 MB，而文件只有几十 KB）：索引只认名字，所以包还能打开，
+// 但读那一格必须报错 —— 而且是**在**分配缓冲之前就报错，否则一个畸形索引就能把内存吃掉。
+do {
+    var forged = ZIP.stored(zipEntries, compress: false)
+    var patched = false
+    var index = 0
+    while index + 46 <= forged.count {
+        if forged[index] == 0x50, forged[index + 1] == 0x4B,
+           forged[index + 2] == 0x01, forged[index + 3] == 0x02 {
+            // 压缩后大小（+20）与未压缩大小（+24）都改成 32 MB（0x0200_0000）。
+            for offset in [20, 24] {
+                forged[index + offset] = 0x00
+                forged[index + offset + 1] = 0x00
+                forged[index + offset + 2] = 0x00
+                forged[index + offset + 3] = 0x02
+            }
+            patched = true
+            break
+        }
+        index += 1
+    }
+    if patched {
+        let forgedURL = archiveRoot.appending(path: "oversized.zip")
+        try? forged.write(to: forgedURL)
+        if let archive = try? ZipArchive(url: forgedURL), let entry = archive.entry(named: "701/3375.jpg") {
+            expect((try? archive.data(for: entry)) == nil,
+                   "谎报记录长度的 zip 读那一格必须报错，而不是照着长度去分配内存")
+        } else {
+            expect(false, "谎报记录长度不该影响中央目录的解析")
+        }
+    } else {
+        expect(false, "应能在自己压出来的 zip 里找到中央目录记录")
+    }
+}
+
+// 分卷选择：`ZipTileSource` 只按文件名里的行范围挑包，绝不逐包扫。
+do {
+    let volumes = [
+        ZipVolume(url: archiveRoot.appending(path: "sample-存储.zip"), rowRange: 701...756),
+        ZipVolume(url: archiveRoot.appending(path: "sample-deflate.zip"), rowRange: 757...800),
+    ]
+    let source = ZipTileSource(
+        rootURL: archiveRoot,
+        grid: .geographic,
+        parts: [12: volumes],
+        zoomRange: 12...12
+    )
+    expect(source.availableZoomRange == 12...12, "分卷数据源的层级范围")
+    // 行 701 只在第一个包里 → 应能取到瓦片；行 757 落在第二个包里（包里没有这一行）→ 取不到。
+    let hit = await source.data(for: SlippyTile(zoom: 12, x: 3375, y: 701))
+    expect(hit == zipEntries[0].data, "应按行范围选中 701 的分卷并读出瓦片")
+    let miss = await source.data(for: SlippyTile(zoom: 12, x: 3376, y: 757))
+    expect(miss == nil, "落在没有该行的分卷上应当返回 nil")
+    let noZoom = await source.data(for: SlippyTile(zoom: 13, x: 3375, y: 701))
+    expect(noZoom == nil, "没有该层级时应当返回 nil")
+}
+
+// MARK: - 真实 zip 数据集（挂了福建数据盘时才跑）
+
+/// 真机数据：`/Volumes/Samsung/福建省瓦片`（可用 `EUCLID_ZIP_ROOT` 换到别处）。
+///
+/// 这些期望值来自 manifest.json 与已知的下载结果（z12：1 卷 2772 片；z18：仍在下载）。
+let fujianRoot = URL(fileURLWithPath: ProcessInfo.processInfo.environment["EUCLID_ZIP_ROOT"]
+    ?? "/Volumes/Samsung/福建省瓦片")
+
+if FileManager.default.fileExists(atPath: fujianRoot.appending(path: "manifest.json").path(percentEncoded: false)) {
+    section("真实 zip 数据集：\(fujianRoot.lastPathComponent)")
+    if let dataset = ZipDatasetLocator.makeDataset(at: fujianRoot), let info = dataset.zipInfo {
+        expect(dataset.grid.kind == .geographic, "福建数据集应认成经纬度网格")
+        expect(dataset.layout.tileSize == 256, "瓦片边长应为 256（实际 \(dataset.layout.tileSize)）")
+        expect(dataset.zoomRange.lowerBound == 12, "最低层级应为 z12")
+        expect(dataset.zoomRange.upperBound >= 18, "最高层级应到 z18")
+        expect(dataset.layout.directoryAxis == .yFirst, "包内是 <行>/<列>，应识别为 y 在前")
+        expect(info.parts[12]?.count == 1, "z12 应有 1 个分卷（实际 \(info.parts[12]?.count ?? 0)）")
+        expect(info.parts[13]?.count == 1, "z13 应有 1 个分卷（实际 \(info.parts[13]?.count ?? 0)）")
+        expect(info.parts[14]?.count == 2, "z14 应有 2 个分卷（实际 \(info.parts[14]?.count ?? 0)）")
+        expect(info.parts[15]?.count == 5, "z15 应有 5 个分卷（实际 \(info.parts[15]?.count ?? 0)）")
+        expect(info.parts[16]?.count == 17, "z16 应有 17 个分卷（实际 \(info.parts[16]?.count ?? 0)）")
+        expect(info.parts[17]?.count == 45, "z17 应有 45 个分卷（实际 \(info.parts[17]?.count ?? 0)）")
+        expect(info.parts[12]?.first?.rowRange == 701...756,
+               "z12 分卷的行范围应为 701…756（实际 \(String(describing: info.parts[12]?.first?.rowRange))）")
+
+        if let bbox = info.boundingBox {
+            expectClose(bbox.west, 115.84259, accuracy: 1e-6, "manifest bbox 西边界")
+            expectClose(bbox.east, 120.4953, accuracy: 1e-6, "manifest bbox 东边界")
+            expectClose(bbox.south, 23.483276, accuracy: 1e-6, "manifest bbox 南边界")
+            expectClose(bbox.north, 28.322754, accuracy: 1e-6, "manifest bbox 北边界")
+        } else {
+            expect(false, "manifest 的 bbox 应能读出来")
+        }
+
+        // 覆盖范围不扫盘：直接用 manifest 的 bbox，换算成归一化世界矩形。
+        if let extent = DatasetLocator.extent(of: dataset) {
+            let box = extent.boundingBox
+            expectClose(box.southWest.longitude, 115.84259, accuracy: 1e-6, "数据范围西边界")
+            expectClose(box.northEast.longitude, 120.4953, accuracy: 1e-6, "数据范围东边界")
+            expectClose(box.southWest.latitude, 23.483276, accuracy: 1e-4, "数据范围南边界")
+            expectClose(box.northEast.latitude, 28.322754, accuracy: 1e-4, "数据范围北边界")
+            expect(extent.tileCount == info.tileCount, "瓦片总数应取 manifest 的记录")
+        } else {
+            expect(false, "zip 数据集应能算出覆盖范围")
+        }
+
+        // z12：整包体检（条目数、某一条的长度与像素尺寸都对着下载结果核）。
+        if let volume = info.parts[12]?.first {
+            if let archive = try? ZipArchive(url: volume.url) {
+                expect(archive.entryCount == 2772, "z12 分卷应有 2772 条记录（实际 \(archive.entryCount)）")
+                expect(archive.indexedRows.first == 701 && archive.indexedRows.last == 756,
+                       "z12 分卷覆盖的行应为 701…756")
+                // 空数据瓦片不落盘，所以最北一行的西侧若干列本来就是缺的（manifest 记了 196 片缺失）。
+                // 只要落在 bbox 覆盖的 3366…3418 列之内、且东端顶到 3414 就说明坐标换算没错位。
+                let firstRowColumns = archive.columnNumbers(inRow: "701")
+                expect(firstRowColumns.first == 3375 && firstRowColumns.last == 3414,
+                       "z12 行 701 的列应为 3375…3414（实际 \(String(describing: firstRowColumns.first))…\(String(describing: firstRowColumns.last))）")
+                expect(firstRowColumns.allSatisfy { (3366...3418).contains($0) },
+                       "z12 行 701 的列应全部落在 bbox 覆盖的 3366…3418 之内")
+                // manifest、bbox 与包内实际条目数三方对账：53 列 × 56 行 − 196 片空数据 = 2772。
+                expect(53 * 56 - 196 == archive.entryCount,
+                       "缺片数与规划范围应当对得上（\(53 * 56 - 196) vs \(archive.entryCount)）")
+                if let entry = archive.entry(named: "701/3375.jpg"), let data = try? archive.data(for: entry) {
+                    expect(data.count == 28402, "701/3375.jpg 应为 28402 字节（实际 \(data.count)）")
+                    if let image = ImageDecoder.decode(data) {
+                        expect(image.width == 256 && image.height == 256, "瓦片应为 256×256")
+                    } else {
+                        expect(false, "701/3375.jpg 应能解码成图像")
+                    }
+                } else {
+                    expect(false, "应能读出 z12 的 701/3375.jpg")
+                }
+                // 西边的空数据格确实没有条目（不该「编」出一张图来）。
+                expect(archive.entry(named: "701/3366.jpg") == nil, "空数据格不该有条目")
+                // 空数据瓦片是小尺寸 PNG 占位图（几百字节），不是影像数据。
+                if let entry = archive.entry(named: "756/3407.png"), let data = try? archive.data(for: entry) {
+                    expect(data.count < 2048, "空数据瓦片应是小占位图（实际 \(data.count) 字节）")
+                    if let image = ImageDecoder.decode(data) {
+                        expect(image.width == 256 && image.height == 256, "占位瓦片也应是 256×256")
+                    } else {
+                        expect(false, "空数据瓦片应能解码")
+                    }
+                } else {
+                    expect(false, "应能读出 756/3407.png")
+                }
+            } else {
+                expect(false, "z12 分卷应当能打开")
+            }
+        } else {
+            expect(false, "z12 应有分卷")
+        }
+
+        // z18 还在下载：能打开就顺着核一遍 ZIP64 与内容；打不开只提示，不算失败。
+        if let volume = info.parts[18]?.first {
+            if let archive = try? ZipArchive(url: volume.url), !archive.indexedRows.isEmpty {
+                expect(archive.isZip64, "z18 的条目数超过 65535，应当是 ZIP64")
+                let row = archive.indexedRows[archive.indexedRows.count / 2]
+                let names = archive.entryNames(inRow: String(row))
+                if let name = names.first, let entry = archive.entry(named: name),
+                   let data = try? archive.data(for: entry) {
+                    expect(!data.isEmpty, "z18 的 \(name) 应有内容")
+                    expect(ImageDecoder.decode(data) != nil, "z18 的 \(name) 应能解码")
+                } else {
+                    expect(false, "z18 应能读出至少一条记录")
+                }
+            } else {
+                print("  · z18 分卷暂时打不开（多半还在下载），已跳过")
+            }
+        } else {
+            print("  · 还没有 z18 分卷，已跳过")
+        }
+    } else {
+        expect(false, "福建数据目录应被认成 zip 数据集")
+    }
+} else {
+    print("\n▸ 真实 zip 数据集：未挂载（跳过 \(fujianRoot.path(percentEncoded: false))）")
 }
 
 // MARK: - 汇总

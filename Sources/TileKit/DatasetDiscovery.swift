@@ -8,17 +8,42 @@ public struct TileDataset: Identifiable, Hashable, Sendable {
     public let rootURL: URL
     public let layout: TileLayout
     public let zoomRange: ClosedRange<Int>
+    /// 瓦片编号的网格：散文件目录里的 XYZ 数据是墨卡托，天地图那类 WMTS 数据是经纬度。
+    public let grid: TileGrid
+    /// 非 nil 表示这是一份 **zip 分卷**数据集（不解压直接读）。
+    public let zipInfo: ZipDatasetInfo?
 
-    public init(id: String, name: String, rootURL: URL, layout: TileLayout, zoomRange: ClosedRange<Int>) {
+    public init(
+        id: String,
+        name: String,
+        rootURL: URL,
+        layout: TileLayout,
+        zoomRange: ClosedRange<Int>,
+        grid: TileGrid = .webMercator,
+        zipInfo: ZipDatasetInfo? = nil
+    ) {
         self.id = id
         self.name = name
         self.rootURL = rootURL
         self.layout = layout
         self.zoomRange = zoomRange
+        self.grid = grid
+        self.zipInfo = zipInfo
     }
 
-    public var source: DirectoryTileSource {
-        DirectoryTileSource(rootURL: rootURL, layout: layout, zoomRange: zoomRange)
+    /// 是不是 zip 分卷数据集。
+    public var isArchive: Bool { zipInfo != nil }
+
+    public var source: any TileImageSource {
+        if let zipInfo {
+            return ZipTileSource(
+                rootURL: rootURL,
+                grid: grid,
+                parts: zipInfo.parts,
+                zoomRange: zoomRange
+            )
+        }
+        return DirectoryTileSource(rootURL: rootURL, layout: layout, zoomRange: zoomRange)
     }
 
 }
@@ -47,6 +72,8 @@ public enum DatasetLocator {
     private static let maxDiscoveryDepth = 3
 
     /// 在给定目录中查找所有数据集。给定的目录可以本身就是数据集，也可以是数据集的容器。
+    ///
+    /// 既认散文件目录（`<z>/<x>/<y>`），也认 zip 分卷包（`z12/….zip` + `manifest.json`）。
     public static func discover(at url: URL, depth: Int = 0) -> [TileDataset] {
         if let dataset = makeDataset(at: url) {
             return [dataset]
@@ -62,9 +89,19 @@ public enum DatasetLocator {
 
     /// 若目录自身就是数据集则返回描述，否则返回 nil。
     public static func makeDataset(at url: URL) -> TileDataset? {
+        // zip 分卷包优先：它自带覆盖范围，描述比「扫一遍目录猜出来的」更准。
+        if let archive = ZipDatasetLocator.makeDataset(at: url) { return archive }
+        return makeDirectoryDataset(at: url)
+    }
+
+    /// 散文件目录（`<z>/<x>/<y>.<ext>`）。
+    ///
+    /// 「有 `<z>` 子目录」不算数 —— 目录里真的存在瓦片才算，否则把一个装着 zip 的
+    /// `z12/` 目录误认成空数据集，界面就会打开一份什么都没有的数据。
+    static func makeDirectoryDataset(at url: URL) -> TileDataset? {
         let levels = zoomLevels(of: url)
         guard let minZoom = levels.first, let maxZoom = levels.last else { return nil }
-        let layout = detectLayout(at: url, levels: levels)
+        guard let layout = detectLayout(at: url, levels: levels) else { return nil }
         let name = url.lastPathComponent
         return TileDataset(
             id: url.path(percentEncoded: false),
@@ -86,9 +123,9 @@ public enum DatasetLocator {
     /// 判定目录名与文件名的轴向：`<z>/<a>/<b>` 中 a 是列号还是行号。
     ///
     /// 判据是「另一种编排方式是否存在」：若 a 为行号，则磁盘上应存在 `<z>/<b>/<a>.<ext>`。
-    static func detectLayout(at url: URL, levels: [Int]) -> TileLayout {
+    static func detectLayout(at url: URL, levels: [Int]) -> TileLayout? {
         var layout = TileLayout.webODM
-        guard let sample = samplePaths(at: url, levels: levels) else { return layout }
+        guard let sample = samplePaths(at: url, levels: levels) else { return nil }
 
         let manager = FileManager.default
         if manager.fileExists(atPath: sample.transposedDirectory.path(percentEncoded: false)) {
@@ -145,7 +182,11 @@ public enum DatasetLocator {
     /// 计算数据集覆盖范围（归一化世界矩形）。
     ///
     /// 为避免遍历几十万文件，选取一个规模适中的层级做统计；该范围对所有层级都成立。
+    /// zip 分卷数据集不必扫盘：范围就记在 manifest / 分卷行范围里。
     public static func extent(of dataset: TileDataset, preferredMaxDirectories: Int = 400) -> DatasetExtent? {
+        if let info = dataset.zipInfo {
+            return archiveExtent(of: dataset, info: info)
+        }
         let levels = Array(dataset.zoomRange).filter { level in
             FileManager.default.fileExists(atPath: dataset.rootURL.appending(path: String(level)).path(percentEncoded: false))
         }
@@ -192,6 +233,22 @@ public enum DatasetLocator {
             return DatasetExtent(worldRect: rect, level: level, tileCount: count)
         }
         return nil
+    }
+
+    /// zip 数据集的覆盖范围：manifest 的 bbox（或探测出来的范围）换算成归一化世界矩形。
+    private static func archiveExtent(of dataset: TileDataset, info: ZipDatasetInfo) -> DatasetExtent? {
+        guard let bbox = info.boundingBox,
+              bbox.east > bbox.west, bbox.north > bbox.south else { return nil }
+        let west = WebMercator.normalizedX(longitude: bbox.west)
+        let east = WebMercator.normalizedX(longitude: bbox.east)
+        let north = WebMercator.normalizedY(latitude: bbox.north)
+        let south = WebMercator.normalizedY(latitude: bbox.south)
+        guard east > west, south > north else { return nil }
+        return DatasetExtent(
+            worldRect: CGRect(x: west, y: north, width: east - west, height: south - north),
+            level: dataset.zoomRange.upperBound,
+            tileCount: info.tileCount ?? 0
+        )
     }
 
     // MARK: - 目录工具

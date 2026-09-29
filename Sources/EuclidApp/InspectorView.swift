@@ -52,9 +52,12 @@ struct InspectorView: View {
                 }
                 LabeledContent("层级", value: "z\(dataset.zoomRange.lowerBound) – z\(dataset.zoomRange.upperBound)")
                 LabeledContent("瓦片尺寸", value: "\(dataset.layout.tileSize) × \(dataset.layout.tileSize) px")
+                LabeledContent("存储") {
+                    Text(storageDescription(dataset))
+                }
                 LabeledContent("目录结构", value: directoryDescription(dataset.layout))
                 LabeledContent("行号基准", value: dataset.layout.rowOrigin == .north ? "XYZ（北起源）" : "TMS（南起源）")
-                LabeledContent("坐标基准", value: "WGS84 / Web Mercator")
+                LabeledContent("坐标基准", value: gridDescription(dataset))
             }
         } else if let raster = model.selectedRaster {
             Section("单幅影像") {
@@ -113,6 +116,20 @@ struct InspectorView: View {
         case .xFirst: return "<z>/<x>/<y>"
         case .yFirst: return "<z>/<y>/<x>"
         }
+    }
+
+    /// 数据放在散文件目录里，还是打包成 zip 分卷（后者解压不用做在前面）。
+    private func storageDescription(_ dataset: TileDataset) -> String {
+        guard let info = dataset.zipInfo else { return "散文件目录" }
+        var text = "zip 分卷 · \(info.volumeCount) 个包（不解压直读）"
+        if dataset.zoomRange.count > 1 { text += " · 覆盖 z\(dataset.zoomRange.lowerBound)–z\(dataset.zoomRange.upperBound)" }
+        return text
+    }
+
+    /// 瓦片编号所在的网格与坐标基准。
+    private func gridDescription(_ dataset: TileDataset) -> String {
+        guard dataset.grid.kind == .geographic else { return "WGS84 / Web Mercator" }
+        return (dataset.zipInfo?.crs).map { "\($0) 经纬度网格" } ?? "EPSG:4490 经纬度网格"
     }
 }
 

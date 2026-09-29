@@ -74,7 +74,7 @@ struct RootView: View {
             return "在线底图 z0–z\(basemap.zoomRange.upperBound)\(attribution)"
         }
         if let dataset = model.selectedDataset {
-            return "z\(dataset.zoomRange.lowerBound)–z\(dataset.zoomRange.upperBound) · \(dataset.layout.tileSize)px"
+            return AppModel.detail(of: dataset)
         }
         if let raster = model.selectedRaster {
             let shape = raster.isGeoreferenced ? raster.crsName : "未配准"

@@ -437,6 +437,7 @@ final class TileCanvasNSView: NSView {
                     name: layer.name,
                     tileSize: layer.tileSize,
                     zoomRange: layer.zoomRange,
+                    grid: layer.grid,
                     followsDisplayScale: layer.followsDisplayScale,
                     maximumDataZoom: layer.maximumDataZoom,
                     memoryLimitBytes: layer.memoryLimitBytes,
@@ -515,9 +516,19 @@ final class TileCanvasNSView: NSView {
         }
         // 只有「真的要重新适配视野」时才按适配层级算下限；否则沿用原下限（否则每开关一次底图，
         // 能缩小的范围就被当前相机重新收紧一次，看起来就像视野被改动了）。
-        let lower = rect == nil
+        var lower = rect == nil
             ? min(zoomBounds.lowerBound, upper - 0.001)
             : min(max(-2, fitCamera.zoomLevel - 1.2), upper - 0.001)
+        // 主图层的最低数据层级比适配层级“深”很多时（整省 z12 之类的数据在「适应窗口」下就是这样），
+        // 再往外缩一屏就要铺几千片，安全阀会把画布清空 —— 看着像数据没打开。
+        // 把「一屏还铺得出来」的最低层级也算进缩放下限，宁可少看一点，也不留一屏空白。
+        if rect != nil, let primary {
+            lower = max(lower, primary.affordableCameraZoom(
+                viewportSize: bounds.size, displayScale: displayScale
+            ))
+        }
+        // 下限顶到上限会让 `ClosedRange` 直接崩，夹一道。
+        lower = min(lower, upper - 0.001)
         zoomBounds = lower...upper
         camera = fitCamera.clamped(zoomLevelRange: zoomBounds)
     }
@@ -679,6 +690,11 @@ final class TileCanvasNSView: NSView {
     private var currentDataZoom: Int {
         guard let primary = primaryStack else { return 0 }
         return primary.dataZoom(for: camera)
+    }
+
+    /// 当前基准层的瓦片网格（瓦片读数的行列换算按它算）。
+    private var currentGrid: TileGrid {
+        anchorLayer?.grid ?? layers.last?.grid ?? .webMercator
     }
 
     /// 把两条图层都同步一遍：下层先铺，上层后铺，叠加顺序天然正确。
@@ -1120,17 +1136,23 @@ final class TileCanvasNSView: NSView {
         guard let store = measurementStore else { return }
         let coordinate = effectiveCamera.coordinate(forViewPoint: point)
         let zoom = currentDataZoom
-        let scale = Double(1 << zoom)
-        let world = WebMercator.normalized(coordinate)
-        let tileX = min(max(Int(floor(world.x * scale)), 0), (1 << zoom) - 1)
-        let tileY = min(max(Int(floor(world.y * scale)), 0), (1 << zoom) - 1)
+        let grid = currentGrid
+        let tile = grid.tile(at: coordinate, zoom: zoom)
+        let bounds = grid.bounds(zoom: zoom, column: tile.column, row: tile.row)
+        // 瓦片内像素按**这片瓦片自己的经纬度范围**算：经纬度网格的瓦片不是正方形，
+        // 在墨卡托世界坐标里量会差几十个像素（高纬更明显）。
+        let pixels = max(camera.tilePixelSize, 1)
+        let horizontal = max(bounds.east - bounds.west, 1e-12)
+        let vertical = max(bounds.north - bounds.south, 1e-12)
+        let pixelX = min(max(Int((coordinate.longitude - bounds.west) / horizontal * pixels), 0), Int(pixels) - 1)
+        let pixelY = min(max(Int((bounds.north - coordinate.latitude) / vertical * pixels), 0), Int(pixels) - 1)
         store.cursorInfo = CursorInfo(
             coordinate: coordinate,
             zoom: zoom,
-            tileX: tileX,
-            tileY: tileY,
-            pixelX: Int((world.x * scale - Double(tileX)) * camera.tilePixelSize),
-            pixelY: Int((world.y * scale - Double(tileY)) * camera.tilePixelSize)
+            tileX: tile.column,
+            tileY: tile.row,
+            pixelX: pixelX,
+            pixelY: pixelY
         )
     }
 

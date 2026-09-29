@@ -83,11 +83,11 @@ final class LayerThumbnailStore {
         } else {
             zoom = min(max(fallbackZoom, lower), upper)
         }
-        let count = Double(1 << zoom)
-        let maximum = (1 << zoom) - 1
-        let x = min(max(Int((center.x * count).rounded(.down)), 0), maximum)
-        let y = min(max(Int((center.y * count).rounded(.down)), 0), maximum)
-        return SlippyTile(zoom: zoom, x: x, y: y)
+        // 行列换算交给图层自己的网格：经纬度网格的行按纬度等分，
+        // 拿墨卡托的行号去取会取到几十行以外的片子（高纬尤其明显）。
+        let coordinate = WebMercator.coordinate(fromNormalized: center)
+        let tile = layer.grid.tile(at: coordinate, zoom: zoom)
+        return SlippyTile(zoom: zoom, x: tile.column, y: tile.row)
     }
 
     /// 缩到行高附近就够：面板上的缩略图只有 40×28 点（Retina 上 80×56 像素）。

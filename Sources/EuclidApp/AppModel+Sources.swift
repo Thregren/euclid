@@ -153,7 +153,7 @@ extension AppModel {
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
         panel.prompt = "打开"
-        panel.message = "选择瓦片目录（可以是单个数据集，也可以包含多个数据集）"
+        panel.message = "选择瓦片目录（可以是单个数据集，也可以包含多个数据集；支持 zip 分卷包）"
         if let rootFolder {
             panel.directoryURL = rootFolder
         }
@@ -201,6 +201,15 @@ extension AppModel {
 
     private func openWithoutRemembering(_ url: URL, isDirectory: Bool) {
         guard isDirectory else {
+            // 拖进来一个 zip 分卷：当成「打开它所在的那份数据」。
+            // 分卷通常躺在 `z12/` 这种层级目录里，那就再往上走一层找数据集根目录。
+            if url.pathExtension.lowercased() == "zip" {
+                let parent = url.deletingLastPathComponent()
+                let root = Int(parent.lastPathComponent) != nil ? parent.deletingLastPathComponent() : parent
+                rootFolder = root
+                scan(root, preferring: url)
+                return
+            }
             // 文件：按单幅影像打开（GeoTIFF / TIFF / 普通图片）。
             openRaster(url)
             return
@@ -242,7 +251,7 @@ extension AppModel {
         }
     }
 
-    private func scan(_ url: URL) {
+    private func scan(_ url: URL, preferring preferred: URL? = nil) {
         scanGeneration += 1
         let generation = scanGeneration
         AppModel.trace("scan start \(url.path(percentEncoded: false))")
@@ -257,10 +266,20 @@ extension AppModel {
             isScanning = false
             datasets = found
             if found.isEmpty {
-                setStatus("在 \(url.lastPathComponent) 中没有找到形如 <z>/<x>/<y> 的瓦片目录", autoClearAfter: 0)
+                setStatus("在 \(url.lastPathComponent) 中没有找到瓦片目录（<z>/<x>/<y>）或 zip 分卷包", autoClearAfter: 0)
                 selectSource(nil)
             } else {
-                selectSource(found[0].id)
+                // 拖具体某个分卷进来时，优先选中包含它的那份数据。
+                let preferredPath = preferred?.path(percentEncoded: false)
+                let match = preferredPath.flatMap { path in
+                    found.first { dataset in
+                        guard let info = dataset.zipInfo else { return false }
+                        return info.parts.values.contains { volumes in
+                            volumes.contains { $0.url.path(percentEncoded: false) == path }
+                        }
+                    }
+                }
+                selectSource((match ?? found[0]).id)
             }
         }
     }
@@ -315,6 +334,12 @@ extension AppModel {
             canvas.updateExtent(result)
             if result == nil {
                 setStatus("未能确定数据范围，已按默认层级显示", autoClearAfter: 6)
+            } else if let info = dataset.zipInfo {
+                // zip 分卷读起来和散文件没区别，交代一句让使用者知道没在偷偷解压。
+                setStatus(
+                    "zip 分卷 \(info.volumeCount) 个包 · \(dataset.grid.title) · 不解压直读",
+                    autoClearAfter: 8
+                )
             } else {
                 setStatus(nil)
             }

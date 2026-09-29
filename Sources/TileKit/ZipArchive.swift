@@ -1,0 +1,376 @@
+import Foundation
+
+/// 只读 ZIP 归档读取器（存储 / deflate 两种方式，支持 ZIP64）。
+///
+/// 为什么瓦片要放进 zip：exFAT 的簇是 256 KB，一张 16 KB 的瓦片散着放也要占满一个簇，
+/// 一千六百万张就是几个 TB。打包成 zip 之后按实际大小占用，而且**不用解压**就能直接读。
+///
+/// 设计上有三条是冲着「大瓦片包」去的：
+///
+/// 1. **不把中央目录整个读进内存**：一个 z18 的分卷能有一百多万条记录、中央目录上百 MB。
+///    这里只流式扫一遍，记下「每个行号（名字的第一段）对应的字节范围」；
+///    查某一格时再单独解析那一行的记录（几十 KB）。
+/// 2. **索引按行缓存**：解析过的行做个小 LRU（默认 8 行），一屏用到的行数远小于它。
+/// 3. **每次读取只 seek + 读一条**，并核对长度与 CRC：正在下载、只写了一半的分卷
+///    不会被当成有效数据（会抛错，调用方按缺片处理）。
+public final class ZipArchive: @unchecked Sendable {
+    /// 中央目录里的一条记录。
+    public struct Entry: Sendable, Hashable {
+        public let name: String
+        public let method: UInt16
+        public let compressedSize: UInt64
+        public let uncompressedSize: UInt64
+        public let crc32: UInt32
+        public let localHeaderOffset: UInt64
+    }
+
+    public enum ZipError: Error, CustomStringConvertible {
+        case notAZip
+        case truncated(String)
+        case unsupported(String)
+        case corrupt(String)
+
+        public var description: String {
+            switch self {
+            case .notAZip: return "不是 ZIP 文件（找不到中央目录）"
+            case .truncated(let what): return "ZIP 被截断：\(what)"
+            case .unsupported(let what): return "不支持的 ZIP 特性：\(what)"
+            case .corrupt(let what): return "ZIP 内容损坏：\(what)"
+            }
+        }
+    }
+
+    public let url: URL
+    /// 单条记录解压后的上限：瓦片也就几十 KB，超过这个数一定是畸形文件或选错了文件。
+    public static let maximumEntryBytes = 64 << 20
+    /// 解析中央目录时的读缓冲大小。
+    private static let chunkSize = 1 << 21
+
+    private let handle: FileHandle
+    private let lock = NSLock()
+    /// 文件长度。读数据前用它兜一道，畸形索引里的超大长度就不会变成巨量内存申请。
+    private var fileSize: UInt64 = 0
+    /// 行号（名字里第一段）→ 该行所有记录在中央目录里占据的字节范围。
+    private var rowSpans: [String: (start: UInt64, end: UInt64)] = [:]
+    /// 已解析的行 → （完整名字 → 记录）。
+    private var rowTables: [String: [String: Entry]] = [:]
+    private var rowOrder: [String] = []
+    /// 解析过的行做个小 LRU。
+    ///
+    /// 一屏通常只落在十几行上（z17 一条行里三千多个条目，一张行表约 400 KB），
+    /// 12 行既能把整屏盖住，内存也压在几 MB 量级。
+    private static let rowCacheLimit = 12
+
+    public private(set) var entryCount = 0
+    public private(set) var centralDirectorySize: UInt64 = 0
+    public private(set) var isZip64 = false
+
+    public init(url: URL) throws {
+        self.url = url
+        guard let handle = try? FileHandle(forReadingFrom: url) else {
+            throw ZipError.notAZip
+        }
+        self.handle = handle
+        do {
+            try readCentralDirectory()
+        } catch {
+            try? handle.close()
+            throw error
+        }
+    }
+
+    deinit {
+        try? handle.close()
+    }
+
+    // MARK: - 查询
+
+    /// 按完整名字查一条记录（例如 `45224/215425.jpg`）。
+    public func entry(named name: String) -> Entry? {
+        let row = Self.rowPrefix(of: name)
+        lock.lock()
+        defer { lock.unlock() }
+        return table(forRow: row)[name]
+    }
+
+    /// 读出并校验一条记录的内容。
+    public func data(for entry: Entry) throws -> Data {
+        guard entry.method != 0xFFFF else {
+            throw ZipError.unsupported("加密记录：\(entry.name)")
+        }
+        guard entry.uncompressedSize <= UInt64(Self.maximumEntryBytes) else {
+            throw ZipError.unsupported("单条记录解压后 \(entry.uncompressedSize) 字节")
+        }
+        lock.lock()
+        defer { lock.unlock() }
+
+        // 本地文件头：长度字段可能与中央目录不同（数据描述符），
+        // 所以**只**用它算数据的起点，长度与 CRC 一律以中央目录为准。
+        let header = read(at: entry.localHeaderOffset, count: 30)
+        guard header.count == 30, header.u32(0) == 0x0403_4B50 else {
+            throw ZipError.corrupt("本地文件头签名不对：\(entry.name)")
+        }
+        let nameLength = UInt64(header.u16(26))
+        let extraLength = UInt64(header.u16(28))
+        let dataOffset = entry.localHeaderOffset + 30 + nameLength + extraLength
+        // 长度一律以中央目录为准，但先拿文件长度兜一道：畸形（或只写了一半）的索引里
+        // 那个「压缩后大小」可以是任意值，照着它去分配缓冲会直接把内存吃掉。
+        guard entry.compressedSize <= UInt64(Self.maximumEntryBytes),
+              dataOffset <= fileSize,
+              entry.compressedSize <= fileSize - dataOffset else {
+            throw ZipError.corrupt("记录超出文件范围：\(entry.name)")
+        }
+
+        let packed = read(at: dataOffset, count: Int(entry.compressedSize))
+        guard UInt64(packed.count) == entry.compressedSize else {
+            throw ZipError.truncated("\(entry.name) 的数据不完整")
+        }
+
+        let payload: Data
+        switch entry.method {
+        case 0:
+            payload = packed
+        case 8:
+            guard let inflated = ZIP.inflate(packed, capacity: Int(entry.uncompressedSize)) else {
+                throw ZipError.corrupt("deflate 解不开：\(entry.name)")
+            }
+            payload = inflated
+        default:
+            throw ZipError.unsupported("压缩方式 \(entry.method)：\(entry.name)")
+        }
+        guard UInt64(payload.count) == entry.uncompressedSize else {
+            throw ZipError.corrupt("长度对不上：\(entry.name)")
+        }
+        guard ZIP.crc32(payload) == entry.crc32 else {
+            throw ZipError.corrupt("CRC 对不上：\(entry.name)")
+        }
+        return payload
+    }
+
+    /// 某一行的全部条目名（升序）。探测覆盖范围用。
+    public func entryNames(inRow row: String) -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return table(forRow: row).keys.sorted()
+    }
+
+    /// 索引里出现过的行号（升序，数字行号）。
+    public var indexedRows: [Int] {
+        rowSpans.keys.compactMap(Int.init).sorted()
+    }
+
+    // MARK: - 中央目录
+
+    private func readCentralDirectory() throws {
+        let size = try handle.seekToEnd()
+        fileSize = size
+        guard size >= 22 else { throw ZipError.notAZip }
+        // 中央目录结束记录（EOCD）在文件末尾 22 字节 + 最多 65535 字节注释之内。
+        let tailLength = Int(min(size, 22 + 65_535))
+        let tail = read(at: size - UInt64(tailLength), count: tailLength)
+        guard let eocd = Self.lastIndex(of: 0x0605_4B50, in: tail), tail.count >= eocd + 22 else {
+            throw ZipError.notAZip
+        }
+
+        var entries = UInt64(tail.u16(eocd + 10))
+        var directorySize = UInt64(tail.u32(eocd + 12))
+        var directoryOffset = UInt64(tail.u32(eocd + 16))
+
+        // ZIP64：固定字段被填满（0xFFFF / 0xFFFFFFFF）时，真值放在 ZIP64 结束记录里，
+        // 它的位置由紧挨 EOCD 前面的定位器给出。
+        let needsZip64 = entries == 0xFFFF || directorySize == 0xFFFF_FFFF || directoryOffset == 0xFFFF_FFFF
+        if needsZip64 {
+            guard eocd >= 20, tail.u32(eocd - 20) == 0x0706_4B50 else {
+                throw ZipError.corrupt("缺少 ZIP64 定位器")
+            }
+            let record = read(at: tail.u64(eocd - 20 + 8), count: 56)
+            guard record.count == 56, record.u32(0) == 0x0606_4B50 else {
+                throw ZipError.corrupt("ZIP64 结束记录签名不对")
+            }
+            entries = record.u64(32)
+            directorySize = record.u64(40)
+            directoryOffset = record.u64(48)
+            isZip64 = true
+        }
+        entryCount = Int(entries)
+        centralDirectorySize = directorySize
+        guard directoryOffset + directorySize <= size else {
+            throw ZipError.truncated("中央目录越过了文件末尾")
+        }
+        try indexRows(directoryOffset: directoryOffset, directorySize: directorySize)
+    }
+
+    /// 流式扫一遍中央目录，只记「行 → 字节范围」，不保留记录本身。
+    private func indexRows(directoryOffset: UInt64, directorySize: UInt64) throws {
+        try forEachRecord(from: directoryOffset, to: directoryOffset + directorySize) { name, _, start, length in
+            let row = Self.rowPrefix(of: name)
+            if let span = rowSpans[row] {
+                rowSpans[row] = (min(span.start, start), max(span.end, start + UInt64(length)))
+            } else {
+                rowSpans[row] = (start, start + UInt64(length))
+            }
+        }
+    }
+
+    /// 解析某一行的全部记录（带缓存）。
+    private func table(forRow row: String) -> [String: Entry] {
+        if let cached = rowTables[row] { return cached }
+        guard let span = rowSpans[row] else { return [:] }
+
+        var table: [String: Entry] = [:]
+        let prefix = row.isEmpty ? "" : row + "/"
+        try? forEachRecord(from: span.start, to: span.end) { name, entry, _, _ in
+            guard name.hasPrefix(prefix) else { return }
+            table[name] = entry
+        }
+
+        rowTables[row] = table
+        rowOrder.append(row)
+        while rowOrder.count > Self.rowCacheLimit {
+            rowTables[rowOrder.removeFirst()] = nil
+        }
+        return table
+    }
+
+    /// 流式遍历一段中央目录：每次回调给出名字、记录与它在文件里的位置。
+    private func forEachRecord(
+        from start: UInt64,
+        to end: UInt64,
+        _ body: (_ name: String, _ entry: Entry, _ recordStart: UInt64, _ recordLength: Int) -> Void
+    ) throws {
+        var buffer = Data()
+        var bufferFileOffset = start
+        var cursor = start
+        var offset = 0
+
+        /// 保证缓冲里从 `offset` 起至少有 `count` 字节。
+        func ensure(_ count: Int) -> Bool {
+            while buffer.count - offset < count, cursor < end {
+                let want = Int(min(UInt64(Self.chunkSize), end - cursor))
+                buffer.append(read(at: cursor, count: want))
+                cursor += UInt64(want)
+            }
+            return buffer.count - offset >= count
+        }
+
+        while ensure(46) {
+            guard buffer.u32(offset) == 0x0201_4B50 else {
+                throw ZipError.corrupt("中央目录记录签名不对（文件偏移 \(bufferFileOffset + UInt64(offset))）")
+            }
+            let nameLength = Int(buffer.u16(offset + 28))
+            let extraLength = Int(buffer.u16(offset + 30))
+            let commentLength = Int(buffer.u16(offset + 32))
+            let recordLength = 46 + nameLength + extraLength + commentLength
+            guard ensure(recordLength) else {
+                throw ZipError.truncated("中央目录记录不完整")
+            }
+
+            let base = buffer.startIndex + offset
+            let name = String(decoding: buffer[(base + 46)..<(base + 46 + nameLength)], as: UTF8.self)
+            let extra = Data(buffer[(base + 46 + nameLength)..<(base + 46 + nameLength + extraLength)])
+            let entry = Self.makeEntry(name: name, record: buffer, offset: offset, extra: extra)
+            body(name, entry, bufferFileOffset + UInt64(offset), recordLength)
+
+            offset += recordLength
+            // 攒够一块就把已经用掉的部分丢掉，避免整个中央目录都留在内存里。
+            if offset >= Self.chunkSize {
+                buffer = Data(buffer[(buffer.startIndex + offset)...])
+                bufferFileOffset += UInt64(offset)
+                offset = 0
+            }
+        }
+    }
+
+    private static func makeEntry(name: String, record: Data, offset: Int, extra: Data) -> Entry {
+        let flags = record.u16(offset + 8)
+        var method = record.u16(offset + 10)
+        if flags & 0x1 != 0 { method = 0xFFFF }  // 加密：调用方一律当不支持
+        let compressed = UInt64(record.u32(offset + 20))
+        let uncompressed = UInt64(record.u32(offset + 24))
+        let crc = record.u32(offset + 16)
+        var sizes: (uncompressed: UInt64, compressed: UInt64, offset: UInt64) = (
+            uncompressed, compressed, UInt64(record.u32(offset + 42))
+        )
+
+        // ZIP64 扩展字段：只补齐那些在固定字段里被写成「满值」的项，顺序固定
+        // （原始长度、压缩长度、本地头偏移、分卷号）。
+        if uncompressed == 0xFFFF_FFFF || compressed == 0xFFFF_FFFF || sizes.offset == 0xFFFF_FFFF {
+            var cursor = 0
+            while cursor + 4 <= extra.count {
+                let id = extra.u16(cursor)
+                let size = Int(extra.u16(cursor + 2))
+                let body = cursor + 4
+                guard body + size <= extra.count else { break }
+                if id == 0x0001 {
+                    var at = body
+                    if uncompressed == 0xFFFF_FFFF, at + 8 <= body + size {
+                        sizes.uncompressed = extra.u64(at); at += 8
+                    }
+                    if compressed == 0xFFFF_FFFF, at + 8 <= body + size {
+                        sizes.compressed = extra.u64(at); at += 8
+                    }
+                    if sizes.offset == 0xFFFF_FFFF, at + 8 <= body + size {
+                        sizes.offset = extra.u64(at)
+                    }
+                    break
+                }
+                cursor = body + size
+            }
+        }
+
+        return Entry(
+            name: name,
+            method: method,
+            compressedSize: sizes.compressed,
+            uncompressedSize: sizes.uncompressed,
+            crc32: crc,
+            localHeaderOffset: sizes.offset
+        )
+    }
+
+    // MARK: - 工具
+
+    private func read(at offset: UInt64, count: Int) -> Data {
+        guard count > 0 else { return Data() }
+        do {
+            try handle.seek(toOffset: offset)
+            return try handle.read(upToCount: count) ?? Data()
+        } catch {
+            return Data()
+        }
+    }
+
+    /// 名字里的第一段（`45224/215425.jpg` → `45224`）。
+    static func rowPrefix(of name: String) -> String {
+        guard let slash = name.firstIndex(of: "/") else { return "" }
+        return String(name[name.startIndex..<slash])
+    }
+
+    private static func lastIndex(of signature: UInt32, in data: Data) -> Int? {
+        guard data.count >= 4 else { return nil }
+        var index = data.count - 4
+        while index >= 0 {
+            if data.u32(index) == signature { return index }
+            index -= 1
+        }
+        return nil
+    }
+}
+
+/// 小端读取（ZIP 的所有整数字段都是小端）。偏移一律相对 `startIndex`，
+/// 因为 `Data` 的切片可能保留非零起点。
+extension Data {
+    func u16(_ offset: Int) -> UInt16 {
+        guard offset >= 0, offset + 2 <= count else { return 0 }
+        let start = startIndex + offset
+        return UInt16(self[start]) | (UInt16(self[start + 1]) << 8)
+    }
+
+    func u32(_ offset: Int) -> UInt32 {
+        UInt32(u16(offset)) | (UInt32(u16(offset + 2)) << 16)
+    }
+
+    func u64(_ offset: Int) -> UInt64 {
+        UInt64(u32(offset)) | (UInt64(u32(offset + 4)) << 32)
+    }
+}
