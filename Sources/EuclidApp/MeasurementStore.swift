@@ -9,6 +9,7 @@ enum MapTool: String, CaseIterable, Hashable, Sendable {
     case distance
     case area
     case circle
+    case annotation
 
     var measurementKind: MeasurementKind? {
         switch self {
@@ -17,6 +18,7 @@ enum MapTool: String, CaseIterable, Hashable, Sendable {
         case .distance: return .distance
         case .area: return .area
         case .circle: return .circle
+        case .annotation: return .annotation
         }
     }
 
@@ -27,6 +29,7 @@ enum MapTool: String, CaseIterable, Hashable, Sendable {
         case .distance: return "测距"
         case .area: return "测面积"
         case .circle: return "画圆"
+        case .annotation: return "标注"
         }
     }
 
@@ -37,6 +40,7 @@ enum MapTool: String, CaseIterable, Hashable, Sendable {
         case .distance: return "ruler"
         case .area: return "skew"
         case .circle: return "circle"
+        case .annotation: return "mappin.and.ellipse"
         }
     }
 
@@ -47,6 +51,7 @@ enum MapTool: String, CaseIterable, Hashable, Sendable {
         case .distance: return "D"
         case .area: return "A"
         case .circle: return "O"
+        case .annotation: return "N"
         }
     }
 
@@ -63,6 +68,7 @@ enum MapTool: String, CaseIterable, Hashable, Sendable {
         case .distance: return "点击加点，右键、双击或回车结束"
         case .area: return "点击加点，右键、双击或回车闭合"
         case .circle: return "先点圆心，再点一次确定半径；之后可拖动半径点或输入精确半径"
+        case .annotation: return "点击落一个标注点，再在检查器里写文字"
         }
     }
 
@@ -90,6 +96,8 @@ enum MapTool: String, CaseIterable, Hashable, Sendable {
             return draftCount == 0
                 ? "点击确定圆心，再点一次确定半径"
                 : "移动指针预览半径，再点一次完成 · 完成后拖动半径点或输入精确半径 · Esc 取消"
+        case .annotation:
+            return "点击落标注点，然后在右侧检查器里填写「备注」，图上就会显示这段文字"
         }
     }
 }
@@ -273,9 +281,9 @@ final class MeasurementStore {
             return
         }
         markUndoPoint()
-        if kind == .point {
+        if kind == .point || kind == .annotation {
             let measurement = GeoMeasurement(
-                kind: .point,
+                kind: kind,
                 points: [coordinate],
                 colorIndex: nextColorIndex(),
                 style: pendingStyle
@@ -379,6 +387,46 @@ final class MeasurementStore {
     /// 恢复某条测量的默认样式。
     func resetStyle(of id: UUID) {
         updateStyle(of: id) { $0 = .standard }
+    }
+
+    // MARK: - 名称与备注
+
+    /// 改名（空串 = 回到「按类型自动编号」）。
+    ///
+    /// 输入是逐字符发生的，因此用合并键把一串连续输入并成一步撤销。
+    /// 这里**只判空、不做 trim**：把用户刚敲下的空格吃掉会让输入框里的光标一直跳回原位。
+    func setName(_ name: String, of id: UUID) {
+        updateText(of: id, coalescingKey: "name") { measurement in
+            measurement.name = Self.isBlank(name) ? nil : name
+        }
+    }
+
+    /// 写备注（标注工具显示的就是这段文字）。
+    func setNote(_ note: String, of id: UUID) {
+        updateText(of: id, coalescingKey: "note") { measurement in
+            measurement.note = Self.isBlank(note) ? nil : note
+        }
+    }
+
+    private static func isBlank(_ text: String) -> Bool {
+        text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// 改文本类字段的公共路径：只有真的变了才记撤销点、才通知存档。
+    private func updateText(
+        of id: UUID,
+        coalescingKey: String,
+        _ transform: (inout GeoMeasurement) -> Void
+    ) {
+        guard let index = measurements.firstIndex(where: { $0.id == id }) else { return }
+        var candidate = measurements[index]
+        transform(&candidate)
+        guard candidate.name != measurements[index].name || candidate.note != measurements[index].note else {
+            return
+        }
+        markUndoPoint(coalescingKey: "\(coalescingKey)-\(id.uuidString)")
+        measurements[index] = candidate
+        onChange?()
     }
 
     // MARK: - 半径

@@ -15,6 +15,8 @@ enum MeasurementExportFormat: String, CaseIterable, Identifiable {
     case kml
     case csv
     case excel
+    case dxf
+    case shapefile
 
     var id: String { rawValue }
 
@@ -24,6 +26,8 @@ enum MeasurementExportFormat: String, CaseIterable, Identifiable {
         case .kml: return "KML"
         case .csv: return "CSV"
         case .excel: return "Excel"
+        case .dxf: return "DXF（CAD）"
+        case .shapefile: return "Shapefile"
         }
     }
 
@@ -33,11 +37,21 @@ enum MeasurementExportFormat: String, CaseIterable, Identifiable {
         case .kml: return "kml"
         case .csv: return "csv"
         case .excel: return "xlsx"
+        case .dxf: return "dxf"
+        case .shapefile: return "shp"
         }
     }
 
-    /// Excel 是二进制格式，不能直接复制成文本。
-    var isText: Bool { self != .excel }
+    /// 能直接复制成文本的格式（Excel 是二进制，Shapefile 是多文件）。
+    var isText: Bool {
+        switch self {
+        case .excel, .shapefile: return false
+        default: return true
+        }
+    }
+
+    /// 导出会写出多个文件（Shapefile 有 .shp/.shx/.dbf/.prj/.cpg）。
+    var isMultiFile: Bool { self == .shapefile }
 
     /// 可以复制到剪贴板的格式。
     static var textFormats: [MeasurementExportFormat] {
@@ -49,19 +63,42 @@ enum MeasurementExportFormat: String, CaseIterable, Identifiable {
         case .geoJSON: return MeasurementExporter.geoJSON(measurements)
         case .kml: return MeasurementExporter.kml(measurements)
         case .csv: return MeasurementExporter.csv(measurements)
-        case .excel: return ""
+        case .dxf: return MeasurementCADExporter.dxf(measurements)
+        case .excel, .shapefile: return ""
         }
     }
 
     /// 导出用的字节内容。
     ///
     /// - Throws: Excel 超过 ZIP32 上限时抛 `ZIPError.tooLarge`。文本格式不会抛。
+    ///   多文件格式（Shapefile）返回空 `Data`，请走 `files(_:baseName:datasetName:)`。
     func data(_ measurements: [GeoMeasurement], datasetName: String? = nil) throws -> Data {
         switch self {
         case .excel:
             return try MeasurementExporter.excel(measurements, datasetName: datasetName)
+        case .shapefile:
+            return Data()
         default:
             return Data(render(measurements).utf8)
+        }
+    }
+
+    /// 一次导出会写出的全部文件（文件名 + 内容）。
+    ///
+    /// 单文件格式就是「一个以 baseName 命名的文件」；Shapefile 则是
+    /// `baseName_point.shp` 这样的一整套，调用方负责写到目标目录。
+    func files(
+        _ measurements: [GeoMeasurement],
+        baseName: String,
+        datasetName: String? = nil
+    ) throws -> [(name: String, data: Data)] {
+        switch self {
+        case .shapefile:
+            return MeasurementCADExporter.shapefile(measurements, baseName: baseName)
+                .map { (name: $0.name, data: $0.data) }
+        default:
+            return [(name: "\(baseName).\(fileExtension)",
+                     data: try data(measurements, datasetName: datasetName))]
         }
     }
 }
@@ -88,29 +125,43 @@ extension AppModel {
     func exportMeasurements(as format: MeasurementExportFormat) {
         guard !measurements.measurements.isEmpty else { return }
         let panel = NSSavePanel()
-        panel.nameFieldStringValue = "测量结果.\(format.fileExtension)"
+        panel.nameFieldStringValue = format.isMultiFile ? "测量结果" : "测量结果.\(format.fileExtension)"
         panel.canCreateDirectories = true
         panel.isExtensionHidden = false
-        panel.message = "导出 \(measurements.measurements.count) 条测量结果"
+        panel.message = format.isMultiFile
+            ? "导出 \(measurements.measurements.count) 条测量结果（会写出 .shp/.shx/.dbf/.prj/.cpg 一组文件）"
+            : "导出 \(measurements.measurements.count) 条测量结果"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         // 拼接与编码放在后台：Excel 要拼 XML 再打 ZIP、CSV/GeoJSON 也是几十万字符的拼装，
         // 在主线程上做就是「点了导出，窗口先卡一下」；写盘（几 MB）也一并放后台。
         let snapshot = measurements.measurements
         let datasetName = selectedSourceName
+        let directory = url.deletingLastPathComponent()
+        let baseName = url.deletingPathExtension().lastPathComponent
         setStatus("正在导出 \(snapshot.count) 条测量…", autoClearAfter: 0)
         Task {
-            let failure: String? = await Task.detached(priority: .userInitiated) {
+            let outcome: Result<Int, Error> = await Task.detached(priority: .userInitiated) {
                 do {
-                    try format.data(snapshot, datasetName: datasetName).write(to: url, options: .atomic)
-                    return nil
+                    let files = try format.files(snapshot, baseName: baseName, datasetName: datasetName)
+                    for file in files {
+                        try file.data.write(
+                            to: directory.appendingPathComponent(file.name),
+                            options: .atomic
+                        )
+                    }
+                    return .success(files.count)
                 } catch {
-                    return error.localizedDescription
+                    return .failure(error)
                 }
             }.value
-            if let failure {
-                setStatus("导出失败：\(failure)", autoClearAfter: 8)
-            } else {
-                setStatus("已导出 \(snapshot.count) 条测量结果到 \(url.lastPathComponent)")
+            switch outcome {
+            case .success(let count):
+                let where_ = directory.lastPathComponent
+                setStatus(count > 1
+                    ? "已导出 \(snapshot.count) 条测量结果（\(count) 个文件）到「\(where_)」"
+                    : "已导出 \(snapshot.count) 条测量结果到 \(url.lastPathComponent)")
+            case .failure(let error):
+                setStatus("导出失败：\(error.localizedDescription)", autoClearAfter: 8)
             }
         }
     }
@@ -357,19 +408,61 @@ extension AppModel {
         }
     }
 
+    /// 导出当前视图为 PDF：画面是位图，信息栏 / 标题 / 坐标 / 比例尺是矢量。
+    ///
+    /// 与 PNG 那条路径共用同一个「画布快照 → 后台合成」链路，因此同样不卡界面。
+    func exportViewAsPDF() {
+        guard let info = viewImageInfo else {
+            setStatus("当前没有可导出的画面")
+            return
+        }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "\(basemapName)-视图.pdf"
+        panel.allowedContentTypes = [.pdf]
+        panel.isExtensionHidden = false
+        panel.message = "导出当前视图为 PDF（含测量标注，文字与比例尺为矢量）"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        setStatus("正在出图…", autoClearAfter: 0)
+        Task {
+            guard let snapshot = canvas.mapSnapshot() else {
+                setStatus("导出失败：画面还没渲染好", autoClearAfter: 8)
+                return
+            }
+            let data = await Task.detached(priority: .userInitiated) {
+                ViewExporter.pdfData(snapshot, info: info)
+            }.value
+            guard let data else {
+                setStatus("导出失败：画面还没渲染好", autoClearAfter: 8)
+                return
+            }
+            let failure: String? = await Task.detached(priority: .userInitiated) {
+                do {
+                    try data.write(to: url, options: .atomic)
+                    return nil
+                } catch {
+                    return error.localizedDescription
+                }
+            }.value
+            if let failure {
+                setStatus("导出失败：\(failure)", autoClearAfter: 8)
+            } else {
+                setStatus("已导出 PDF 到 \(url.lastPathComponent)")
+            }
+        }
+    }
+
     /// 合成当前画面并编码成 PNG。
     ///
-    /// 画面本身（图层树）必须在主线程取，合成也就几步绘制；真正贵的是 PNG 编码
-    /// （Retina 上一屏大约几十到一百多毫秒），因此只把编码放到后台。
+    /// 主线程只做一件事：把图层树抽成值类型快照（只读遍历，微秒级）。
+    /// 光栅化、信息栏合成、PNG 编码（Retina 上一屏几十到一百多毫秒）整段在后台做，
+    /// 出图期间界面照常响应。
     private func viewImageData(info: ViewExporter.Info, includingMeasurements: Bool) async -> Data? {
-        guard let map = canvas.mapImage(includingMeasurements: includingMeasurements),
-              let composed = ViewExporter.compose(
-                map: map,
-                scale: canvas.backingScale,
-                info: info
-              ) else { return nil }
+        guard let snapshot = canvas.mapSnapshot(includingMeasurements: includingMeasurements) else {
+            return nil
+        }
         return await Task.detached(priority: .userInitiated) {
-            ViewExporter.pngData(composed)
+            ViewExporter.pngData(snapshot, info: info)
         }.value
     }
 
@@ -380,7 +473,8 @@ extension AppModel {
     }
 
     /// 信息栏内容：现在看的是什么、中心在哪、多大比例、量了几条。
-    private var viewImageInfo: ViewExporter.Info? {
+    /// （内部而非 private：巡检图集导出在另一个文件里也要用同一份信息栏内容。）
+    var viewImageInfo: ViewExporter.Info? {
         guard hasMapContent else { return nil }
         let hasLocal = selectedSourceName != nil
         let online = onlineBasemap
@@ -399,5 +493,57 @@ extension AppModel {
             metersPerPoint: viewport.metersPerPoint,
             measurementCount: measurements.measurements.count
         )
+    }
+
+    // MARK: - 矢量叠加层（GeoJSON / KML）
+
+    /// 导入 GeoJSON / KML 作为矢量叠加层。
+    ///
+    /// 解析成「测量」之后就和手画的图形完全同权：同样的样式、同样的存档、同样的导出、
+    /// 同样的画布渲染 —— 叠在影像上面就能对照检查。
+    func importVectorOverlay() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = true
+        panel.message = "选择 GeoJSON（.json / .geojson）或 KML 文件"
+        panel.prompt = "导入"
+        guard panel.runModal() == .OK, !panel.urls.isEmpty else { return }
+        let urls = panel.urls
+        setStatus("正在导入矢量…", autoClearAfter: 0)
+        Task {
+            var imported: [GeoMeasurement] = []
+            var failures: [String] = []
+            for url in urls {
+                let result: Result<[GeoMeasurement], Error> = await Task.detached(priority: .userInitiated) {
+                    do {
+                        return .success(try VectorImporter.measurements(from: url))
+                    } catch {
+                        return .failure(error)
+                    }
+                }.value
+                switch result {
+                case .success(let measurements): imported.append(contentsOf: measurements)
+                case .failure(let error):
+                    let reason = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                    failures.append("\(url.lastPathComponent)：\(reason)")
+                }
+            }
+            guard !imported.isEmpty else {
+                setStatus("导入失败：\(failures.first ?? "没有可识别的图形")", autoClearAfter: 8)
+                return
+            }
+            measurements.merge(imported)
+            canvas.refreshOverlay()
+            // 导入完顺手看全它们（不然图形可能落在视野外，像是「什么都没发生」）。
+            if let rect = measurements.measurements.map(\.worldRect).compactMap({ $0 }).reduce(nil, { partial, rect in
+                partial.map { $0.union(rect) } ?? rect
+            }) {
+                canvas.fit(to: rect)
+            }
+            var message = "已导入 \(imported.count) 个图形"
+            if !failures.isEmpty { message += "（\(failures.count) 个文件失败：\(failures[0])）" }
+            setStatus(message, autoClearAfter: 8)
+        }
     }
 }

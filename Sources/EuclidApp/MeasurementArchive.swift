@@ -77,10 +77,26 @@ actor MeasurementArchive {
         return pendingNotice
     }
 
+    /// 时间戳日历（进程内共用一份）。
+    ///
+    /// 这里刻意不用 `DateFormatter`：它的创建是几十微秒到毫秒级，而存档文件名每次落盘都要取一次；
+    /// `Calendar` 是值类型、可安全跨线程共享，配上 `String(format:)` 既省事又稳。
+    private static let stampCalendar: Calendar = {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.locale = Locale(identifier: "en_US_POSIX")
+        return calendar
+    }()
+
     private static func timestamp() -> String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyyMMdd-HHmmss"
-        return formatter.string(from: Date())
+        let parts = stampCalendar.dateComponents(
+            [.year, .month, .day, .hour, .minute, .second],
+            from: Date()
+        )
+        return String(
+            format: "%04d%02d%02d-%02d%02d%02d",
+            parts.year ?? 0, parts.month ?? 0, parts.day ?? 0,
+            parts.hour ?? 0, parts.minute ?? 0, parts.second ?? 0
+        )
     }
 
     /// 写盘。失败时返回一句给人看的话（同一个会话里只说一次），成功返回 nil。

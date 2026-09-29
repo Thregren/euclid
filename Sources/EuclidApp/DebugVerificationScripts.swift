@@ -345,3 +345,128 @@ enum DebugExportScript {
         }
     }
 }
+
+/// 开发调试用的 DEM 工具箱脚本。
+///
+/// `EUCLID_DEBUG_ANALYSIS=1` 时，等数据安定后依次走一遍「点高程 / 坡度 / 土方量」，
+/// 把结果打到 stderr，用来在无人值守的情况下核对整条分析链路；
+/// `EUCLID_DEBUG_ANALYSIS_SHEET=1` 只把面板打开（配合整窗截图核对界面）。
+@MainActor
+enum DebugAnalysisScript {
+    static func runIfRequested(model: AppModel) {
+        if ProcessInfo.processInfo.environment["EUCLID_DEBUG_ANALYSIS_SHEET"] != nil {
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(8))
+                model.showAnalysisSheet = true
+            }
+        }
+        guard ProcessInfo.processInfo.environment["EUCLID_DEBUG_ANALYSIS"] != nil else { return }
+        Task { @MainActor in
+            func log(_ text: String) {
+                FileHandle.standardError.write(Data(("[analysis] " + text + "\n").utf8))
+            }
+            try? await Task.sleep(for: .seconds(10))
+            guard let reader = model.analysisReader, let raster = model.analysisRaster else {
+                log("没有可分析的影像")
+                return
+            }
+            log("影像 \(raster.fileURL.lastPathComponent) \(reader.pixelWidth)×\(reader.pixelHeight) "
+                + "波段=\(reader.bandCount) 高程类=\(reader.isElevationLike)")
+
+            let reference = reader.georeference
+            let center = reference.coordinate(
+                column: Double(reader.pixelWidth) / 2,
+                row: Double(reader.pixelHeight) / 2
+            )
+            if let center {
+                let value = model.elevationReading(at: center)
+                log("点高程(中心)=\(value.map { String(format: "%.3f", $0) } ?? "—")")
+            }
+
+            model.addSlopeLayer(scope: .whole)
+            while model.analysis.isWorking { try? await Task.sleep(for: .milliseconds(100)) }
+            if let statistics = model.analysis.slopeStatistics, !statistics.isEmpty {
+                log(String(format: "坡度 平均=%.2f° 最大=%.2f° 最小=%.2f° 采样点=%d",
+                           statistics.mean, statistics.maximum, statistics.minimum, statistics.validCount))
+            } else {
+                log("坡度：没有结果")
+            }
+
+            let corners = [
+                (0.0, 0.0),
+                (Double(reader.pixelWidth), 0.0),
+                (Double(reader.pixelWidth), Double(reader.pixelHeight)),
+                (0.0, Double(reader.pixelHeight)),
+            ].compactMap { reference.coordinate(column: $0.0, row: $0.1) }
+            if corners.count == 4 {
+                model.analysis.baseElevationText = "0"
+                let bounds = GeoBounds(
+                    west: corners.map(\.longitude).min() ?? 0,
+                    south: corners.map(\.latitude).min() ?? 0,
+                    east: corners.map(\.longitude).max() ?? 0,
+                    north: corners.map(\.latitude).max() ?? 0
+                )
+                model.calculateVolume(over: bounds)
+                while model.analysis.isWorking { try? await Task.sleep(for: .milliseconds(100)) }
+                if let volume = model.analysis.volume {
+                    log("土方量 挖=\(AppModel.volumeText(volume.cutVolume)) "
+                        + "填=\(AppModel.volumeText(volume.fillVolume)) "
+                        + "面积=\(String(format: "%.0f m²", volume.sampledArea)) "
+                        + "格=\(volume.sampledCells)")
+                } else {
+                    log("土方量：没有结果")
+                }
+            }
+            log("结束")
+        }
+    }
+}
+
+/// 开发调试用的标签页脚本。
+///
+/// `EUCLID_DEBUG_TABS=1` 时在数据安定后走一遍「加页 → 在新页开另一份数据 → 切回」，
+/// 把每一页的图层数 / 测量数打到 stderr，用来核对「切页确实换了状态、切回来又还回来」。
+@MainActor
+enum DebugTabsScript {
+    static func runIfRequested(model: AppModel) {
+        guard ProcessInfo.processInfo.environment["EUCLID_DEBUG_TABS"] != nil else { return }
+        Task { @MainActor in
+            func log(_ text: String) {
+                FileHandle.standardError.write(Data(("[tabs] " + text + "\n").utf8))
+            }
+            try? await Task.sleep(for: .seconds(12))
+            model.ensureWorkspaceTabs()
+            guard let firstTabID = model.activeWorkspaceTabID else {
+                log("没有活动标签页")
+                return
+            }
+            let firstSource = model.selectedSourceID
+
+            // 在第一页放一条测量，用来验证「切回来测量还在」。
+            if let extent = model.extent {
+                let center = WebMercator.coordinate(
+                    fromNormalized: CGPoint(x: extent.worldRect.midX, y: extent.worldRect.midY)
+                )
+                model.measurements.dropPoint(at: center)
+            }
+            log("第一页：来源=\(firstSource ?? "无") 层=\(model.layers.count) "
+                + "测量=\(model.measurements.measurements.count) 标题=\(model.workspaceTabs.first?.title ?? "-")")
+
+            model.addWorkspaceTab()
+            log("新页：页数=\(model.workspaceTabs.count) 层=\(model.layers.count) "
+                + "测量=\(model.measurements.measurements.count) 来源=\(model.selectedSourceID ?? "无")")
+
+            if let firstSource {
+                model.open(URL(fileURLWithPath: firstSource))
+                try? await Task.sleep(for: .seconds(6))
+                log("新页打开数据后：层=\(model.layers.count) 标题=\(model.workspaceTabs.last?.title ?? "-")")
+            }
+
+            model.activateWorkspaceTab(firstTabID)
+            try? await Task.sleep(for: .seconds(2))
+            log("切回第一页：层=\(model.layers.count) 测量=\(model.measurements.measurements.count) "
+                + "来源=\(model.selectedSourceID ?? "无")")
+            log("结束")
+        }
+    }
+}

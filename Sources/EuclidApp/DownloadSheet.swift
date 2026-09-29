@@ -133,6 +133,12 @@ struct DownloadSheet: View {
                 Button("用当前视图") {
                     model.download.useCurrentView(model.canvas.visibleBounds())
                 }
+                Button("在视图上框选…") {
+                    // 先收起面板（模态表单挡着画布），拉完框会自动弹回来。
+                    dismiss()
+                    model.pickDownloadBoundsFromView()
+                }
+                .help("把面板收起来，在画布上拖一个矩形框，松手即填入范围")
                 Button("用数据范围") {
                     if let extent = model.extent {
                         model.download.bounds = GeoBounds(extent.boundingBox.southWest, extent.boundingBox.northEast)
@@ -269,6 +275,11 @@ struct DownloadSheet: View {
         return sheetSection("进度") {
             if download.isRunning, let progress = download.progress {
                 ProgressView(value: progress.fraction)
+                if download.isPaused {
+                    Text("已暂停（在途的瓦片会落地，不再发新请求）")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
                 HStack(spacing: 10) {
                     Text("\(progress.completed) / \(progress.total)")
                         .monospacedDigit()
@@ -350,6 +361,7 @@ struct DownloadSheet: View {
                     .lineLimit(1)
             }
             if download.isRunning {
+                Button(download.isPaused ? "继续下载" : "暂停") { model.download.togglePause() }
                 Button("停止下载") { model.download.cancel() }
             } else {
                 Button("关闭") { dismiss() }

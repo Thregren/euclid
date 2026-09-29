@@ -110,6 +110,8 @@ extension AppModel {
     func removeLayer(_ id: String) {
         guard let index = layers.firstIndex(where: { $0.id == id }) else { return }
         let removed = layers.remove(at: index)
+        // 卷帘对比的分界层没了就自动关掉，免得留一条指向空层的分隔线。
+        if swipePivotLayerID == id { swipePivotLayerID = nil }
         if selectedLayerID == id { selectedLayerID = layers.last?.id }
         if removed.isAnchor {
             selectedSourceID = nil
@@ -226,6 +228,8 @@ extension AppModel {
     /// 把图层列表推给画布（图层与来源两个扩展都要用，故不加 private）。
     func pushLayers() {
         canvas.set(layers: layers, focus: anchorLayer?.fitRect)
+        // 图层变了常常意味着「打开的东西」变了，顺手刷新当前标签页的自动标题。
+        refreshActiveWorkspaceTabTitle()
     }
 
     /// 把不再被任何图层使用的 zip 归档从池子里放掉。

@@ -191,6 +191,50 @@ extension AppModel {
         openWithoutRemembering(url, isDirectory: isDirectory.boolValue)
     }
 
+    /// 一次打开多个路径：第一个当主内容，其余作为**叠加图层**依次加上去。
+    ///
+    /// 拖进来的东西可能混着目录、zip 分卷与单幅影像；这里只在能读出地理参考的
+    /// 单幅影像上做叠加 —— 其余的逐个打开会把刚铺好的主内容顶掉，反而不是用户要的。
+    func open(_ urls: [URL]) {
+        guard let first = urls.first else { return }
+        open(first)
+        let extras = urls.dropFirst().filter {
+            var isDirectory: ObjCBool = false
+            let exists = FileManager.default.fileExists(
+                atPath: $0.path(percentEncoded: false), isDirectory: &isDirectory
+            )
+            // 只有「确实存在、而且不是目录」的才当叠加影像去读；
+            // 目录 / zip 分卷这些一律交给第一个路径那条链路处理。
+            return exists && !isDirectory.boolValue
+        }
+        guard !extras.isEmpty else { return }
+        addOverlayRasters(from: Array(extras))
+    }
+
+    /// 把一批影像读进来当叠加图层。
+    ///
+    /// 读完再挂：`RasterLoader.load` 要读文件头（可能几百毫秒），逐个在主线程读会卡住界面。
+    /// 每挂一层都走 `addLayer`，于是图层顺序、基准层、不透明度这些既有规则全都不用另写一套。
+    private func addOverlayRasters(from urls: [URL]) {
+        Task {
+            var added = 0
+            for url in urls {
+                let raster = await Task.detached(priority: .userInitiated) {
+                    try? RasterLoader.load(url: url)
+                }.value
+                guard let raster else {
+                    setStatus("叠加失败：读不出 \(url.lastPathComponent)", autoClearAfter: 6)
+                    continue
+                }
+                addLayer(makeLayer(raster: raster))
+                added += 1
+            }
+            if added > 0 {
+                setStatus("已叠加 \(added) 个图层", autoClearAfter: 6)
+            }
+        }
+    }
+
     /// 打开一份数据但**不写进「最近打开」**（调试用：无人值守截图时不改用户的偏好）。
     func openForDebugging(_ url: URL) {
         var isDirectory: ObjCBool = false

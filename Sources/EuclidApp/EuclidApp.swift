@@ -78,6 +78,12 @@ struct Euclid: App {
             }
             .keyboardShortcut("l", modifiers: [.command, .shift])
             .help("把本地瓦片用 HTTP 提供给别的工具（例如 OSM 在线编辑器）")
+            Button("DEM 工具箱…") {
+                model.showAnalysisSheet = true
+            }
+            .keyboardShortcut("d", modifiers: [.command, .option])
+            .disabled(model.analysisReader == nil)
+            .help("在这份影像上算剖面、坡度、土方量，或做两期差异（⌥⌘D）")
             Divider()
             Button("快速导出当前视图（含标注）") {
                 model.quickExportView()
@@ -88,6 +94,11 @@ struct Euclid: App {
                 model.exportViewAsImage()
             }
             .keyboardShortcut("e", modifiers: [.command, .shift])
+            .disabled(!model.hasMapContent)
+            Button("导出当前视图为 PDF…") {
+                model.exportViewAsPDF()
+            }
+            .keyboardShortcut("e", modifiers: [.command, .option])
             .disabled(!model.hasMapContent)
             Button("复制当前视图到剪贴板") {
                 model.copyViewToClipboard()
@@ -103,6 +114,31 @@ struct Euclid: App {
                 model.loadMeasurementsFromFile()
             }
             .keyboardShortcut("o", modifiers: [.command, .option])
+            Button("导入 GeoJSON / KML 叠加层…") {
+                model.importVectorOverlay()
+            }
+            .keyboardShortcut("i", modifiers: [.command, .option, .shift])
+            Divider()
+            Button("把当前视图记为书签") {
+                model.addBookmark()
+            }
+            .keyboardShortcut("b", modifiers: [.command, .shift])
+            .disabled(!model.hasMapContent)
+            Menu("跳到书签") {
+                if model.bookmarks.items.isEmpty {
+                    Text("还没有书签")
+                } else {
+                    ForEach(model.bookmarks.items) { bookmark in
+                        Button(bookmark.displayName) { model.goToBookmark(bookmark) }
+                    }
+                }
+            }
+            .disabled(model.bookmarks.items.isEmpty)
+            Button("导出巡检图集…") {
+                model.exportInspectionAtlas()
+            }
+            .keyboardShortcut("a", modifiers: [.command, .option])
+            .disabled(!model.hasMapContent)
             Button("在访达中显示测量自动存档") {
                 model.revealMeasurementArchive()
             }
@@ -114,6 +150,10 @@ struct Euclid: App {
                 .keyboardShortcut("z", modifiers: [.command, .shift])
         }
         CommandGroup(after: .toolbar) {
+            Button("命令面板…") { model.openCommandPalette() }
+                .keyboardShortcut("k", modifiers: .command)
+            Button("快捷键设置…") { model.showShortcutSettings = true }
+            Divider()
             Toggle(isOn: Bindable(model).showLayers) {
                 Text("显示图层面板")
             }
@@ -138,6 +178,18 @@ struct Euclid: App {
             }
             .keyboardShortcut("g", modifiers: .command)
         }
+        CommandMenu("标签页") {
+            Button("新建标签页") { model.addWorkspaceTab() }
+                .keyboardShortcut("t", modifiers: .command)
+            Button("关闭标签页") { model.closeActiveWorkspaceTab() }
+                .keyboardShortcut("w", modifiers: [.command, .option])
+            Button("下一个标签页") { model.selectNextWorkspaceTab() }
+                .keyboardShortcut(.tab, modifiers: .control)
+                .disabled(model.workspaceTabs.count <= 1)
+            Button("上一个标签页") { model.selectPreviousWorkspaceTab() }
+                .keyboardShortcut(.tab, modifiers: [.control, .shift])
+                .disabled(model.workspaceTabs.count <= 1)
+        }
         CommandMenu("工具") {
             Button("浏览") { model.measurements.tool = .browse }
                 .keyboardShortcut("1", modifiers: .command)
@@ -149,6 +201,8 @@ struct Euclid: App {
                 .keyboardShortcut("4", modifiers: .command)
             Button("画圆") { model.measurements.tool = .circle }
                 .keyboardShortcut("5", modifiers: .command)
+            Button("标注") { model.measurements.tool = .annotation }
+                .keyboardShortcut("6", modifiers: .command)
             Divider()
             Button("记下指针位置的点（把指针放到目标上，按 P）") {
                 model.dropPointAtCursor()

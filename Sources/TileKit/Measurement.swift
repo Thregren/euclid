@@ -10,6 +10,8 @@ public enum MeasurementKind: String, Sendable, Codable, CaseIterable {
     case area
     /// 圆（圆心 + 半径）。
     case circle
+    /// 带文字的标注（落一个点 + 一段说明）。
+    case annotation
 
     public var displayName: String {
         switch self {
@@ -17,6 +19,7 @@ public enum MeasurementKind: String, Sendable, Codable, CaseIterable {
         case .distance: return "测距"
         case .area: return "测面积"
         case .circle: return "画圆"
+        case .annotation: return "标注"
         }
     }
 
@@ -26,14 +29,20 @@ public enum MeasurementKind: String, Sendable, Codable, CaseIterable {
         case .distance: return "ruler"
         case .area: return "skew"
         case .circle: return "circle"
+        case .annotation: return "mappin.and.ellipse"
         }
+    }
+
+    /// 「只有一个点、没有长度」的类别（导出的长度列对它们留空）。
+    public var isPointLike: Bool {
+        self == .point || self == .annotation
     }
 
     /// 是否使用填充色（多边形与圆）。
     public var hasFill: Bool {
         switch self {
         case .area, .circle: return true
-        case .point, .distance: return false
+        case .point, .distance, .annotation: return false
         }
     }
 }
@@ -97,6 +106,10 @@ public struct GeoMeasurement: Identifiable, Sendable, Hashable, Codable {
     public var createdAt: Date
     /// 描边/填充样式。
     public var style: MeasurementStyle
+    /// 自定义名称（导出与界面显示都用它；空表示按类型自动编号）。
+    public var name: String?
+    /// 备注（标注工具写的就是这里；导出成属性与说明）。
+    public var note: String?
 
     public init(
         id: UUID = UUID(),
@@ -104,7 +117,9 @@ public struct GeoMeasurement: Identifiable, Sendable, Hashable, Codable {
         points: [GeoCoordinate],
         colorIndex: Int = 0,
         createdAt: Date = Date(),
-        style: MeasurementStyle = .standard
+        style: MeasurementStyle = .standard,
+        name: String? = nil,
+        note: String? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -112,6 +127,8 @@ public struct GeoMeasurement: Identifiable, Sendable, Hashable, Codable {
         self.colorIndex = colorIndex
         self.createdAt = createdAt
         self.style = style
+        self.name = name
+        self.note = note
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -121,22 +138,44 @@ public struct GeoMeasurement: Identifiable, Sendable, Hashable, Codable {
         case colorIndex
         case createdAt
         case style
+        case name
+        case note
     }
 
-    /// 手工解码：旧存档没有 `style` 字段，缺省时按调色板默认样式处理。
+    /// 手工解码：旧存档没有 `style` / `name` / `note` 字段，缺省时按「无」处理。
+    ///
+    /// `kind` 也按字符串解：将来（或更早的版本）遇到不认识的类别时退化成点坐标，
+    /// 而不是让整份存档解码失败。
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(UUID.self, forKey: .id)
-        kind = try container.decode(MeasurementKind.self, forKey: .kind)
+        let rawKind = try container.decodeIfPresent(String.self, forKey: .kind)
+        kind = rawKind.flatMap(MeasurementKind.init(rawValue:)) ?? .point
         points = try container.decode([GeoCoordinate].self, forKey: .points)
         colorIndex = try container.decodeIfPresent(Int.self, forKey: .colorIndex) ?? 0
         createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
         style = try container.decodeIfPresent(MeasurementStyle.self, forKey: .style) ?? .standard
+        name = Self.cleaned(try container.decodeIfPresent(String.self, forKey: .name))
+        note = Self.cleaned(try container.decodeIfPresent(String.self, forKey: .note))
+    }
+
+    /// 空串与「只打了空格」都当作没写，避免导出里出现一堆空行。
+    private static func cleaned(_ text: String?) -> String? {
+        guard let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines) else { return nil }
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     /// 圆心（仅圆有效）。
     public var circleCenter: GeoCoordinate? {
         kind == .circle ? points.first : nil
+    }
+
+    /// 显示与导出用的名字：有自定义名就优先用它，否则退回类型名。
+    public var exportName: String {
+        guard let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+            return kind.displayName
+        }
+        return trimmed
     }
 
     /// 半径端点（仅圆有效）。
@@ -157,7 +196,7 @@ public struct GeoMeasurement: Identifiable, Sendable, Hashable, Codable {
     /// 顶点的显示名。
     public func pointLabel(at index: Int) -> String {
         switch kind {
-        case .point:
+        case .point, .annotation:
             return "取点"
         case .distance:
             return "P\(index + 1)"
@@ -289,7 +328,7 @@ public enum MeasurementCalculator {
         }
 
         switch kind {
-        case .point:
+        case .point, .annotation:
             return MeasurementResult(segments: [], totalLength: 0)
 
         case .circle:

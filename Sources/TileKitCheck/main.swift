@@ -1790,6 +1790,280 @@ do {
     }
 }
 
+section("单幅影像：浮点样本 / 分离平面 / Predictor 3（对照 libtiff 写出的样本）")
+
+do {
+    // 两份样本由 libtiff 的 `tiffcp` 从「未压缩 float32」转出（命令记在 Fixtures/TIFF/README.md）：
+    // 单波段的 DEM 是连续存放 + Predictor 3，三波段那份是分离平面（PlanarConfiguration = 2）。
+    // 期望值就是生成时的解析式，所以这一轮同时验了「解压」「预测还原」「按样本取值」三件事。
+    func elevation(x: Int, y: Int) -> Float {
+        let dx = Double(x) - 300, dy = Double(y) - 200
+        let bump = 200.0 * exp(-(dx * dx + dy * dy) / (2 * 60 * 60))
+        return Float(100.0 + 50.0 * sin(Double(x) / 80) * cos(Double(y) / 60) + bump)
+    }
+
+    let demURL = tiffFixtures.appending(path: "dem_f32_p3.tif")
+    if let dataset = try? RasterLoader.load(url: demURL) {
+        expect(dataset.pixelWidth == 600 && dataset.pixelHeight == 400, "DEM 样本应读出 600 × 400")
+        expect(dataset.bitsPerSample == 32, "DEM 样本每个样本 32 位（实际 \(dataset.bitsPerSample)）")
+        expect(dataset.isGeoreferenced, "DEM 样本是配准过的 GeoTIFF")
+        if let gsd = dataset.groundSampleDistance {
+            expectClose(gsd, 0.5, accuracy: 1e-3, "DEM 地面分辨率应为 0.5 米/像素")
+        }
+        // 画面上能不能看出来：整幅渲染必须成功，而且中间那座高地要比角落亮。
+        if let image = dataset.renderOverview(maxPixelSize: 240), let bytes = rgbaBytes(of: image) {
+            let width = image.width
+            func gray(_ x: Int, _ y: Int) -> Int { Int(bytes[(y * width + x) * 4]) }
+            let center = gray(width / 2, image.height / 2)
+            let corner = gray(2, 2)
+            expect(center > corner, "浮点影像按分位拉伸后，中间的高地应比角落亮（\(center) vs \(corner)）")
+        } else {
+            expect(false, "DEM 样本应能渲染出整幅缩略图")
+        }
+    } else {
+        expect(false, "DEM 样本（float32 + Predictor 3）应能打开")
+    }
+
+    // 按样本取值：与解析式逐点比（容差按 float32 的量级放）。
+    if let reader = RasterSampleReader.open(url: demURL) {
+        expect(reader.isFloat, "DEM 应认出浮点样本")
+        expect(reader.bandCount == 1, "DEM 应认出单波段")
+        expect(reader.isElevationLike, "单波段浮点 + 有地理参考 = 高程数据")
+        var worst: Float = 0
+        for (x, row) in [(0, 0), (37, 11), (300, 200), (599, 399), (256, 128)] {
+            guard let value = reader.value(column: Double(x), row: Double(row)) else {
+                expect(false, "DEM 在像素 (\(x), \(row)) 应读得到高程")
+                continue
+            }
+            worst = max(worst, abs(value - elevation(x: x, y: 400 - row)))
+        }
+        expect(worst < 1e-3, "DEM 逐点高程应与生成时的解析式一致（最大偏差 \(worst)）")
+
+        // 网格 + 剖面：同一套取值路径的两种用法。
+        if let grid = reader.grid(rect: CGRect(x: 0, y: 0, width: 600, height: 400), maxDimension: 64) {
+            expect(grid.step == 10, "600 宽抽到 64 点时步长应为 10（实际 \(grid.step)）")
+            expect(grid.width == 60 && grid.height == 40,
+                   "抽稀后的网格应是 60 × 40（实际 \(grid.width) × \(grid.height)）")
+            expect(grid.validValues.count == grid.width * grid.height, "整幅范围内不该有空洞")
+        } else {
+            expect(false, "DEM 应能取到样本网格")
+        }
+        let profile = reader.profile(from: CGPoint(x: 0, y: 200), to: CGPoint(x: 599, y: 200), count: 128)
+        expect(profile.count == 128, "剖面应取满 128 个点（实际 \(profile.count)）")
+        if let first = profile.first, let last = profile.last {
+            expectClose(Double(first.value), Double(elevation(x: 0, y: 200)), accuracy: 1e-3, "剖面起点高程")
+            expectClose(Double(last.value), Double(elevation(x: 599, y: 200)), accuracy: 1e-3, "剖面终点高程")
+        }
+    } else {
+        expect(false, "DEM 样本应能被 RasterSampleReader 打开")
+    }
+
+    // 分离平面（PlanarConfiguration = 2）+ 浮点：三个波段各占一个平面。
+    let planarURL = tiffFixtures.appending(path: "rgb_f32_planar.tif")
+    if let dataset = try? RasterLoader.load(url: planarURL) {
+        expect(dataset.compression == "Deflate", "分离平面样本压缩方式应为 Deflate")
+        if let image = dataset.renderOverview(maxPixelSize: 120), rgbaBytes(of: image) != nil {
+            expect(true, "分离平面（浮点）影像应能渲染")
+        } else {
+            expect(false, "分离平面样本应能渲染出缩略图")
+        }
+        if let reader = RasterSampleReader.open(url: planarURL) {
+            expect(reader.bandCount == 3, "分离平面样本应有 3 个波段")
+            expect(!reader.isElevationLike, "三波段不算高程数据")
+            // 三个平面在同一点的取值本来就不同（红 0.10 起、绿 0.20 起、蓝 0.50 起）：
+            // 平面取错会立刻露出来。
+            let r = reader.value(column: 0, row: 0, band: 0)
+            let g = reader.value(column: 0, row: 0, band: 1)
+            let b = reader.value(column: 0, row: 0, band: 2)
+            if let r, let g, let b {
+                expect(abs(r - 0.10) < 1e-3 && abs(g - 0.20) < 1e-3 && abs(b - 0.50) < 1e-3,
+                       "分离平面应按波段取到各自的平面（实际 \(r) / \(g) / \(b)）")
+            } else {
+                expect(false, "分离平面在原点应取到三个波段")
+            }
+            if let value = reader.value(column: 599, row: 0, band: 0) {
+                expectClose(Double(value), 0.3995, accuracy: 1e-3, "分离平面第 0 波段在 x=599 的值")
+            } else {
+                expect(false, "分离平面第 0 波段在 x=599 应读得到值")
+            }
+        } else {
+            expect(false, "分离平面样本应能被 RasterSampleReader 打开")
+        }
+    } else {
+        expect(false, "分离平面样本（float32 + PlanarConfiguration = 2）应能打开")
+    }
+
+    // Predictor 3 的还原：两个样本 1.0、-1.0，按 libtiff 的口径编码 ——
+    // 先按字节平面重排（小端：最高位字节在前），再在记录内按**字节**累加一次。
+    do {
+        // 1.0 = 3F800000、-1.0 = BF800000（小端字节序 00 00 80 3F / 00 00 80 BF）。
+        // 重排成 [3F BF][80 80][00 00][00 00]，再按字节做一次一阶差分（不是逐级累加）。
+        // 期望向量由 libtiff 的 fpDiff 口径算出（见 Fixtures/TIFF/make-float-fixtures.py）。
+        var raw: [UInt8] = [0x3F, 0x80, 0xC1, 0x00, 0x80, 0x00, 0x00, 0x00]
+        TIFFSampleChecks.undoFloatPredictor(&raw, width: 2, rows: 1)
+        func float(at offset: Int) -> Float {
+            Float(bitPattern: UInt32(raw[offset])
+                | UInt32(raw[offset + 1]) << 8
+                | UInt32(raw[offset + 2]) << 16
+                | UInt32(raw[offset + 3]) << 24)
+        }
+        expectClose(Double(float(at: 0)), 1.0, accuracy: 1e-6, "Predictor 3：第一个样本原样保留")
+        expectClose(Double(float(at: 4)), -1.0, accuracy: 1e-6, "Predictor 3：第二个样本按字节累加")
+
+        // 大端文件的平面顺序相反（最低位字节在前）。
+        // 大端文件的平面顺序相反：1.0 = 3F800000、2.0 = 40000000，重排成 [3F 40][80 00][00 00][00 00]。
+        var big: [UInt8] = [0x3F, 0x01, 0x40, 0x80, 0x00, 0x00, 0x00, 0x00]
+        TIFFSampleChecks.undoFloatPredictor(&big, width: 2, rows: 1, littleEndian: false)
+        func bigFloat(at offset: Int) -> Float {
+            Float(bitPattern: UInt32(big[offset]) << 24
+                | UInt32(big[offset + 1]) << 16
+                | UInt32(big[offset + 2]) << 8
+                | UInt32(big[offset + 3]))
+        }
+        expectClose(Double(bigFloat(at: 0)), 1.0, accuracy: 1e-6, "Predictor 3（大端）：第一个样本")
+        expectClose(Double(bigFloat(at: 4)), 2.0, accuracy: 1e-6, "Predictor 3（大端）：第二个样本")
+    }
+
+    // 归一化：8 / 16 位无符号满量程、有符号居中、浮点按 0…1。
+    expect(TIFFSampleChecks.normalize(0, bits: 8, kind: .unsigned) == 0, "8 位无符号最小值 → 0")
+    expect(TIFFSampleChecks.normalize(255, bits: 8, kind: .unsigned) == 255, "8 位无符号最大值 → 255")
+    expect(TIFFSampleChecks.normalize(65535, bits: 16, kind: .unsigned) == 255, "16 位无符号最大值 → 255")
+    expect(TIFFSampleChecks.normalize(0, bits: 16, kind: .signed) == 128, "16 位有符号零点 → 128（居中）")
+    expect(TIFFSampleChecks.normalize(0.5, bits: 32, kind: .float) == 128, "浮点 0.5 → 128")
+    expect(TIFFSampleChecks.normalize(.nan, bits: 32, kind: .float) == 0, "NaN 不画（→ 0）")
+}
+
+section("栅格分析：坡度 / 土方量 / 两期差异")
+
+do {
+    // 与上一节共用那两份 600 × 400 的浮点样本（UTM 50N，0.5 米/像素，地面高程由解析式给出）。
+    func elevation(x: Double, y: Double) -> Double {
+        let dx = x - 300, dy = y - 200
+        let bump = 200.0 * exp(-(dx * dx + dy * dy) / (2 * 60 * 60))
+        return 100.0 + 50.0 * sin(x / 80) * cos(y / 60) + bump
+    }
+
+    /// 解析式的坡度（度）：把 dE/dx、dE/dy（每像素）按地面点距换算成梯度，再取模求 atan。
+    func analyticSlopeDegrees(x: Double, y: Double, spacing: Double) -> Double {
+        let dx = x - 300, dy = y - 200
+        let bump = exp(-(dx * dx + dy * dy) / (2 * 60 * 60))
+        // d/dx exp(-r²/7200) = -dx/3600 · exp(-r²/7200)，注意 2·60² = 7200 里那个 2。
+        let dEx = 50 * cos(x / 80) / 80 * cos(y / 60) - 200 * dx / (60 * 60) * bump
+        let dEy = -50 * sin(x / 80) * sin(y / 60) / 60 - 200 * dy / (60 * 60) * bump
+        // 行号向南增大（y 轴方向相反），水平梯度取正号。
+        let groundX = dEx / spacing
+        let groundY = -dEy / spacing
+        return atan((groundX * groundX + groundY * groundY).squareRoot()) * 180 / .pi
+    }
+
+    let demURL = tiffFixtures.appending(path: "dem_f32_p3.tif")
+    let planarURL = tiffFixtures.appending(path: "rgb_f32_planar.tif")
+    if let reader = RasterSampleReader.open(url: demURL), reader.isElevationLike {
+        let full = CGRect(x: 0, y: 0, width: 600, height: 400)
+
+        // 坡度：与解析式的梯度比（中心差分 + 0.5 米/像素的换算要一起对才算对）。
+        if let slope = DEMAnalysis.slope(reader: reader, rect: full) {
+            expect(slope.width == 600 && slope.height == 400, "整幅坡度网格应为 600 × 400")
+            // 0.5 米是 UTM 平面距离；换算回椭球面要除以中央经线比例因子 0.9996 → 约 0.5002 米。
+            expectClose(slope.spacingMeters, 0.5, accuracy: 0.002, "相邻点地面间距应在 0.5 米附近")
+            let stats = DEMAnalysis.statistics(of: slope)
+            expect(stats.validCount > 230_000, "坡度网格应有大量有效点（实际 \(stats.validCount)）")
+            expect(stats.maximum < 90, "坡度是水平面夹角，必然小于 90 度（实际 \(stats.maximum)）")
+            expect(stats.mean > 1, "起伏地形应有可观的平均坡度（实际 \(stats.mean)）")
+            // 取一个内部点，和解析梯度比（容差按单边差分的截断误差放）。
+            let probeIndex = 200 * 600 + 50
+            if slope.values.indices.contains(probeIndex) {
+                expectClose(
+                    Double(slope.values[probeIndex]),
+                    analyticSlopeDegrees(x: 50, y: 200, spacing: slope.spacingMeters),
+                    accuracy: 0.05,
+                    "坡度应与解析梯度一致"
+                )
+            } else {
+                expect(false, "坡度网格应含探针点")
+            }
+            expect(DEMAnalysis.image(of: slope) != nil, "坡度应能着色成图")
+            // 与地理参考对得上：坡度图左上角应落在源影像左上角。
+            let sourceTopLeft = reader.georeference.coordinate(column: 0, row: 0)
+            let slopeTopLeft = slope.georeference.coordinate(column: 0, row: 0)
+            if let sourceTopLeft, let slopeTopLeft {
+                expectClose(slopeTopLeft.longitude, sourceTopLeft.longitude, accuracy: 1e-9, "坡度图西边界")
+                expectClose(slopeTopLeft.latitude, sourceTopLeft.latitude, accuracy: 1e-9, "坡度图北边界")
+            } else {
+                expect(false, "坡度图应能算出左上角经纬度")
+            }
+        } else {
+            expect(false, "DEM 应能算出坡度")
+        }
+
+        // 土方量：整幅范围、基准取 0（全在地面之下）→ 只应有挖方，且等于逐格求和。
+        let whole = [
+            CGPoint(x: 0, y: 0), CGPoint(x: 600, y: 0),
+            CGPoint(x: 600, y: 400), CGPoint(x: 0, y: 400),
+        ]
+        if let volume = DEMAnalysis.volume(reader: reader, polygon: whole, baseElevation: 0) {
+            expect(volume.fillVolume == 0, "基准在地面之下时不该有填方（实际 \(volume.fillVolume)）")
+            expect(volume.sampledCells == 600 * 400, "整幅应采到 24 万个格子（实际 \(volume.sampledCells)）")
+            expectClose(volume.cellArea, 0.25, accuracy: 0.002, "一个格子的地面面积在 0.25 平方米附近")
+            // 逐格求和当基准（与体积积分走的是同一份采样，但独立算一遍和）。
+            if let grid = reader.grid(rect: full, maxDimension: 2048) {
+                var expected = 0.0
+                for value in grid.values where value.isFinite { expected += Double(value) * volume.cellArea }
+                expectClose(volume.cutVolume, expected, accuracy: abs(expected) * 1e-9 + 1e-6,
+                            "挖方量应等于逐格高程 × 格面积之和")
+            } else {
+                expect(false, "整幅应能取到样本网格")
+            }
+            // 中心那个高斯包（200 米）叠在缓坡上，整幅最高在 328 米附近。
+            expectClose(volume.elevation.maximum, 328, accuracy: 3, "整幅最高高程应在 328 米附近")
+        } else {
+            expect(false, "DEM 应能算出整幅土方量")
+        }
+
+        // 土方量：范围缩到一小块，挖填都要出现（基准取该块的中位高程附近）。
+        let patch = [
+            CGPoint(x: 100, y: 100), CGPoint(x: 200, y: 100),
+            CGPoint(x: 200, y: 200), CGPoint(x: 100, y: 200),
+        ]
+        if let volume = DEMAnalysis.volume(reader: reader, polygon: patch, baseElevation: 100) {
+            expect(volume.sampledCells == 100 * 100, "小块应采到 1 万个格子（实际 \(volume.sampledCells)）")
+            expect(volume.cutVolume > 0 && volume.fillVolume > 0, "基准穿过地形时挖填都该出现")
+            expectClose(volume.sampledArea, Double(100 * 100) * volume.cellArea, accuracy: 1e-6, "采样平面面积")
+        } else {
+            expect(false, "DEM 应能算出一小块土方量")
+        }
+
+        // 点落在多边形内外的判定。
+        expect(DEMAnalysis.contains(whole, point: CGPoint(x: 300, y: 200)), "中心点应在多边形内")
+        expect(!DEMAnalysis.contains(whole, point: CGPoint(x: -5, y: 200)), "范围外的点应判在多边形外")
+
+        // 两期差异：同一份数据相减应处处为零。
+        if let same = RasterDifference.compute(first: reader, second: reader) {
+            expect(same.comparedSamples == 600 * 400, "同源相减应比满 24 万个采样点")
+            expectClose(same.absoluteMaximum, 0, accuracy: 1e-9, "同源相减的最大差值为 0")
+            expectClose(same.meanDifference, 0, accuracy: 1e-9, "同源相减的平均差值为 0")
+        } else {
+            expect(false, "同一份影像应能算出差异图（恒为 0）")
+        }
+    } else {
+        expect(false, "DEM 样本应能被 RasterSampleReader 打开")
+    }
+
+    // 两期差异：DEM 与三波段影像的第 0 波段（同范围、同地理参考）。
+    if let dem = RasterSampleReader.open(url: demURL),
+       let planar = RasterSampleReader.open(url: planarURL),
+       let result = RasterDifference.compute(first: dem, second: planar, band: 0) {
+        expect(result.width == 600 && result.height == 400, "差异图应铺满共同覆盖范围")
+        expect(result.comparedSamples == 600 * 400, "差异图应比满 24 万个采样点")
+        // DEM 均值 ≈ 119（缓坡 + 中心高斯包），影像第 0 波段在 0.10…0.40 之间。
+        expectClose(result.meanDifference, 118.8, accuracy: 2, "DEM 减影像的平均差值应在 119 附近")
+        expect(result.absoluteMaximum < 335, "差异不会超过两个数据的量级之和")
+        expect(result.image.width == result.width && result.image.height == result.height, "差异图尺寸一致")
+    } else {
+        expect(false, "DEM 与三波段影像应能算出差异图")
+    }
+}
+
 section("影像解码：跨瓦片的块缓存与读句柄池")
 
 do {
@@ -2673,6 +2947,128 @@ if let fujianRoot {
     }
 } else {
     print("\n▸ 真实 zip 数据集：没有找到带 manifest.json 的「福建省瓦片」（跳过）")
+}
+
+// MARK: - G1：新功能自检
+
+section("G1：新功能自检（流式下载 / zip 索引 / 矢量导入 / 导出 / 概览缓存 / 本地服务）")
+
+do {
+    let plan = try TileDownloadPlan(
+        bounds: GeoBounds(west: 120.10, south: 30.20, east: 120.32, north: 30.38),
+        zoomRange: 12...13
+    )
+    for range in plan.ranges {
+        var streamed: [SlippyTile] = []
+        var buffer: [SlippyTile] = []
+        var iterator = plan.tileChunks(for: range, chunkSize: 7)
+        while let chunk = iterator.next() {
+            expect(chunk.count <= 7, "流式分块不应超过块大小")
+            buffer.append(contentsOf: chunk)
+            if buffer.count >= 7 {
+                streamed.append(contentsOf: buffer)
+                buffer.removeAll(keepingCapacity: true)
+            }
+        }
+        streamed.append(contentsOf: buffer)
+        expect(streamed == plan.tiles(for: range), "z\(range.zoom) 流式顺序应与物化顺序一致")
+    }
+}
+
+do {
+    let directory = FileManager.default.temporaryDirectory.appending(path: "euclid-zipindex-\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let file = directory.appending(path: "part.zip")
+    try? Data(repeating: 0x41, count: 4096).write(to: file)
+    let size = UInt64((try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+    let spans: [String: (start: UInt64, end: UInt64)] = [
+        "12/3400": (1, 2048),
+        "12/3401\tx": (2049, 4095),
+        "12/3402\n换行": (0, 0),
+    ]
+    ZipIndexCache.save(
+        rowSpans: spans,
+        entryCount: 3,
+        centralDirectorySize: 4096,
+        isZip64: false,
+        for: file,
+        fileSize: size
+    )
+    let loaded = ZipIndexCache.load(for: file, fileSize: size)
+    expect(
+        loaded?.rowSpans.count == spans.count && loaded?.entryCount == 3 && loaded?.isZip64 == false,
+        "索引应命中并还原表头"
+    )
+    expect(
+        loaded?.rowSpans["12/3401\tx"]?.start == 2049 && loaded?.rowSpans["12/3402\n换行"]?.end == 0,
+        "含制表符 / 换行的行名应原样还原"
+    )
+    expect(ZipIndexCache.load(for: file, fileSize: size + 1) == nil, "文件大小变了应不命中")
+
+    let sample = GeoMeasurement(
+        kind: .distance,
+        points: [
+            GeoCoordinate(longitude: 120, latitude: 30),
+            GeoCoordinate(longitude: 120.001, latitude: 30),
+        ],
+        name: "道路"
+    )
+    let dxf = MeasurementCADExporter.dxf([sample])
+    expect(dxf.contains("SECTION") && dxf.contains("ENTITIES") && dxf.contains("EOF"), "DXF 应含标准段")
+    expect(MeasurementCADExporter.pair(1, "注记").contains("\\U+6CE8"), "非 ASCII 应转成 \\U+XXXX")
+
+    let shapefile = MeasurementCADExporter.shapefile([sample], baseName: "自检")
+    for suffix in ["_line.shp", "_line.shx", "_line.dbf", "_line.prj", "_line.cpg"] {
+        let match = shapefile.first { $0.name.hasSuffix(suffix) }
+        expect(match?.name == "自检\(suffix)" && !(match?.data.isEmpty ?? true), "Shapefile 应含 \(suffix)")
+    }
+    let shp = shapefile.first { $0.name.hasSuffix("_line.shp") }?.data
+    expect(shp?.count ?? 0 >= 100, ".shp 应含 100 字节头与记录")
+
+    let geojson = #"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"name":"干道"},"geometry":{"type":"LineString","coordinates":[[120,30],[120.001,30.001]]}}]}"#
+    let jsonURL = directory.appending(path: "sample.geojson")
+    try? Data(geojson.utf8).write(to: jsonURL)
+    let imported = try? VectorImporter.measurements(from: jsonURL)
+    expect(imported?.count == 1 && imported?.first?.kind == .distance, "GeoJSON 应导入为折线")
+
+    let kml = "<kml><Document><Placemark><name>测区</name><Polygon><outerBoundaryIs><LinearRing><coordinates>120,30 120.01,30 120.01,30.01 120,30.01 120,30</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark></Document></kml>"
+    let kmlURL = directory.appending(path: "sample.kml")
+    try? Data(kml.utf8).write(to: kmlURL)
+    let parsedKML = try? VectorImporter.measurements(from: kmlURL)
+    expect(parsedKML?.count == 1 && parsedKML?.first?.kind == .area, "KML 外环应导入为面积")
+
+    let dense = (0..<5000).map { GeoCoordinate(longitude: 120 + Double($0) * 1e-6, latitude: 30) }
+    let simplified = VectorImporter.simplified(dense, limit: 100)
+    expect(
+        simplified.count == 100 && simplified.first == dense.first && simplified.last == dense.last,
+        "抽稀应保留首尾"
+    )
+
+    let key = RasterOverviewCache.key(fileURL: file, tileSize: 256)
+    expect(key.contains("part.zip") && key.hasSuffix("|256"), "概览缓存键应按 路径|大小|时间|尺寸 拼出")
+    expect(RasterOverviewCache.fileName(for: key).count == 16, "概览缓存文件名应是定长十六进制")
+
+    let root = FileManager.default.temporaryDirectory.appending(path: "euclid-server-\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: root.appending(path: "3/4"), withIntermediateDirectories: true)
+    try? Data([0x89, 0x50]).write(to: root.appending(path: "3/4/5.png"))
+    defer { try? FileManager.default.removeItem(at: root) }
+    if let json = LocalTileServer.tileJSON(
+        root: root,
+        rootName: "自检瓦片",
+        port: 8766,
+        metadata: LocalTileServer.RootMetadata()
+    ), let object = try? JSONSerialization.jsonObject(with: json) as? [String: Any] {
+        expect(
+            object["tilejson"] as? String == "2.2.0"
+                && (object["tiles"] as? [String])?.first?.contains("{z}/{x}/{y}") == true,
+            "TileJSON 应给出标准模板"
+        )
+    } else {
+        expect(false, "TileJSON 应能序列化")
+    }
+    let html = LocalTileServer.previewHTML(rootName: "自检<瓦片>", start: (zoom: 3, x: 4, y: 5), tileSize: 256)
+    expect(html.contains("<title>预览 · 自检&lt;瓦片&gt;</title>"), "预览页标题应转义 HTML")
 }
 
 // MARK: - 汇总

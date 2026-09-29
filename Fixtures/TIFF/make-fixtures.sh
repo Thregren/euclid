@@ -1,5 +1,5 @@
 #!/bin/bash
-# 重新生成 TIFF 回归样本（需要 ImageMagick 的 magick 与 python3）。
+# 重新生成 TIFF 回归样本（需要 ImageMagick 的 magick、libtiff 的 tiffinfo/tiffcp 与 python3）。
 #
 # 样本必须由第三方写入方产出：这样自检比对的是「真实世界写出来的 TIFF」，
 # 而不是我们自己写自己读。改完样本请重新跑一遍自检。
@@ -87,3 +87,7 @@ struct.pack_into("<I", output, 4, new_ifd)
 open("geo_utm50_deflate.tif", "wb").write(bytes(output))
 print("geo_utm50_deflate.tif", len(output), "字节")
 PY
+
+# 3) 浮点样本 / 分离平面 / Predictor 3 的两份样本（tiffcp 会丢掉 GeoTIFF 标签，
+#    所以这一份由脚本自己按 TIFF 规范写，写完用 tiffinfo -d 抽查）。
+python3 make-float-fixtures.py .

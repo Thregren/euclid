@@ -117,6 +117,13 @@ struct CursorCoordinateSection: View {
                         .monospacedDigit()
                         .textSelection(.enabled)
                 }
+                if let elevation = model.elevationReading(at: cursor.coordinate) {
+                    LabeledContent("高程") {
+                        Text(String(format: "%.2f m", elevation))
+                            .monospacedDigit()
+                            .textSelection(.enabled)
+                    }
+                }
                 Button {
                     model.copyCursorCoordinate()
                 } label: {
@@ -166,6 +173,15 @@ struct CursorCoordinateSection: View {
 /// 测量结果分区。
 struct MeasurementSection: View {
     @Environment(AppModel.self) private var model
+    /// 是否展开全部（默认只铺最新的这一批）。
+    @State private var showsAllMeasurements = false
+
+    /// 一次最多铺多少条测量行。
+    ///
+    /// 检查器是 `Form`，它的行是**立刻**建出来的：几十条没问题，几百条时连明细一起算就会卡。
+    /// 这里先只铺最新的这一批，其余收在「显示全部」后面 —— 比整块换成 `List` 稳（不动现有版式），
+    /// 也不改「新的在最上面」这个习惯。
+    private static let collapsedRowLimit = 60
 
     var body: some View {
         let store = model.measurements
@@ -175,8 +191,24 @@ struct MeasurementSection: View {
             }
 
             // 新的在最上面：画完一条抬头就能看到它，不用滚到列表底部。
-            ForEach(store.measurements.reversed()) { measurement in
+            let newestFirst = store.measurements.reversed()
+            let shown = showsAllMeasurements
+                ? newestFirst.prefix(newestFirst.count)
+                : newestFirst.prefix(Self.collapsedRowLimit)
+            ForEach(shown) { measurement in
                 row(measurement, store: store)
+            }
+            if store.measurements.count > Self.collapsedRowLimit {
+                Button {
+                    showsAllMeasurements.toggle()
+                } label: {
+                    Text(showsAllMeasurements
+                         ? "只显示最新的 \(Self.collapsedRowLimit) 条"
+                         : "显示其余 \(store.measurements.count - Self.collapsedRowLimit) 条测量")
+                        .font(.callout)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
             }
 
             if store.measurements.isEmpty && store.draft.isEmpty {
@@ -268,8 +300,9 @@ struct MeasurementSection: View {
         HStack(spacing: 6) {
             Image(systemName: measurement.kind.symbolName)
                 .foregroundStyle(color)
-            Text(measurement.kind.displayName)
+            Text(measurement.exportName)
                 .font(.callout.weight(.medium))
+                .lineLimit(1)
             Spacer()
             Text(summary(of: measurement))
                 .font(.callout)
@@ -294,13 +327,13 @@ struct MeasurementSection: View {
     @ViewBuilder
     private func details(of measurement: GeoMeasurement, store: MeasurementStore) -> some View {
         let result = measurement.result
-        if measurement.kind == .point, let coordinate = measurement.points.first {
+        if measurement.kind.isPointLike, let coordinate = measurement.points.first {
             LabeledContent("坐标", value: CoordinateText.decimal(coordinate, precision: 7))
         }
         if let area = result.area {
             LabeledContent("面积", value: model.areaText(area))
         }
-        if measurement.kind != .point {
+        if !measurement.kind.isPointLike {
             LabeledContent(lengthTitle(for: measurement.kind),
                            value: MeasureFormat.distance(result.totalLength))
         }
@@ -317,6 +350,8 @@ struct MeasurementSection: View {
                 model.canvas.refreshOverlay()
             }
         }
+
+        MeasurementTextEditor(measurement: measurement)
 
         if measurement.points.count >= 2 {
             ExpandableRow("顶点坐标") {
@@ -411,7 +446,7 @@ struct MeasurementSection: View {
         switch kind {
         case .area, .circle: return "周长"
         case .distance: return "总长度"
-        case .point: return "长度"
+        case .point, .annotation: return "长度"
         }
     }
 
@@ -420,6 +455,9 @@ struct MeasurementSection: View {
         switch measurement.kind {
         case .point:
             return measurement.points.first.map { CoordinateText.decimal($0, precision: 5) } ?? "—"
+        case .annotation:
+            let note = measurement.note?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return note.isEmpty ? "（未填写文字）" : note
         case .distance:
             return MeasureFormat.distance(result.totalLength)
         case .area:
@@ -427,6 +465,65 @@ struct MeasurementSection: View {
         case .circle:
             return result.radius.map { "R " + MeasureFormat.distance($0) } ?? "—"
         }
+    }
+}
+
+// MARK: - 名称与备注
+
+/// 一条测量的名称与备注输入。
+///
+/// 用本地 `@State` 承接输入，而不是把 `TextField` 直接双向绑到模型上：
+/// 模型那一侧是「空串 → nil」的正常化结果，双向绑定会在输入过程中被回写、光标被打断。
+/// 这里只在「本地值与模型值确实不一致」时才回写，因此撤销 / 切数据集 / 选中别的测量都能正确同步。
+struct MeasurementTextEditor: View {
+    @Environment(AppModel.self) private var model
+    let measurement: GeoMeasurement
+
+    @State private var name = ""
+    @State private var note = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Text("名称")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                TextField(measurement.kind.displayName, text: $name)
+                    .textFieldStyle(.roundedBorder)
+                    .onChange(of: name) { _, newValue in
+                        guard newValue != (model.measurements.selectedMeasurement?.name ?? "") else { return }
+                        model.measurements.setName(newValue, of: measurement.id)
+                    }
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                Text("备注")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                TextField("备注 / 标注文字（随存档与导出一起走）", text: $note, axis: .vertical)
+                    .lineLimit(2...6)
+                    .textFieldStyle(.roundedBorder)
+                    .onChange(of: note) { _, newValue in
+                        guard newValue != (model.measurements.selectedMeasurement?.note ?? "") else { return }
+                        model.measurements.setNote(newValue, of: measurement.id)
+                        model.canvas.refreshOverlay()
+                    }
+            }
+        }
+        .onAppear { syncFromModel() }
+        .onChange(of: measurement.id) { _, _ in syncFromModel() }
+        .onChange(of: measurement.name) { _, newValue in
+            let value = newValue ?? ""
+            if value != name { name = value }
+        }
+        .onChange(of: measurement.note) { _, newValue in
+            let value = newValue ?? ""
+            if value != note { note = value }
+        }
+    }
+
+    private func syncFromModel() {
+        name = measurement.name ?? ""
+        note = measurement.note ?? ""
     }
 }
 
@@ -499,7 +596,7 @@ private struct DraftMeasurementBlock: View {
         switch kind {
         case .area, .circle: return "周长"
         case .distance: return "总长度"
-        case .point: return "长度"
+        case .point, .annotation: return "长度"
         }
     }
 }

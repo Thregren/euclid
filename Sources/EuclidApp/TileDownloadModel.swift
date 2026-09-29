@@ -45,6 +45,8 @@ final class TileDownloadModel {
     var writesManifest = true
 
     var isRunning = false
+    /// 下载中是否处于「暂停」状态（暂停时在途的瓦片会落地，只是不再发新请求）。
+    var isPaused = false
     var progress: TileDownloadProgress?
     var summary: TileDownloadSummary?
     var errorMessage: String?
@@ -56,6 +58,8 @@ final class TileDownloadModel {
     var onSourceChanged: (() -> Void)?
 
     private var task: Task<Void, Never>?
+    /// 暂停 / 继续的闸门（每次开始下载换一个新的，上一次的残留不影响这一次）。
+    private var gate: TileDownloadGate?
     private var didPrepare = false
 
     init() {
@@ -269,6 +273,7 @@ final class TileDownloadModel {
         )
 
         isRunning = true
+        isPaused = false
         summary = nil
         errorMessage = nil
         progress = TileDownloadProgress(
@@ -287,10 +292,12 @@ final class TileDownloadModel {
 
         // 这个 Task 在主 actor 上创建，因此内部状态改动仍在主线程；
         // `run` 本身是非隔离的异步方法，取图与写盘都在后台执行。
+        let gate = TileDownloadGate()
+        self.gate = gate
         task = Task {
             let downloader = TileDownloader()
             do {
-                let result = try await downloader.run(plan: plan, options: options) { update in
+                let result = try await downloader.run(plan: plan, options: options, gate: gate) { update in
                     Task { @MainActor in
                         self.progress = update
                     }
@@ -298,7 +305,9 @@ final class TileDownloadModel {
                 self.finish(with: result, directory: outputDirectory)
             } catch {
                 self.isRunning = false
+                self.isPaused = false
                 self.task = nil
+                self.gate = nil
                 let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
                 self.errorMessage = message
                 self.onStatus?("下载失败：\(message)")
@@ -306,14 +315,34 @@ final class TileDownloadModel {
         }
     }
 
+    /// 暂停 / 继续。暂停只是不再发新请求，已经落地的瓦片留着 ——
+    /// 下次用同一个计划再跑会跳过它们，等于从断点接着下。
+    func togglePause() {
+        guard isRunning, let gate else { return }
+        if isPaused {
+            gate.resume()
+            isPaused = false
+            onStatus?("继续下载…")
+        } else {
+            gate.pause()
+            isPaused = true
+            onStatus?("已暂停下载（再点一次继续；已落地的瓦片会保留）")
+        }
+    }
+
     func cancel() {
         task?.cancel()
+        // 闸门上的等待者要放行，否则取消只是「停下来等」，循环不会走到取消分支。
+        gate?.resume()
+        isPaused = false
         onStatus?("正在停止下载…")
     }
 
     private func finish(with summary: TileDownloadSummary, directory: URL) {
         isRunning = false
+        isPaused = false
         task = nil
+        gate = nil
         self.summary = summary
         lastOutputDirectory = directory
 

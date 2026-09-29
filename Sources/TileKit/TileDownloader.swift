@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 // MARK: - 取图
 
@@ -253,6 +254,64 @@ public enum TileDownloadError: Error, LocalizedError, Equatable {
     }
 }
 
+/// 下载的暂停 / 继续闸门。
+///
+/// 「暂停」不是取消：已经在途的那几张照常落盘，只是不再发新请求；「继续」把等在闸门上的
+/// 下载循环放行（`TileDownloader.run(gate:)`）。
+///
+/// 断点续传靠的是**跳过已存在的文件**（`TileDownloadOptions.overwriteExisting = false`）：
+/// 暂停后即使把任务整个取消，下次用同一个计划重跑也会跳过已落地的那些，从断点接着下。
+///
+/// 并发约定：所有状态都在 `NSLock` 后面，`resume()` 在锁外唤醒等待者
+/// （唤醒会同步跑起等待方的续体，抱着锁做容易和新的 `waitIfPaused` 互相卡住）。
+public final class TileDownloadGate: @unchecked Sendable {
+    /// 用 `OSAllocatedUnfairLock` 而不是 `NSLock`：异步上下文里 `NSLock.lock()` 会被
+    /// Swift 6 直接判为不可用（锁跨 await 持有会死锁），这个锁的 `withLock` 是异步安全的。
+    private struct State {
+        var paused = false
+        var waiters: [CheckedContinuation<Void, Never>] = []
+    }
+
+    private let state = OSAllocatedUnfairLock(initialState: State())
+
+    public init() {}
+
+    public var isPaused: Bool { state.withLock { $0.paused } }
+
+    public func pause() { state.withLock { $0.paused = true } }
+
+    /// 继续（也用于「取消时把等待者放行」，见 `waitIfPaused`）。
+    public func resume() {
+        // 唤醒放在锁外：续体是同步跑起来的，抱着锁唤醒容易和新的 `waitIfPaused` 互卡。
+        let pending = state.withLock { state -> [CheckedContinuation<Void, Never>] in
+            state.paused = false
+            let pending = state.waiters
+            state.waiters.removeAll()
+            return pending
+        }
+        for continuation in pending { continuation.resume() }
+    }
+
+    /// 没暂停就立刻返回；暂停了就挂起，直到 `resume()` 或所在任务被取消。
+    func waitIfPaused() async {
+        guard state.withLock({ $0.paused }) else { return }
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                // 进锁之后再看一次：可能在两次检查之间刚好被 `resume()` 放行了。
+                let alreadyResumed = state.withLock { state -> Bool in
+                    guard state.paused else { return true }
+                    state.waiters.append(continuation)
+                    return false
+                }
+                if alreadyResumed { continuation.resume() }
+            }
+        } onCancel: {
+            // 任务被取消：把等待者放行，让下载循环走到取消分支去收尾。
+            self.resume()
+        }
+    }
+}
+
 /// 瓦片下载器：按计划逐层抓取并写入本地目录。
 public struct TileDownloader: Sendable {
     /// 单次任务的上限，避免误操作把磁盘和对方服务器都拖垮。
@@ -279,6 +338,7 @@ public struct TileDownloader: Sendable {
     public func run(
         plan: TileDownloadPlan,
         options: TileDownloadOptions,
+        gate: TileDownloadGate? = nil,
         onProgress: (@Sendable (TileDownloadProgress) -> Void)? = nil
     ) async throws -> TileDownloadSummary {
         let total = plan.totalTileCount
@@ -327,22 +387,54 @@ public struct TileDownloader: Sendable {
                 cancelled = true
                 break
             }
-            let tiles = plan.tiles(for: range)
             let options = options
             let fetcher = fetcher
 
             try await withThrowingTaskGroup(of: Outcome.self) { group in
-                var index = 0
                 var inFlight = 0
+                var chunk: [SlippyTile] = []
+                var index = 0
+                var chunks = plan.tileChunks(for: range).makeIterator()
 
-                while index < tiles.count || inFlight > 0 {
+                func record(_ outcome: Outcome) {
+                    completed += 1
+                    switch outcome {
+                    case .downloaded(let size):
+                        downloaded += 1
+                        bytes += size
+                    case .skipped:
+                        skipped += 1
+                    case .missing:
+                        missing += 1
+                    case .failed(let message):
+                        failed += 1
+                        if failures.count < 20 { failures.append(message) }
+                    }
+                    report(zoom: range.zoom)
+                }
+
+                while true {
                     if Task.isCancelled {
                         cancelled = true
                         group.cancelAll()
                         break
                     }
-                    while inFlight < options.concurrency, index < tiles.count {
-                        let tile = tiles[index]
+                    // 暂停：等在闸门上。在途的那几张照常跑完（结果先攒在任务组里），
+                    // 只是不再发新请求。取消任务时闸门会把等待者一起放行，
+                    // 于是下一轮循环的 `Task.isCancelled` 能正常收尾，不会挂死。
+                    if let gate {
+                        await gate.waitIfPaused()
+                    }
+                    // 当前块发完了、在途的也收完了：再取下一块。
+                    // 内存里始终只有一块瓦片（`chunkSize` 张），不再把整层物化成数组。
+                    if index >= chunk.count, inFlight == 0 {
+                        guard let next = chunks.next() else { break }
+                        chunk = next
+                        index = 0
+                        continue
+                    }
+                    while inFlight < options.concurrency, index < chunk.count {
+                        let tile = chunk[index]
                         index += 1
                         inFlight += 1
                         group.addTask {
@@ -358,20 +450,7 @@ public struct TileDownloader: Sendable {
                     }
                     guard let outcome = try await group.next() else { break }
                     inFlight -= 1
-                    completed += 1
-                    switch outcome {
-                    case .downloaded(let size):
-                        downloaded += 1
-                        bytes += size
-                    case .skipped:
-                        skipped += 1
-                    case .missing:
-                        missing += 1
-                    case .failed(let message):
-                        failed += 1
-                        if failures.count < 20 { failures.append(message) }
-                    }
-                    report(zoom: range.zoom)
+                    record(outcome)
                 }
             }
             report(zoom: range.zoom, force: true)

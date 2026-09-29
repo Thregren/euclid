@@ -21,21 +21,27 @@ enum TIFFDecoder {
         canvas: UnsafeMutablePointer<UInt8>,
         canvasWidth: Int,
         canvasHeight: Int,
-        destination: CGRect
+        destination: CGRect,
+        stretch: TIFFStretch? = nil
     ) throws {
-        guard level.planarConfiguration == 1 else {
-            throw TIFFError.unsupported("暂不支持分离平面（PlanarConfiguration = 2）的 TIFF")
+        guard level.planarConfiguration == 1 || level.planarConfiguration == 2 else {
+            throw TIFFError.unsupported("暂不支持 PlanarConfiguration = \(level.planarConfiguration) 的 TIFF")
         }
         guard level.compression.isSupported else {
             throw TIFFError.unsupported("暂不支持这种 TIFF 压缩方式：\(level.compression.description)")
         }
-        guard let bits = level.bitsPerSampleUniform, [1, 2, 4, 8, 16].contains(bits) else {
-            throw TIFFError.unsupported("暂不支持 \(level.bitsPerSample.first ?? 0) 位/样本的 TIFF")
+        if level.isFloatSamples {
+            // 浮点样本按 32 / 64 位读写；其它位数（半精度）没有实际数据，直接说不支持。
+            guard let bits = level.bitsPerSampleUniform, bits == 32 || bits == 64 else {
+                throw TIFFError.unsupported("暂不支持 \(level.bitsPerSample.first ?? 0) 位的浮点样本")
+            }
+        } else if level.planarConfiguration == 1 {
+            guard let bits = level.bitsPerSampleUniform,
+                  [1, 2, 4, 8, 16, 32, 64].contains(bits) else {
+                throw TIFFError.unsupported("暂不支持 \(level.bitsPerSample.first ?? 0) 位/样本的 TIFF")
+            }
         }
-        guard [1, 3].contains(level.sampleFormat.first ?? 1) else {
-            throw TIFFError.unsupported("暂不支持浮点样本的 TIFF")
-        }
-        guard level.predictor == 1 || level.predictor == 2 else {
+        guard [1, 2, 3].contains(level.predictor) else {
             throw TIFFError.unsupported("暂不支持 Predictor = \(level.predictor) 的 TIFF")
         }
         if level.compression != .jpeg {
@@ -43,7 +49,8 @@ enum TIFFDecoder {
             case .rgb, .blackIsZero, .whiteIsZero:
                 break
             case .palette:
-                guard (level.colorMap?.count ?? 0) >= 3 * (1 << bits) else {
+                let paletteBits = max(1, min(16, level.bitsPerSample.first ?? 8))
+                guard (level.colorMap?.count ?? 0) >= 3 * (1 << paletteBits) else {
                     throw TIFFError.decodeFailed("调色板表不完整")
                 }
             default:
@@ -80,6 +87,24 @@ enum TIFFDecoder {
         let taps = max(boxWidth, boxHeight) <= 1.2
             ? 1
             : (max(boxWidth, boxHeight) <= 12 ? 2 : 3)
+
+        // 浮点样本 / 分离平面走「按样本取值」那条路：先把值读出来，再按拉伸或
+        // 类型值域映射成颜色。整数连续存放仍然走原来的 RGBA 热路径。
+        if store.usesSamples {
+            try drawSamples(
+                store: store,
+                source: source,
+                boxWidth: boxWidth,
+                boxHeight: boxHeight,
+                taps: taps,
+                canvas: canvas,
+                canvasWidth: canvasWidth,
+                canvasHeight: canvasHeight,
+                destination: destination,
+                stretch: stretch ?? TIFFDisplayRange.stretch(for: file)
+            )
+            return
+        }
 
         for row in 0..<rows {
             let y = startY + row
@@ -122,20 +147,134 @@ enum TIFFDecoder {
             }
         }
     }
+
+    /// 浮点 / 分离平面的采样渲染。
+    ///
+    /// 与整数路径共用「目标像素中心反投源像素」的采样口径，只是每个采样点取的是
+    /// 样本值而不是 RGBA；均值算完再统一映射，避免逐点量化带来的条纹。
+    private static func drawSamples(
+        store: ChunkStore,
+        source: CGRect,
+        boxWidth: Double,
+        boxHeight: Double,
+        taps: Int,
+        canvas: UnsafeMutablePointer<UInt8>,
+        canvasWidth: Int,
+        canvasHeight: Int,
+        destination: CGRect,
+        stretch: TIFFStretch?
+    ) throws {
+        let destinationWidth = max(1.0, destination.width)
+        let destinationHeight = max(1.0, destination.height)
+        let startX = Int(destination.minX.rounded())
+        let startY = Int(destination.minY.rounded())
+        let columns = Int(destinationWidth.rounded(.up))
+        let rows = Int(destinationHeight.rounded(.up))
+        let color = store.rendersColor
+
+        for row in 0..<rows {
+            let y = startY + row
+            guard y >= 0, y < canvasHeight else { continue }
+            let v = (Double(row) + 0.5) / destinationHeight
+            let sourceY = source.minY + v * source.height
+            for column in 0..<columns {
+                let x = startX + column
+                guard x >= 0, x < canvasWidth else { continue }
+                let u = (Double(column) + 0.5) / destinationWidth
+                let sourceX = source.minX + u * source.width
+
+                var totals: (Float, Float, Float) = (0, 0, 0)
+                var count = 0
+                func accumulate(_ values: (Float, Float, Float)) {
+                    totals.0 += values.0
+                    totals.1 += values.1
+                    totals.2 += values.2
+                    count += 1
+                }
+                if taps == 1 {
+                    if let values = try store.sampleBands(
+                        x: Int(sourceX.rounded(.down)),
+                        y: Int(sourceY.rounded(.down)),
+                        color: color
+                    ) {
+                        accumulate(values)
+                    }
+                } else {
+                    for tapY in 0..<taps {
+                        let sy = sourceY - boxHeight / 2 + boxHeight * (Double(tapY) + 0.5) / Double(taps)
+                        for tapX in 0..<taps {
+                            let sx = sourceX - boxWidth / 2 + boxWidth * (Double(tapX) + 0.5) / Double(taps)
+                            if let values = try store.sampleBands(
+                                x: Int(sx.rounded(.down)),
+                                y: Int(sy.rounded(.down)),
+                                color: color
+                            ) {
+                                accumulate(values)
+                            }
+                        }
+                    }
+                }
+                guard count > 0 else { continue }
+                let divisor = Float(count)
+                let offset = (y * canvasWidth + x) * 4
+                if color {
+                    canvas[offset] = encode(totals.0 / divisor, store: store, stretch: stretch)
+                    canvas[offset + 1] = encode(totals.1 / divisor, store: store, stretch: stretch)
+                    canvas[offset + 2] = encode(totals.2 / divisor, store: store, stretch: stretch)
+                    canvas[offset + 3] = 255
+                } else {
+                    guard let gray = encodeGray(totals.0 / divisor, store: store, stretch: stretch) else { continue }
+                    canvas[offset] = gray
+                    canvas[offset + 1] = gray
+                    canvas[offset + 2] = gray
+                    canvas[offset + 3] = 255
+                }
+            }
+        }
+    }
+
+    /// 样本值 → 8 位通道。浮点走拉伸，整数按类型值域归一化。
+    private static func encode(_ value: Float, store: ChunkStore, stretch: TIFFStretch?) -> UInt8 {
+        if let stretch { return stretch.level(value) ?? 0 }
+        return TIFFSampleAccess.normalize(value, level: store.level, band: 0)
+    }
+
+    /// 单波段：NaN / 非有限值不画（留空），其余按灰度。
+    private static func encodeGray(_ value: Float, store: ChunkStore, stretch: TIFFStretch?) -> UInt8? {
+        guard value.isFinite else { return nil }
+        if let stretch { return stretch.level(value) ?? 0 }
+        return TIFFSampleAccess.normalize(value, level: store.level, band: 0)
+    }
 }
 
 /// 数据块的解码缓存：同一块会被相邻的若干目标像素反复取到。
+///
+/// 两个口径共用同一份解压 / 预测还原实现（`TIFFRawChunks`）：
+/// 整数连续存放走 RGBA 热路径，浮点与分离平面走「按样本取值」。
 private final class ChunkStore {
     /// 借用凭据（而不是句柄本身）：只要这个 store 还活着，池子就不会关掉它的句柄。
     private let lease: TIFFReaderLease
     private var reader: TIFFSourceFile { lease.reader }
     private let file: TIFFFile
-    private let level: TIFFImageFileDirectory
+    let level: TIFFImageFileDirectory
     private let path: String
     /// 上一次取到的块。相邻采样点几乎总是落在同一块里，
     /// 记一份就能把「每个采样点查一次字典」降到一次整数比较。
     private var lastIndex = -1
     private var lastPixels: [UInt8] = []
+    /// 分离平面：最近用过的几块「平面内的原始样本」。
+    private var planeChunks: [Int: [UInt8]] = [:]
+    private var planeOrder: [Int] = []
+
+    /// 这一级要不要走「按样本取值」的路。
+    var usesSamples: Bool {
+        level.planarConfiguration == 2 || level.isFloatSamples
+    }
+
+    /// 样本路径下这一级是不是彩色（三波段以上、光度学说是 RGB）。
+    var rendersColor: Bool {
+        level.photometric == .rgb && level.samplesPerPixel >= 3
+    }
 
     init(lease: TIFFReaderLease, file: TIFFFile, level: TIFFImageFileDirectory) {
         self.lease = lease
@@ -144,7 +283,7 @@ private final class ChunkStore {
         self.path = file.url.path(percentEncoded: false)
     }
 
-    /// 取某个源像素的 RGBA；越界返回 nil。
+    /// 取某个源像素的 RGBA（连续存放的整数样本）；越界返回 nil。
     func pixel(x: Int, y: Int) throws -> (UInt8, UInt8, UInt8, UInt8)? {
         guard x >= 0, y >= 0, x < level.width, y < level.height else { return nil }
         let across = max(1, level.chunksAcross)
@@ -167,95 +306,104 @@ private final class ChunkStore {
         return (pixels[offset], pixels[offset + 1], pixels[offset + 2], pixels[offset + 3])
     }
 
+    /// 取某个源像素的样本值（浮点 / 分离平面走它）。
+    ///
+    /// 彩色时返回 RGB 三个样本；单波段时把同一个值填满三个分量。
+    func sampleBands(x: Int, y: Int, color: Bool) throws -> (Float, Float, Float)? {
+        guard x >= 0, y >= 0, x < level.width, y < level.height,
+              level.chunkWidth > 0, level.chunkHeight > 0 else { return nil }
+        let across = max(1, level.chunksAcross)
+        let innerX = x % level.chunkWidth
+        let innerY = y % level.chunkHeight
+        let indexInPlane = (y / level.chunkHeight) * across + (x / level.chunkWidth)
+        if level.planarConfiguration == 2 {
+            let planes = color ? min(3, level.planeCount) : 1
+            var values = (Float(0), Float(0), Float(0))
+            for plane in 0..<planes {
+                guard let bytes = try planeBytes(plane: plane, index: indexInPlane),
+                      let value = TIFFSampleAccess.value(
+                          bytes: bytes,
+                          level: level,
+                          x: innerX,
+                          y: innerY,
+                          band: 0,
+                          order: file.byteOrder
+                      ) else { return nil }
+                if plane == 0 { values.0 = value }
+                else if plane == 1 { values.1 = value }
+                else { values.2 = value }
+            }
+            if planes == 1 { values.1 = values.0; values.2 = values.0 }
+            return values
+        }
+        guard let bytes = try planeBytes(plane: 0, index: indexInPlane) else { return nil }
+        func value(_ band: Int) -> Float? {
+            TIFFSampleAccess.value(
+                bytes: bytes,
+                level: level,
+                x: innerX,
+                y: innerY,
+                band: band,
+                order: file.byteOrder
+            )
+        }
+        guard let first = value(0) else { return nil }
+        if color {
+            guard let green = value(1), let blue = value(2) else { return (first, first, first) }
+            return (first, green, blue)
+        }
+        return (first, first, first)
+    }
+
+    /// RGBA 热路径（连续存放的整数样本）。
     private func chunkPixels(_ index: Int) throws -> [UInt8] {
         // 跨瓦片缓存：这一块在别的瓦片 / 上一次缩放里已经解过就直接拿。
         let key = TIFFChunkCache.Key(path: path, level: level.offset, index: index)
         if let cached = TIFFChunkCache.shared.pixels(for: key) { return cached }
-        let pixels = try decodeChunk(index)
+        let rows = level.rowsInChunk(indexInPlane: index)
+        var pixels: [UInt8]
+        if level.compression == .jpeg, let data = chunkData(globalIndex: index) {
+            pixels = try jpegPixels(data, rows: rows)
+        } else {
+            let raw = try TIFFRawChunks.bytes(
+                file: file,
+                level: level,
+                reader: reader,
+                chunkIndex: index,
+                plane: 0
+            )
+            pixels = TIFFCodec.rgba(from: raw, level: level, rows: rows, order: file.byteOrder)
+        }
         TIFFChunkCache.shared.store(pixels: pixels, for: key)
         return pixels
     }
 
-    /// 数据块里真正有内容的行数（最后一行/列可能不满）。
-    private func rowsInChunk(_ index: Int) -> Int {
-        let across = max(1, level.chunksAcross)
-        let row = index / across
-        let start = row * level.chunkHeight
-        return max(1, min(level.chunkHeight, level.height - start))
+    /// 取「平面内某一块」的原始样本字节（带本地小缓存 + 跨瓦片缓存）。
+    private func planeBytes(plane: Int, index: Int) throws -> [UInt8]? {
+        let key = plane &* 1_000_003 &+ index
+        if let cached = planeChunks[key] { return cached }
+        let bytes = try TIFFRawChunks.bytes(
+            file: file,
+            level: level,
+            reader: reader,
+            chunkIndex: index,
+            plane: plane
+        )
+        planeChunks[key] = bytes
+        planeOrder.append(key)
+        let limit = max(4, level.planeCount * 3)
+        while planeOrder.count > limit {
+            let oldest = planeOrder.removeFirst()
+            planeChunks.removeValue(forKey: oldest)
+        }
+        return bytes
     }
 
-    private func decodeChunk(_ index: Int) throws -> [UInt8] {
-        let rows = rowsInChunk(index)
-        let transparent = [UInt8](repeating: 0, count: level.chunkWidth * level.chunkHeight * 4)
-        let chunk = level.chunks[index]
-        guard chunk.byteCount > 0, let data = reader.read(offset: chunk.offset, count: chunk.byteCount) else {
-            return transparent
-        }
-
-        if level.compression == .jpeg {
-            return try jpegPixels(data, rows: rows)
-        }
-
-        let samplesPerPixel = level.samplesPerPixel
-        let bytesPerSample = level.bytesPerSample
-        let rowBytes = level.chunkWidth * samplesPerPixel * bytesPerSample
-        let capacity = level.chunkHeight * rowBytes
-
-        // 数据块比声明的短时，编解码器会补零把长度凑够（否则调用方按块尺寸索引会越界）。
-        // 补齐本身是对的，但「这个块是坏的」必须留下痕迹：以前它是完全静默的，
-        // 画面上只是那一块发黑，查起来毫无线索。
-        let reportShort: (String) -> (Int) -> Void = { [file] codec in
-            { produced in
-                TIFFDiagnostics.record(
-                    message: "第 \(index) 块的 \(codec) 数据比声明的短（解出 \(produced) / 期望 \(capacity) 字节），缺口已补零",
-                    file: file.url
-                )
-            }
-        }
-
-        var raw: [UInt8]
-        switch level.compression {
-        case .none:
-            raw = [UInt8](data)
-            if raw.count < capacity {
-                reportShort("未压缩")(raw.count)
-                raw.append(contentsOf: [UInt8](repeating: 0, count: capacity - raw.count))
-            }
-        case .deflate:
-            guard let inflated = TIFFCodec.inflate(data, capacity: capacity, onShort: reportShort("Deflate")) else {
-                throw TIFFError.decodeFailed("Deflate 解压失败（第 \(index) 块）")
-            }
-            raw = inflated
-        case .lzw:
-            guard let decoded = TIFFCodec.lzwDecode(data, capacity: capacity, onShort: reportShort("LZW")) else {
-                throw TIFFError.decodeFailed("LZW 解码失败（第 \(index) 块）")
-            }
-            raw = decoded
-        case .packBits:
-            guard let decoded = TIFFCodec.packBitsDecode(data, capacity: capacity, onShort: reportShort("PackBits")) else {
-                throw TIFFError.decodeFailed("PackBits 解码失败（第 \(index) 块）")
-            }
-            raw = decoded
-        case .jpeg, .other:
-            throw TIFFError.unsupported("暂不支持这种 TIFF 压缩方式：\(level.compression.description)")
-        }
-
-        if level.predictor == 2 {
-            TIFFCodec.undoHorizontalPredictor(
-                &raw,
-                width: level.chunkWidth,
-                rows: rows,
-                samplesPerPixel: samplesPerPixel,
-                bitsPerSample: level.bitsPerSample.first ?? 8,
-                order: file.byteOrder
-            )
-        }
-        return TIFFCodec.rgba(
-            from: raw,
-            level: level,
-            rows: rows,
-            order: file.byteOrder
-        )
+    private func chunkData(globalIndex: Int) -> Data? {
+        guard globalIndex >= 0, globalIndex < level.chunks.count else { return nil }
+        let chunk = level.chunks[globalIndex]
+        guard chunk.byteCount > 0 else { return nil }
+        return reader.read(offset: chunk.offset, count: chunk.byteCount)
     }
 
     /// JPEG 压缩的块：交给 ImageIO 解，再转成 RGBA8。
@@ -614,13 +762,8 @@ package enum TIFFCodec {
                                 }
                             }
                         } else {
-                            let base = (y * width + x) * samplesPerPixel * (bits / 8)
                             func sample(_ index: Int) -> Int {
-                                let offset = base + index * (bits / 8)
-                                switch bits {
-                                case 16:
-                                    return Int(source.u16(at: offset, order: order)) >> 8
-                                case 1, 2, 4:
+                                if bits == 1 || bits == 2 || bits == 4 {
                                     let bitIndex = (y * width + x) * samplesPerPixel * bits + index * bits
                                     // 打包位样本：块数据可能比声明的容量短（损坏 / 截断），
                                     // 这里的下标必须自己挡一下，否则就是数组越界。
@@ -632,9 +775,18 @@ package enum TIFFCodec {
                                     let value = (Int(byte) >> shift) & mask
                                     // 归一化到 8 位。
                                     return value * 255 / mask
-                                default:
-                                    return offset < raw.count ? Int(source[offset]) : 0
                                 }
+                                // 8 / 16 / 32 / 64 位（含浮点、有符号）统一按样本值读，
+                                // 再按类型值域归一化 —— 这条口径与 DEM 工具那边完全一致。
+                                guard let value = TIFFSampleAccess.value(
+                                    bytes: raw,
+                                    level: level,
+                                    x: x,
+                                    y: y,
+                                    band: index,
+                                    order: order
+                                ) else { return 0 }
+                                return Int(TIFFSampleAccess.normalize(value, level: level, band: index))
                             }
                             if let palette {
                                 let index = sample(0)

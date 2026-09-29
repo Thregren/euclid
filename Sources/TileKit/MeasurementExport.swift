@@ -88,7 +88,7 @@ public enum MeasurementExporter {
         for measurement in measurements {
             let geometry: String
             switch measurement.kind {
-            case .point:
+            case .point, .annotation:
                 guard let point = measurement.points.first else { continue }
                 geometry = """
                 {"type":"Point","coordinates":[\(number(point.longitude)),\(number(point.latitude))]}
@@ -115,11 +115,14 @@ public enum MeasurementExporter {
             }
             let result = measurement.result
             var properties = [
-                "\"name\":\(jsonString(measurement.kind.displayName))",
+                "\"name\":\(jsonString(measurement.exportName))",
                 "\"kind\":\"\(measurement.kind.rawValue)\"",
                 "\"pointCount\":\(measurement.points.count)",
             ]
-            if measurement.kind != .point {
+            if let note = measurement.note {
+                properties.append("\"note\":\(jsonString(note))")
+            }
+            if !measurement.kind.isPointLike {
                 properties.append("\"lengthMeters\":\(number(result.totalLength))")
             }
             if let radius = result.radius {
@@ -149,8 +152,11 @@ public enum MeasurementExporter {
         var placemarks: [String] = []
         for (index, measurement) in measurements.enumerated() {
             let result = measurement.result
-            var descriptionParts: [String] = ["类型：\(measurement.kind.displayName)"]
-            if measurement.kind != .point {
+            var descriptionParts: [String] = ["编号：\(index + 1)", "类型：\(measurement.kind.displayName)"]
+            if let note = measurement.note {
+                descriptionParts.append("备注：\(note)")
+            }
+            if !measurement.kind.isPointLike {
                 descriptionParts.append("长度：\(MeasureFormat.distance(result.totalLength))")
             }
             if let radius = result.radius {
@@ -163,7 +169,7 @@ public enum MeasurementExporter {
 
             let geometry: String
             switch measurement.kind {
-            case .point:
+            case .point, .annotation:
                 guard let point = measurement.points.first else { continue }
                 geometry = """
                       <Point><coordinates>\(number(point.longitude)),\(number(point.latitude)),0</coordinates></Point>
@@ -188,7 +194,7 @@ public enum MeasurementExporter {
             }
             placemarks.append("""
                 <Placemark>
-                  <name>\(escape(measurement.kind.displayName)) \(index + 1)</name>
+                  <name>\(escape(measurement.exportName))</name>
                   <description>\(escape(description))</description>
             \(geometry)
                 </Placemark>
@@ -208,12 +214,14 @@ public enum MeasurementExporter {
     // MARK: - CSV
 
     public static func csv(_ measurements: [GeoMeasurement]) -> String {
-        var lines = ["测量编号,类型,点序号,点名称,经度,纬度,累计长度(米),本段长度(米),方位角(度),面积(平方米),半径(米)"]
+        var lines = ["测量编号,类型,名称,备注,点序号,点名称,经度,纬度,累计长度(米),本段长度(米),方位角(度),面积(平方米),半径(米)"]
         for (index, measurement) in measurements.enumerated() {
             for row in vertexRows(of: measurement, number: index + 1) {
                 lines.append([
                     "\(row.measurementNumber)",
                     row.kind.displayName,
+                    measurement.exportName,
+                    measurement.note ?? "",
                     "\(row.pointIndex + 1)",
                     row.label,
                     number(row.coordinate.longitude),
@@ -249,7 +257,7 @@ public enum MeasurementExporter {
 
     private static func summarySheet(_ measurements: [GeoMeasurement]) -> XLSX.Sheet {
         var rows: [[XLSX.Cell]] = [[
-            .text("编号"), .text("类型"), .text("点数"),
+            .text("编号"), .text("类型"), .text("名称"), .text("备注"), .text("点数"),
             .text("长度 / 周长(米)"), .text("直线距离(米)"), .text("面积(平方米)"),
             .text("半径(米)"), .text("圆心经度"), .text("圆心纬度"), .text("记录时间"),
         ]]
@@ -258,8 +266,10 @@ public enum MeasurementExporter {
             rows.append([
                 .number(Double(index + 1)),
                 .text(measurement.kind.displayName),
+                .text(measurement.exportName),
+                measurement.note.map { XLSX.Cell.text($0) } ?? .blank,
                 .number(Double(measurement.points.count)),
-                measurement.kind == .point ? .blank : .number(result.totalLength),
+                measurement.kind.isPointLike ? .blank : .number(result.totalLength),
                 result.straightDistance.map { XLSX.Cell.number($0) } ?? .blank,
                 result.area.map { XLSX.Cell.number($0) } ?? .blank,
                 result.radius.map { XLSX.Cell.number($0) } ?? .blank,
@@ -273,7 +283,7 @@ public enum MeasurementExporter {
 
     private static func vertexSheet(_ measurements: [GeoMeasurement]) -> XLSX.Sheet {
         var rows: [[XLSX.Cell]] = [[
-            .text("测量编号"), .text("类型"), .text("点序号"), .text("点名称"),
+            .text("测量编号"), .text("类型"), .text("名称"), .text("备注"), .text("点序号"), .text("点名称"),
             .text("经度(°)"), .text("纬度(°)"),
             .text("东坐标(米)"), .text("北坐标(米)"),
             .text("累计长度(米)"), .text("本段长度(米)"), .text("方位角(°)"),
@@ -285,6 +295,8 @@ public enum MeasurementExporter {
                 rows.append([
                     .number(Double(row.measurementNumber)),
                     .text(row.kind.displayName),
+                    .text(measurement.exportName),
+                    measurement.note.map { XLSX.Cell.text($0) } ?? .blank,
                     .number(Double(row.pointIndex + 1)),
                     .text(row.label),
                     .precise(row.coordinate.longitude),
@@ -358,11 +370,25 @@ public enum MeasurementExporter {
         String(format: "%.8f", value)
     }
 
+    /// 表头时间戳用的日历（进程内共用一份）。
+    ///
+    /// 与存档那边同一个理由：不为了拼一个时间戳去新建 `DateFormatter`。
+    private static let stampCalendar: Calendar = {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.locale = Locale(identifier: "en_US_POSIX")
+        return calendar
+    }()
+
     private static func timestamp(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
-        return formatter.string(from: date)
+        let parts = stampCalendar.dateComponents(
+            [.year, .month, .day, .hour, .minute, .second],
+            from: date
+        )
+        return String(
+            format: "%04d-%02d-%02d %02d:%02d:%02d",
+            parts.year ?? 0, parts.month ?? 0, parts.day ?? 0,
+            parts.hour ?? 0, parts.minute ?? 0, parts.second ?? 0
+        )
     }
 
     /// CSV 字段：含有分隔符、引号或换行时用双引号包起来，内部引号翻倍（RFC 4180）。

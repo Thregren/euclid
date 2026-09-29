@@ -14,14 +14,34 @@
 | `rgba_strip_lzw.tif` | 横条（每 8 行一条） | LZW + Predictor 2 | LZW 码表与位宽增长的时机 |
 | `rgba_strip_packbits.tif` | 横条（每 8 行一条） | PackBits | RLE 解码 |
 | `geo_utm50_deflate.tif` | 分块 16 × 16 | AdobeDeflate + Predictor 2 | GeoTIFF 标签与 EPSG:32650 的定位 |
+| `dem_f32_p3.tif` | 分块 256 × 256 | AdobeDeflate + **Predictor 3** | 浮点样本、字节平面重排 + 行内字节差分、GeoTIFF（0.5 m/像素） |
+| `rgb_f32_planar.tif` | 分块 256 × 256，**分离平面**（PlanarConfiguration = 2） | AdobeDeflate + **Predictor 3** | 多平面取样本、平面内的同一套预测还原 |
+
+后两份是 600 × 400 的浮点 DEM / 三波段影像，值由解析式生成，自检直接和解析式比。
+`Predictor 3` 最容易想当然写错：libtiff 是**先按字节平面重排、再在重排后的记录里按字节累加**
+（不是「相邻样本同位置字节相减」）。样本的编码口径在
+`Fixtures/TIFF/make-float-fixtures.py` 里，与 `tiffcp -c zip:3 -t` 写出的同构文件**逐字节比过**。
 
 ## 复现方式
 
 ```bash
-./Fixtures/TIFF/make-fixtures.sh      # 需要 magick（ImageMagick）与 python3
+./Fixtures/TIFF/make-fixtures.sh      # 需要 magick（ImageMagick）、tiffinfo/tiffcp 与 python3
 ```
 
 `geo_utm50_deflate.tif` 的定位点取 **UTM 50N 中央经线上的整数格点**
 （东坐标 500000 = 117°E 中央经线本身、北坐标 4500000、5 cm/像素），刻意与任何真实测区无关；
 脚本把定位点、像素尺度与 GeoKey（EPSG:32650）一起注入 IFD，
 自检里用 PROJ 算出的四角坐标当基准。
+
+## 浮点样本的复现与核对
+
+```bash
+python3 Fixtures/TIFF/make-float-fixtures.py Fixtures/TIFF   # 重写两份浮点样本
+tiffinfo Fixtures/TIFF/dem_f32_p3.tif                        # 看标签与 Predictor
+tiffinfo -d Fixtures/TIFF/rgb_f32_planar.tif | head -20      # 看 libtiff 解出来的值
+```
+
+不要用 `tiffcp -c none` 去核对这两份分块的浮点样本：libtiff 4.7 转写「分块 + 分离平面 + 浮点」
+时会写坏，但 **它的解码是对的**，所以核对要看 `tiffinfo -d`。同理
+`tiffcp -p contig/-p separate` 对 bits/sample ≠ 8 会直接报
+「Cannot handle different planar configuration w/ bits/sample != 8」。

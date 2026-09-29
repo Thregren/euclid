@@ -12,6 +12,7 @@ struct InspectorView: View {
         Form {
             if model.hasMapContent {
                 MeasurementSection()
+                BookmarkSection()
                 CursorCoordinateSection()
                 if let extent = model.extent {
                     extentSection(extent)

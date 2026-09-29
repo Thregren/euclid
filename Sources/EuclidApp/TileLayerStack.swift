@@ -363,7 +363,9 @@ final class TileLayerStack {
                let image = recycledImages[ancestor] {
                 install(image, in: layer, source: ancestor, for: tile, animated: false)
             }
-            layer.frame = frame
+            // 值没变就别碰：一帧近千个图层，「瓦片到位」「手势提交」这类重铺里绝大多数 frame
+            // 与上一帧完全相同，而 CALayer 不保证对「赋等值」提前返回 —— 累起来就是重铺的主要开销。
+            if layer.frame != frame { layer.frame = frame }
         }
         CATransaction.commit()
 
@@ -396,12 +398,16 @@ final class TileLayerStack {
         renderGrid(camera: rangeCamera, offset: offset, zoom: zoom, visible: showGrid)
 
         // 读数只算视野内的那一批（铺图多铺的那一圈不进读数）。
-        let loadedVisible = needed.filter { layerImageSource[$0] == $0 }.count
-        let fallbackVisible = needed.filter { tile in
-            guard let source = layerImageSource[tile] else { return false }
-            return source != tile
-        }.count
-        let missingVisible = needed.filter { missingTiles.contains($0) }.count
+        // 三个数字合成一次遍历：视野内最多上千片，三次 `filter` 就是三遍哈希查找。
+        var loadedVisible = 0
+        var fallbackVisible = 0
+        var missingVisible = 0
+        for tile in needed {
+            if let source = layerImageSource[tile] {
+                if source == tile { loadedVisible += 1 } else { fallbackVisible += 1 }
+            }
+            if missingTiles.contains(tile) { missingVisible += 1 }
+        }
         let frame = TileLayerFrame(
             name: name,
             zoom: zoom,
@@ -650,6 +656,48 @@ final class TileLayerStack {
             .takeUnretainedValue()
     }
 
+    /// 按 `contentsRect` 把图裁出该格子真正显示的那一块。
+    ///
+    /// 祖先贴图兜底时，一格图层里装的是**整张高层级瓦片**，只显示其中一个子区域
+    /// （`contentsGravity = .resize` + `contentsRect`）。出图快照必须照这个口径裁，
+    /// 否则缩略图会把整张祖图塞进一格，画面直接错位。
+    static func cropped(_ image: CGImage, to contentsRect: CGRect) -> CGImage? {
+        guard contentsRect != CGRect(x: 0, y: 0, width: 1, height: 1) else { return image }
+        // `CGImage.cropping(to:)` 的坐标与 `contentsRect` 一样：单位坐标，y 从图顶算起。
+        let width = CGFloat(image.width)
+        let height = CGFloat(image.height)
+        let rect = CGRect(
+            x: (contentsRect.minX * width).rounded(.down),
+            y: (contentsRect.minY * height).rounded(.down),
+            width: max(1, (contentsRect.width * width).rounded()),
+            height: max(1, (contentsRect.height * height).rounded())
+        )
+        return image.cropping(to: rect)
+    }
+
+    /// 把本层当前**真正装着**的图按层序追加到出图快照里。
+    ///
+    /// 只读：不改 frame、不改 isHidden、不改事务，主线程上一次遍历，微秒级。
+    /// 网格层（调试用）不进快照 —— 和旧实现「渲染前临时隐藏网格」是同一个口径，
+    /// 但不再去动视图状态（旧写法一旦中途抛错就会把网格永久留在隐藏状态）。
+    func appendPlacements(into placements: inout [MapRenderSnapshot.Placement]) {
+        let hostOpacity = CGFloat(hostLayer.opacity)
+        guard hostOpacity > 0.001, !hostLayer.isHidden, let sublayers = hostLayer.sublayers else {
+            return
+        }
+        for layer in sublayers {
+            // 层序就是 `sublayers` 的顺序：先铺的在下（旧层兜底），后铺的在上。
+            guard layer !== gridLayer, !layer.isHidden else { continue }
+            guard let image = Self.contentsImage(of: layer),
+                  let visible = Self.cropped(image, to: layer.contentsRect) else { continue }
+            let opacity = CGFloat(layer.opacity) * hostOpacity
+            guard opacity > 0.001 else { continue }
+            placements.append(
+                MapRenderSnapshot.Placement(image: visible, frame: layer.frame, opacity: opacity)
+            )
+        }
+    }
+
     /// 调试用：当前瓦片图层的几何概况（`EUCLID_TRACE_LAYERS` 时打到 stderr）。
     func debugTileLayerSummary() -> (
         count: Int, withImage: Int,
@@ -798,13 +846,38 @@ final class TileLayerStack {
         }
     }
 
+    /// 网格路径的输入签名：这几样没变，画出来的线就一模一样。
+    ///
+    /// 网格是「开着看」的辅助线，而 `sync` 在瓦片到位、手势提交时都会跑一遍；
+    /// 每次都重建几百个点的路径再赋给 `gridLayer.path` 纯属白做。
+    private struct GridSignature: Equatable {
+        var zoom: Int
+        var center: CGPoint
+        var pixelsPerWorldUnit: Double
+        var viewport: CGSize
+        var offset: CGPoint
+    }
+
+    private var lastGridSignature: GridSignature?
+
     private func renderGrid(camera: MapCamera, offset: CGPoint, zoom: Int, visible: Bool) {
         guard visible,
               let range = grid.tileRange(zoom: zoom, worldRect: camera.visibleWorldRect) else {
-            gridLayer.isHidden = true
-            gridLayer.path = nil
+            lastGridSignature = nil
+            if !gridLayer.isHidden {
+                gridLayer.isHidden = true
+                gridLayer.path = nil
+            }
             return
         }
+        let signature = GridSignature(
+            zoom: zoom,
+            center: camera.center,
+            pixelsPerWorldUnit: camera.pixelsPerWorldUnit,
+            viewport: camera.viewportSize,
+            offset: offset
+        )
+        if signature == lastGridSignature, !gridLayer.isHidden { return }
         let columns = range.columns
         let rows = range.rows
         let path = CGMutablePath()
@@ -828,6 +901,7 @@ final class TileLayerStack {
         }
         gridLayer.isHidden = false
         gridLayer.path = path
+        lastGridSignature = signature
     }
 
     /// 刷新网格颜色（跟随深浅色）。

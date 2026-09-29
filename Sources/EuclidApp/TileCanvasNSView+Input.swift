@@ -15,6 +15,20 @@ extension TileCanvasNSView {
         let point = convert(event.locationInWindow, from: nil)
         dragStartPoint = point
 
+        // 框选范围模式：优先于一切（这期间不做测量、不拖顶点）。
+        if event.buttonNumber == 0, boundsPicker != nil {
+            dragTarget = .pickBounds
+            beginPickRect(at: point)
+            return
+        }
+
+        // 卷帘对比：抓住分隔线时只拖线，不做测量 / 平移。
+        if event.buttonNumber == 0, swipeHitTest(point) {
+            dragTarget = .swipe
+            NSCursor.resizeLeftRight.set()
+            return
+        }
+
         // ⌃+左键在 macOS 上与右键等价：同样用来结束当前测量（不落点）。
         if event.modifierFlags.contains(.control), tool != .browse {
             finishDraft()
@@ -80,6 +94,12 @@ extension TileCanvasNSView {
         markViewPositioned()
         let point = convert(event.locationInWindow, from: nil)
         switch dragTarget {
+        case .pickBounds:
+            updatePickRect(to: point)
+
+        case .swipe:
+            setSwipeFraction(bounds.width > 1 ? point.x / bounds.width : 0.5)
+
         case .vertex(let measurementID, let index):
             let coordinate = commitCoordinate(for: point, event: event, skipVertexSnap: true)
             measurementStore?.moveVertex(measurementID: measurementID, index: index, to: coordinate)
@@ -115,8 +135,15 @@ extension TileCanvasNSView {
         dragLastPoint = nil
         dragStartPoint = nil
         pendingClickPoint = nil
-        (tool == .browse ? NSCursor.openHand : NSCursor.crosshair).set()
+        refreshCursor()
         window?.invalidateCursorRects(for: self)
+
+        if case .pickBounds = target {
+            finishPickRect(at: point)
+            return
+        }
+
+        if case .swipe = target { return }
 
         if case .vertex = target { return }
 
@@ -170,7 +197,10 @@ extension TileCanvasNSView {
 
     override func mouseMoved(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
+        let wasOnDivider = lastPointerPoint.map { swipeHitTest($0) } ?? false
         lastPointerPoint = point
+        // 贴到分隔线上 / 离开分隔线时换指针（其余情况不去碰系统指针，免得抢掉工具光标）。
+        if swipeIsActive, wasOnDivider != swipeHitTest(point) { refreshCursor() }
         updateLiveCoordinate(point)
         reportCursor(point)
         updateHover(at: point)
@@ -490,6 +520,14 @@ extension TileCanvasNSView {
     }
 
     override func keyDown(with event: NSEvent) {
+        // 框选期间 Esc 先退出框选（不动测量草稿）。
+        if event.keyCode == 53, boundsPicker != nil {
+            boundsPicker = nil
+            let cancel = boundsPickCancel
+            boundsPickCancel = nil
+            cancel?()
+            return
+        }
         if let store = measurementStore {
             switch event.keyCode {
             case 53:   // Esc

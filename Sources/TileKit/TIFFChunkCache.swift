@@ -24,14 +24,25 @@ package final class TIFFChunkCache: @unchecked Sendable {
     /// 路径必须在键里：不同影像的 IFD 常常都从偏移 8 开始、块号也都从 0 开始，
     /// 而它们的内容毫无关系 —— 漏掉路径就会把 A 的像素画到 B 上。
     package struct Key: Hashable {
+        /// 同一块数据的两条读法：渲染用的 RGBA，和 DEM / 差异叠加用的原始样本。
+        ///
+        /// 两种读法的字节含义完全不同，键里必须分开 —— 否则「原始样本」会把
+        /// 已经解释成颜色的那一份读走（画面上出现垃圾数据，且很难查）。
+        package enum Payload: Hashable {
+            case rgba
+            case samples
+        }
+
         package let path: String
         package let level: Int
         package let index: Int
+        package let payload: Payload
 
-        package init(path: String, level: Int, index: Int) {
+        package init(path: String, level: Int, index: Int, payload: Payload = .rgba) {
             self.path = path
             self.level = level
             self.index = index
+            self.payload = payload
         }
     }
 

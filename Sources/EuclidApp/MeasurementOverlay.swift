@@ -186,29 +186,33 @@ final class MeasurementOverlay {
         invalidateCache()
     }
 
-    /// 离屏渲染时把标注文字临时翻正。
+    /// 把标注单独离屏渲染成一张位图（尺寸与画布等大、带透明通道）。
     ///
-    /// `CALayer.render(in:)` 在 y 向下的上下文里会把 `CATextLayer` 的文字画成上下镜像
-    /// （瓦片那种「画图片」的内容不受影响），屏幕上的合成路径则正常。
-    /// 导出图片与调试截图都走离屏渲染，所以出图前给文字图层补一次纵向翻转，出图后立刻还原。
-    func withLabelsUprightForOffscreenRender<T>(_ body: () -> T) -> T {
-        let original = labelLayers.map(\.transform)
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        for layer in labelLayers where !layer.isHidden {
-            layer.transform = CATransform3DMakeScale(1, -1, 1)
-        }
-        CATransaction.commit()
-
-        defer {
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            for (index, layer) in labelLayers.enumerated() where index < original.count {
-                layer.transform = original[index]
-            }
-            CATransaction.commit()
-        }
-        return body()
+    /// 出图快照用它：渲染器只需要拿到「一张标注图」，不必再去摸活着的视图与图层树。
+    /// 渲染在**离屏上下文**里完成，视图的 `frame` / `isHidden` 一概不动 —— 旧实现是
+    /// 临时改视图状态再还原，任一步出错就会留下隐藏的图层。
+    ///
+    /// 注意这里**不需要**给文字图层补翻转：直接渲染 `hostLayer` 时，
+    /// `CATextLayer` 的文字方向与图层几何一致（旧的 `view.layer.render` 路径才需要补，
+    /// 那条路径已经删掉）。改动这里之后务必再导出一次图核对文字方向。
+    ///
+    /// - Returns: `nil` 表示这一帧没有标注可画（或上下文建不出来），调用方按「不含标注」处理。
+    func offscreenImage(size: CGSize, scale: CGFloat) -> CGImage? {
+        let width = Int((size.width * scale).rounded())
+        let height = Int((size.height * scale).rounded())
+        guard width > 0, height > 0, scale > 0,
+              let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let context = CGContext(
+                data: nil, width: width, height: height,
+                bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+              ) else { return nil }
+        context.scaleBy(x: scale, y: scale)
+        // 与画布出图同一套口径：先把上下文翻成「图层几何的 y 向下」。
+        context.translateBy(x: 0, y: size.height)
+        context.scaleBy(x: 1, y: -1)
+        hostLayer.render(in: context)
+        return context.makeImage()
     }
 
     func update(
@@ -269,7 +273,8 @@ final class MeasurementOverlay {
                     segmented: showLabels && selected,
                     summarized: showLabels,
                     prominent: selected,
-                    camera: camera
+                    camera: camera,
+                    annotationText: measurement.note ?? measurement.name
                 )
             }
             // 记下静态部分用掉多少个图层：草稿接着往后用，互不干扰。
@@ -399,7 +404,8 @@ final class MeasurementOverlay {
         segmented: Bool,
         summarized: Bool,
         prominent: Bool,
-        camera: MapCamera
+        camera: MapCamera,
+        annotationText: String? = nil
     ) {
         let points = coordinates.map { layerPoint($0, camera: camera) }
         let outlined = kind == .circle
@@ -454,7 +460,10 @@ final class MeasurementOverlay {
             for (index, point) in points.enumerated() {
                 // 草稿的最后一个点是实时预览点，用略小的圆区分。
                 let isLivePreview = isDraft && index == points.count - 1 && points.count > 1
-                let radius = isLivePreview ? baseRadius - 0.5 : baseRadius
+                // 标注是「钉在图上」的记号，比普通顶点大一档，远远就能看到。
+                let radius = kind == .annotation
+                    ? (isLivePreview ? baseRadius + 1.5 : baseRadius + 2)
+                    : (isLivePreview ? baseRadius - 0.5 : baseRadius)
                 vertices.addEllipse(in: CGRect(
                     x: point.x - radius,
                     y: point.y - radius,
@@ -467,6 +476,24 @@ final class MeasurementOverlay {
             layer.fillColor = NSColor.white.cgColor
             layer.strokeColor = colors.stroke
             layer.lineWidth = prominent ? 2 : 1.6
+        }
+
+        // 标注外面再套一圈虚环，和普通顶点一眼区分得开。
+        if kind == .annotation, let first = points.first {
+            let ring = CGMutablePath()
+            let radius: CGFloat = 10
+            ring.addEllipse(in: CGRect(
+                x: first.x - radius,
+                y: first.y - radius,
+                width: radius * 2,
+                height: radius * 2
+            ))
+            let layer = dequeueRadius()
+            layer.path = ring
+            layer.fillColor = nil
+            layer.strokeColor = colors.stroke
+            layer.lineWidth = 1.4
+            layer.lineDashPattern = [3, 3]
         }
 
         guard !coordinates.isEmpty else { return }
@@ -517,6 +544,10 @@ final class MeasurementOverlay {
             switch kind {
             case .point:
                 summary = coordinates.first.map { CoordinateText.decimal($0, precision: 6) } ?? ""
+            case .annotation:
+                // 标注的文字就是备注；没写备注时退回一个「点击即可编辑」的提示。
+                let text = annotationText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                summary = text.isEmpty ? "标注" : text
             case .distance:
                 summary = "总长 " + MeasureFormat.distance(result.totalLength)
             case .area:

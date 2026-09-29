@@ -9,6 +9,7 @@ struct RootView: View {
         // 版式照 Pixelmator Pro：画布铺满窗口，两侧面板与右侧工具条浮在画布之上，
         // 底部再留一条状态栏。面板之间不挤压画布，因此窗口拉大时看到的始终是整幅影像。
         VStack(spacing: 0) {
+            WorkspaceTabBar()
             ZStack {
                 MapScreen()
                 floatingPanels
@@ -20,6 +21,24 @@ struct RootView: View {
         .navigationSubtitle(subtitle)
         .modifier(DebugColorSchemeOverride())
         .toolbar { toolbarContent }
+        // ⌘K 命令面板：盖在整个界面上（含两侧浮窗），点空白处关掉。
+        .overlay {
+            if model.showCommandPalette {
+                ZStack(alignment: .top) {
+                    Color.black.opacity(0.16)
+                        .ignoresSafeArea()
+                        .onTapGesture { model.closeCommandPalette() }
+                    CommandPaletteView()
+                        .environment(model)
+                        .padding(.top, 84)
+                }
+                .transition(.opacity)
+            }
+        }
+        .sheet(isPresented: $model.showShortcutSettings) {
+            ShortcutSettingsView()
+                .environment(model)
+        }
         .sheet(isPresented: $model.showDownloadSheet) {
             DownloadSheet()
                 .environment(model)
@@ -32,7 +51,14 @@ struct RootView: View {
             TileServerSheet()
                 .environment(model)
         }
+        .sheet(isPresented: $model.showAnalysisSheet) {
+            RasterAnalysisSheet()
+                .environment(model)
+        }
         .task {
+            model.ensureWorkspaceTabs()
+            // 键位覆盖由这个监视器接管（没改过的命令照旧走菜单栏）。
+            model.installCommandKeyMonitor()
             model.activateInitialDataset()
             DebugDownloadScript.runIfRequested(model: model)
             DebugBasemapScript.runIfRequested(model: model)
@@ -40,6 +66,8 @@ struct RootView: View {
             DebugTileExportScript.runIfRequested(model: model)
             DebugVerifyScript.runIfRequested(model: model)
             DebugTileServerScript.runIfRequested(model: model)
+            DebugAnalysisScript.runIfRequested(model: model)
+            DebugTabsScript.runIfRequested(model: model)
             DebugLayerScript.runIfRequested(model: model)
             DebugInputScript.runIfRequested(model: model)
             DebugMemoryScript.runIfRequested(model: model)
@@ -118,6 +146,8 @@ struct RootView: View {
                     .keyboardShortcut("e", modifiers: .command)
                 Button("导出当前视图为图片…") { model.exportViewAsImage() }
                     .keyboardShortcut("e", modifiers: [.command, .shift])
+                Button("导出当前视图为 PDF…") { model.exportViewAsPDF() }
+                    .keyboardShortcut("e", modifiers: [.command, .option])
                 Button("复制当前视图到剪贴板") { model.copyViewToClipboard() }
                     .keyboardShortcut("c", modifiers: [.command, .shift])
                 Button("在访达中显示导出目录") { model.revealQuickExportFolder() }
@@ -197,8 +227,10 @@ struct MapScreen: View {
             }
         }
         .dropDestination(for: URL.self) { urls, _ in
-            guard let url = urls.first else { return false }
-            model.open(url)
+            guard !urls.isEmpty else { return false }
+            // 一次拖进多个东西：第一个当主内容打开，其余的作为叠加图层依次挂上去
+            // （叠加看两期影像 / 影像与在线底图是常事，一个一个拖太啰嗦）。
+            model.open(urls)
             return true
         }
     }

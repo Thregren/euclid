@@ -41,7 +41,8 @@ final class TileCanvasNSView: NSView {
     /// 每一层已经装配过的来源签名：只有来源真的变了才重配（改不透明度、调顺序都不重取图）。
     private var stackSignatures: [String: String] = [:]
     /// 当前图层列表（下 → 上）。
-    private var layers: [MapLayer] = []
+    /// （卷帘对比在另一个文件里要用到它，故不加 `private`。）
+    var layers: [MapLayer] = []
 
     /// 基准层：测量、存档、相机尺度都以它为准。
     private var anchorLayer: MapLayer? { layers.first { $0.isAnchor } ?? layers.last }
@@ -80,7 +81,50 @@ final class TileCanvasNSView: NSView {
     enum DragTarget {
         case pan
         case vertex(measurementID: UUID?, index: Int)
+        /// 拉框选范围（下载面板「在视图上框选」用）。
+        case pickBounds
+        /// 拖卷帘对比的分隔线。
+        case swipe
     }
+
+    /// 框选范围回调：非 nil 时画布进入「拉框」模式，松手把框内的经纬度范围交出去。
+    ///
+    /// 这是画布与下载面板之间唯一的接口，画布不需要知道「下载」这件事，
+    /// 面板也不需要知道画布内部怎么把屏幕点换算成经纬度。
+    var boundsPicker: ((GeoBounds) -> Void)? {
+        didSet {
+            guard (boundsPicker == nil) != (oldValue == nil) else { return }
+            if boundsPicker == nil { clearPickRect() }
+            window?.invalidateCursorRects(for: self)
+            refreshCursor()
+        }
+    }
+
+    /// 框选被取消（Esc）时的回调：与 `boundsPicker` 配对使用。
+    ///
+    /// 画布对「谁在要范围」一无所知：要范围 / 被取消各一个闭包，下载面板与分析面板
+    /// 各自接自己的那条，画布这边不必区分。
+    var boundsPickCancel: (() -> Void)?
+
+    /// 框选用的橡皮筋层（只在框选期间可见）。
+    let pickLayer = CAShapeLayer()
+    /// 框选的起点与当前点（视图坐标，y 向上）。
+    var pickAnchor: CGPoint?
+    var pickCurrent: CGPoint?
+
+    // MARK: - 卷帘对比（E1）的状态
+    //
+    // 逻辑都在 `TileCanvasNSView+Swipe.swift`，这里只放存储属性（Swift 的扩展不能加存储属性）。
+    /// 卷帘对比的分界层 id：它**之上**的图层只在分隔线左侧显示；nil = 未开启对比。
+    var swipePivotLayerID: String?
+    /// 分隔线位置（占视图宽度的比例 0…1）。
+    var swipeFraction: CGFloat = 0.5
+    /// 每条被遮罩的图层配一块形状遮罩（懒建）。
+    var swipeMasks: [String: CAShapeLayer] = [:]
+    /// 分隔线 + 中央把手，盖在瓦片与测量标注之上。
+    let swipeDividerLayer = CAShapeLayer()
+    /// 把手心里的那对向内箭头（懒建）。
+    var swipeArrowsLayer: CAShapeLayer?
 
     var dragTarget: DragTarget?
     var dragLastPoint: CGPoint?
@@ -221,6 +265,26 @@ final class TileCanvasNSView: NSView {
         // 顺序即层序：底色 → 图层栈（按需插在中间）→ 测量标注。
         layer?.addSublayer(backgroundLayer)
         layer?.addSublayer(overlay.hostLayer)
+        // 框选橡皮筋盖在最上面：它只在框选期间有内容，平时是空路径、不可见。
+        pickLayer.fillColor = NSColor.controlAccentColor.withAlphaComponent(0.12).cgColor
+        pickLayer.strokeColor = NSColor.controlAccentColor.withAlphaComponent(0.9).cgColor
+        pickLayer.lineWidth = 1.5
+        pickLayer.lineDashPattern = [6, 4]
+        // 与测量标注同口径：层坐标 y 向下，这里翻成视图坐标（y 向上），
+        // 事件点就不用再换算一次。
+        pickLayer.isGeometryFlipped = true
+        pickLayer.isHidden = true
+        layer?.addSublayer(pickLayer)
+
+        // 卷帘分隔线：白色竖线 + 中央圆把手，平时隐藏（未开启对比时不占视觉）。
+        swipeDividerLayer.fillColor = NSColor.white.withAlphaComponent(0.92).cgColor
+        swipeDividerLayer.isGeometryFlipped = true
+        swipeDividerLayer.isHidden = true
+        swipeDividerLayer.shadowColor = NSColor.black.cgColor
+        swipeDividerLayer.shadowOpacity = 0.35
+        swipeDividerLayer.shadowRadius = 2
+        swipeDividerLayer.shadowOffset = .zero
+        layer?.addSublayer(swipeDividerLayer)
         applyAppearanceColors()
     }
 
@@ -405,7 +469,74 @@ final class TileCanvasNSView: NSView {
 
     override func resetCursorRects() {
         super.resetCursorRects()
-        addCursorRect(bounds, cursor: tool == .browse ? .openHand : .crosshair)
+        addCursorRect(bounds, cursor: pickCursor)
+    }
+
+    /// 当前该显示的指针样式（框选模式下忽略工具，一律十字）。
+    private var pickCursor: NSCursor {
+        // 卷帘对比开着、且指针正贴在分隔线上：给「左右拖」的指针，提示这里可以抓。
+        if let point = lastPointerPoint, swipeHitTest(point) { return .resizeLeftRight }
+        return boundsPicker != nil ? .crosshair : (tool == .browse ? .openHand : .crosshair)
+    }
+
+    /// 立即刷新指针（进入 / 退出框选模式时调用）。
+    func refreshCursor() {
+        pickCursor.set()
+    }
+
+    // MARK: - 框选范围（下载面板用）
+
+    /// 按下：记下拉框起点。
+    func beginPickRect(at point: CGPoint) {
+        pickAnchor = point
+        pickCurrent = point
+        updatePickLayer()
+    }
+
+    /// 拖动：橡皮筋跟着指针走。
+    func updatePickRect(to point: CGPoint) {
+        guard pickAnchor != nil else { return }
+        pickCurrent = point
+        updatePickLayer()
+    }
+
+    /// 清掉橡皮筋（结束、取消、切模式都走这里）。
+    func clearPickRect() {
+        pickAnchor = nil
+        pickCurrent = nil
+        pickLayer.path = nil
+        pickLayer.isHidden = true
+    }
+
+    private func updatePickLayer() {
+        guard let anchor = pickAnchor, let current = pickCurrent else { return }
+        pickLayer.frame = bounds
+        pickLayer.path = CGPath(rect: Self.rect(from: anchor, to: current), transform: nil)
+        pickLayer.isHidden = false
+    }
+
+    private static func rect(from a: CGPoint, to b: CGPoint) -> CGRect {
+        CGRect(
+            x: min(a.x, b.x),
+            y: min(a.y, b.y),
+            width: abs(b.x - a.x),
+            height: abs(b.y - a.y)
+        )
+    }
+
+    /// 松手：把框内的经纬度范围交出去（太小、或者已经出了世界范围就不交）。
+    func finishPickRect(at point: CGPoint) {
+        defer { clearPickRect() }
+        guard let handler = boundsPicker, let anchor = pickAnchor else { return }
+        let rect = Self.rect(from: anchor, to: point)
+        // 小于 4 点基本是误触，不当作一次框选。
+        guard rect.width >= 4, rect.height >= 4 else { return }
+        let cornerA = camera.worldPoint(forViewPoint: CGPoint(x: rect.minX, y: rect.minY))
+        let cornerB = camera.worldPoint(forViewPoint: CGPoint(x: rect.maxX, y: rect.maxY))
+        let world = Self.rect(from: cornerA, to: cornerB)
+        let clamped = world.intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
+        guard !clamped.isNull, clamped.width > 0, clamped.height > 0 else { return }
+        handler(GeoBounds(normalizedRect: clamped))
     }
 
     /// 世界范围（在线底图的兜底适配目标）。
@@ -488,6 +619,8 @@ final class TileCanvasNSView: NSView {
         } else {
             refreshCamera(fitRect: focusRect, defaultZoomLevel: focusRect == nil ? 2 : nil)
         }
+        // 图层增删改序之后遮罩对象可能对不上了，重刷一遍（未开启对比时是空操作）。
+        if swipeIsActive || !swipeMasks.isEmpty { applySwipe() }
         syncLayers()
     }
 
@@ -523,6 +656,8 @@ final class TileCanvasNSView: NSView {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         backgroundLayer.frame = bounds
+        pickLayer.frame = bounds
+        swipeDividerLayer.frame = bounds
         for stack in stacks.values { stack.hostLayer.frame = bounds }
         CATransaction.commit()
     }
@@ -601,11 +736,24 @@ final class TileCanvasNSView: NSView {
         let layerCount = orderedStacks.filter(\.isActive).count
         guard !name.isEmpty else {
             setAccessibilityLabel("地图画布，暂无内容")
-            setAccessibilityValue(nil)
+            writeAccessibilityZoom(nil)
             return
         }
         setAccessibilityLabel("地图画布：\(name)" + (layerCount > 1 ? "（\(layerCount) 个图层）" : ""))
-        setAccessibilityValue("z\(currentDataZoom)")
+        writeAccessibilityZoom(currentDataZoom)
+    }
+
+    /// 上次写进无障碍值的层级。
+    private var lastAccessibilityZoom: Int?
+
+    /// 只在层级真的变了才写无障碍值。
+    ///
+    /// `sync` 在瓦片到位、手势提交时都会跑，每次都 `setAccessibilityValue("z…")` 等于
+    /// 每秒给辅助功能栈发几十次同样的通知 —— 值没变就别惊动它。
+    private func writeAccessibilityZoom(_ zoom: Int?) {
+        guard zoom != lastAccessibilityZoom else { return }
+        lastAccessibilityZoom = zoom
+        setAccessibilityValue(zoom.map { "z\($0)" })
     }
 
     /// 本地数据范围算好之后对齐窗口（只影响本地层，不打断已经铺好的其他层）。
@@ -652,6 +800,23 @@ final class TileCanvasNSView: NSView {
         camera.center = WebMercator.normalized(coordinate)
         camera = camera.clamped(zoomLevelRange: zoomBounds)
         syncLayers()
+    }
+
+    /// 跳到指定视点（中心 + 缩放层级），书签与「巡检图集」用。
+    func goTo(_ coordinate: GeoCoordinate, zoomLevel: Double?) {
+        markViewPositioned()
+        camera.center = WebMercator.normalized(coordinate)
+        if let zoomLevel {
+            camera = camera.settingZoomLevel(zoomLevel, zoomLevelRange: zoomBounds)
+        }
+        camera = camera.clamped(zoomLevelRange: zoomBounds)
+        syncLayers()
+        reportViewport(visibleTiles: lastVisibleTiles)
+    }
+
+    /// 当前视点（书签记的就是这个）。
+    var currentViewpoint: (center: GeoCoordinate, zoomLevel: Double) {
+        (WebMercator.coordinate(fromNormalized: camera.center), camera.zoomLevel)
     }
 
     /// 把指针当前位置记成一个点（快捷键 P，与「点坐标」工具共用同一份数据）。
@@ -717,7 +882,9 @@ final class TileCanvasNSView: NSView {
         CATransaction.setDisableActions(true)
         backgroundLayer.frame = bounds
         for stack in stacks.values { stack.hostLayer.frame = bounds }
+        swipeDividerLayer.frame = bounds
         CATransaction.commit()
+        if swipeIsActive { applySwipe() }
         syncLayers()
     }
 
@@ -841,7 +1008,7 @@ final class TileCanvasNSView: NSView {
         reportTileStats(loadedTiles: loadedTiles, missingTiles: missingTiles, loadsTiles: loadsTiles)
         reportViewport(visibleTiles: visibleTiles)
         traceDetail = "需要 \(visibleTiles) 片 · 已上屏 \(loadedTiles) · 缺 \(missingTiles)"
-        setAccessibilityValue("z\(currentDataZoom)")
+        writeAccessibilityZoom(currentDataZoom)
     }
 
     /// 瓦片读数是给状态栏看的，手势期间它本来也没在变，别白刷一次界面。
@@ -888,38 +1055,31 @@ final class TileCanvasNSView: NSView {
     /// - Parameter includingMeasurements: 导出干净的画面时可以关掉测量标注；
     ///   调试用的瓦片网格永远不进导出图（那是排查用的，不该出现在成图里）。
     func renderMapImage(includingMeasurements: Bool = true) -> CGImage? {
-        renderMapImage(scale: CGFloat(displayScale), includingMeasurements: includingMeasurements)
+        renderSnapshot(includingMeasurements: includingMeasurements)?.makeImage()
     }
 
-    private func renderMapImage(scale: CGFloat, includingMeasurements: Bool = true) -> CGImage? {
-        guard bounds.width > 1, bounds.height > 1,
-              scale > 0 else { return nil }
-        let width = Int((bounds.width * scale).rounded())
-        let height = Int((bounds.height * scale).rounded())
-        guard width > 0, height > 0,
-              let space = CGColorSpace(name: CGColorSpace.sRGB),
-              let context = CGContext(
-                data: nil, width: width, height: height,
-                bitsPerComponent: 8, bytesPerRow: 0, space: space,
-                bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
-              ) else { return nil }
-        context.scaleBy(x: scale, y: scale)
-        // CALayer 的几何是 y 向下，位图上下文是 y 向上，这里翻回来。
-        context.translateBy(x: 0, y: bounds.height)
-        context.scaleBy(x: 1, y: -1)
-        let overlayWasHidden = overlay.hostLayer.isHidden
-        let gridStates = stacks.values.map { $0.gridLayer.isHidden }
-        overlay.hostLayer.isHidden = !includingMeasurements
-        for stack in stacks.values { stack.gridLayer.isHidden = true }
-        let rendered: CGImage? = overlay.withLabelsUprightForOffscreenRender {
-            layer?.render(in: context)
-            return context.makeImage()
-        }
-        overlay.hostLayer.isHidden = overlayWasHidden
-        for (index, stack) in stacks.values.enumerated() where index < gridStates.count {
-            stack.gridLayer.isHidden = gridStates[index]
-        }
-        return rendered
+    /// 把当前画面抽成**值类型快照**：底图 + 各图层栈的图 + 测量标注位图。
+    ///
+    /// 只读，不改任何可见状态（旧的出图路径要临时改 `isHidden` 再还原，
+    /// 中途出错就会留下隐藏的网格或标注）。快照里全是不可变的 `CGImage`，
+    /// 拿出去之后可以整体丢到后台线程去光栅化 / 合成 / 编码，主线程不再为出图停摆。
+    func renderSnapshot(includingMeasurements: Bool = true) -> MapRenderSnapshot? {
+        let scale = CGFloat(displayScale)
+        guard bounds.width > 1, bounds.height > 1, scale > 0 else { return nil }
+        var placements: [MapRenderSnapshot.Placement] = []
+        // 层序按模型给的图层列表（下 → 上），保证叠加关系与屏幕一致。
+        for stack in orderedStacks { stack.appendPlacements(into: &placements) }
+        let overlayImage: CGImage? = (includingMeasurements && !overlay.hostLayer.isHidden)
+            ? overlay.offscreenImage(size: bounds.size, scale: scale)
+            : nil
+        return MapRenderSnapshot(
+            size: bounds.size,
+            scale: scale,
+            background: backgroundLayer.backgroundColor,
+            placements: placements,
+            overlay: overlayImage,
+            measurementCount: measurementStore?.measurements.count ?? 0
+        )
     }
 
     // MARK: - 测量标注

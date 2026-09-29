@@ -349,6 +349,110 @@ public struct TileDownloadPlan: Hashable, Sendable {
         return tiles
     }
 
+    /// 逐块流出瓦片（顺序与 `tiles(for:)` 完全一致：行中心优先、列中心优先）。
+    ///
+    /// 为什么要有它：`tiles(for:)` 会把整层物化成一个数组 —— 一份两百万张的计划光放
+    /// 格子就要几十 MB，而且**下载还没开始**就先占住。这里改成惰性生成，内存只跟块大小有关
+    /// （默认一块 512 张），顺序不变，因此「先下中间」的手感也没变。
+    public func tileChunks(for range: TileRange, chunkSize: Int = 512) -> TileChunkSequence {
+        TileChunkSequence(range: range, chunkSize: max(1, chunkSize))
+    }
+
+    /// 中心向外的偏移序列：0, -1, +1, -2, +2, …（不物化数组，随用随算）。
+    ///
+    /// 与 `centerOut(_:center:)` 逐个对齐：先往左、再往右，保证流式下载的出图顺序
+    /// 和原来物化数组那条路径**完全一致**（自检里有一条专门比这个）。
+    static func centerOutOffset(_ step: Int) -> Int {
+        guard step > 0 else { return 0 }
+        return step % 2 == 1 ? -((step + 1) / 2) : (step / 2)
+    }
+
+
+    /// 一个范围里的瓦片流：按「行中心优先、列中心优先」逐块给出，不物化整层。
+    public struct TileChunkSequence: Sequence, IteratorProtocol {
+        private let zoom: Int
+        private let columns: ClosedRange<Int>
+        private let rows: ClosedRange<Int>
+        private let centerColumn: Int
+        private let centerRow: Int
+        private let chunkSize: Int
+        /// 行 / 列「游标」的上限（越界的那几次循环里直接跳过，不进数组）。
+        ///
+        /// 游标是**偏移序号**而不是偏移量：序号 0 给中心、1 给 −1、2 给 +1、3 给 −2……
+        /// 因此要覆盖到「距中心最远 k 格」就得走到序号 2k —— 写成 k 会漏掉最外的那一圈
+        /// （有一轮就是这样：48 张的计划只下了 20 张，剩下的一圈从来没进过队列）。
+        private let rowStepLimit: Int
+        private let columnStepLimit: Int
+        /// 当前行（`nil` 表示这一行取完了，该往下翻）。
+        private var currentRow: Int?
+        private var rowStep = 0
+        private var columnStep = 0
+        private var finished = false
+
+        init(range: TileRange, chunkSize: Int) {
+            zoom = range.zoom
+            columns = range.columns
+            rows = range.rows
+            centerColumn = (range.columns.lowerBound + range.columns.upperBound) / 2
+            centerRow = (range.rows.lowerBound + range.rows.upperBound) / 2
+            self.chunkSize = chunkSize
+            // 注意：`Sequence` 自带 `max()`，这里必须显式写 `Swift.max` 才是全局函数。
+            rowStepLimit = 2 * Swift.max(
+                centerRow - range.rows.lowerBound,
+                range.rows.upperBound - centerRow
+            )
+            columnStepLimit = 2 * Swift.max(
+                centerColumn - range.columns.lowerBound,
+                range.columns.upperBound - centerColumn
+            )
+        }
+
+        public mutating func next() -> [SlippyTile]? {
+            guard !finished else { return nil }
+            var chunk: [SlippyTile] = []
+            chunk.reserveCapacity(chunkSize)
+            while chunk.count < chunkSize {
+                guard let row = currentRow else {
+                    guard advanceRow() else {
+                        finished = true
+                        break
+                    }
+                    continue
+                }
+                if let column = nextColumn() {
+                    chunk.append(SlippyTile(zoom: zoom, x: column, y: row))
+                } else {
+                    currentRow = nil
+                }
+            }
+            return chunk.isEmpty ? nil : chunk
+        }
+
+        /// 翻到下一行（跳过落在范围外的偏移）。取到当前行时把列游标归零。
+        private mutating func advanceRow() -> Bool {
+            while rowStep <= rowStepLimit {
+                let candidate = centerRow + TileDownloadPlan.centerOutOffset(rowStep)
+                rowStep += 1
+                if rows.contains(candidate) {
+                    currentRow = candidate
+                    columnStep = 0
+                    return true
+                }
+            }
+            return false
+        }
+
+        /// 当前行的下一个列号（同样按中心向外，跳过范围外的偏移）。
+        private mutating func nextColumn() -> Int? {
+            while columnStep <= columnStepLimit {
+                let candidate = centerColumn + TileDownloadPlan.centerOutOffset(columnStep)
+                columnStep += 1
+                if columns.contains(candidate) { return candidate }
+            }
+            return nil
+        }
+    }
+
     public func allTiles() -> [SlippyTile] {
         ranges.flatMap { tiles(for: $0) }
     }

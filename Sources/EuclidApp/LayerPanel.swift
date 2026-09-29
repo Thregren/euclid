@@ -339,6 +339,12 @@ struct LayersPanel: View {
         }
         .disabled(layer.isAnchor || layer.kind == .online)
 
+        let isSwipePivot = model.swipePivotLayerID == layer.id
+        Button(isSwipePivot ? "关闭卷帘对比" : "以此为分界做卷帘对比") {
+            model.toggleSwipeCompare(layerID: layer.id)
+        }
+        .disabled(!isSwipePivot && model.layers.last?.id == layer.id)
+
         Divider()
 
         Button(layer.isVisible ? "隐藏这一层" : "显示这一层") {
@@ -372,6 +378,26 @@ struct LayersPanel: View {
 
             Slider(value: opacityBinding, in: 0...1)
                 .controlSize(.small)
+
+            if let pivot = model.swipePivotLayerID,
+               let name = model.layers.first(where: { $0.id == pivot })?.name {
+                HStack(spacing: 6) {
+                    Image(systemName: "rectangle.split.2x1")
+                        .font(.caption)
+                        .foregroundStyle(.tint)
+                    Text("卷帘对比：分界在「\(name)」")
+                        .font(.caption)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer(minLength: 4)
+                    Button("关闭") { model.swipePivotLayerID = nil }
+                        .buttonStyle(.link)
+                        .font(.caption)
+                }
+                .padding(.horizontal, 7)
+                .padding(.vertical, 4)
+                .background(Color.accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+            }
 
             searchField
         }

@@ -92,6 +92,30 @@ public struct RasterGeoreference: Hashable, Sendable {
         return rect ?? CGRect(x: 0.25, y: 0.25, width: 0.5, height: 0.5)
     }
 
+    /// 归一化世界矩形 → 像素矩形（四角都换算一遍，取包围盒）。
+    ///
+    /// 铺图（把瓦片范围换算成影像上的取图区域）与数值分析（把视野 / 框选换算成像素范围）
+    /// 共用这一条口径：两边各写一份的话，算出来的范围会跟看到的位置差一点。
+    public func pixelRect(ofWorldRect rect: CGRect) -> CGRect? {
+        let west = WebMercator.longitude(normalizedX: rect.minX)
+        let east = WebMercator.longitude(normalizedX: rect.maxX)
+        let north = WebMercator.latitude(normalizedY: rect.minY)
+        let south = WebMercator.latitude(normalizedY: rect.maxY)
+        let corners = [
+            GeoCoordinate(longitude: west, latitude: north),
+            GeoCoordinate(longitude: east, latitude: north),
+            GeoCoordinate(longitude: east, latitude: south),
+            GeoCoordinate(longitude: west, latitude: south),
+        ]
+        var box: CGRect?
+        for corner in corners {
+            guard let pixel = pixel(for: corner) else { return nil }
+            box = box.map { $0.union(CGRect(origin: pixel, size: .zero)) }
+                ?? CGRect(origin: pixel, size: .zero)
+        }
+        return box
+    }
+
     /// 由 GeoTIFF 标签建地理参考。
     static func from(geo: TIFFGeoTags, pixelWidth: Int, pixelHeight: Int) -> RasterGeoreference {
         let crs = crsFromKeys(geo)
@@ -405,23 +429,9 @@ public struct RasterTileSource: TileImageSource {
         guard tileWorld.intersects(worldRect) else { return nil }
 
         // 瓦片的世界范围 → 影像坐标矩形 → 像素矩形。
-        let west = WebMercator.longitude(normalizedX: tileWorld.minX)
-        let east = WebMercator.longitude(normalizedX: tileWorld.maxX)
-        let north = WebMercator.latitude(normalizedY: tileWorld.minY)
-        let south = WebMercator.latitude(normalizedY: tileWorld.maxY)
-        let corners = [
-            GeoCoordinate(longitude: west, latitude: north),
-            GeoCoordinate(longitude: east, latitude: north),
-            GeoCoordinate(longitude: east, latitude: south),
-            GeoCoordinate(longitude: west, latitude: south),
-        ]
-        var pixelRect: CGRect?
-        for corner in corners {
-            guard let pixel = georeference.pixel(for: corner) else { return nil }
-            pixelRect = pixelRect.map { $0.union(CGRect(origin: pixel, size: .zero)) }
-                ?? CGRect(origin: pixel, size: .zero)
+        guard let rawPixelRect = Self.pixelRect(ofTileWorld: tileWorld, georeference: georeference) else {
+            return nil
         }
-        guard let rawPixelRect = pixelRect else { return nil }
 
         let imageBounds = CGRect(x: 0, y: 0, width: Double(pixelWidth), height: Double(pixelHeight))
         let clipped = rawPixelRect.intersection(imageBounds)
@@ -438,6 +448,34 @@ public struct RasterTileSource: TileImageSource {
             height: clipped.height * scaleY
         )
 
+        // 没有内建概览的大图：先看持久化概览缓存有没有现成的，有就直接用它铺 ——
+        // 比逐块解原图快一两个数量级（这正是「无概览大图」最卡的那条路）。
+        if file.overviews.isEmpty {
+            let sourcePixelsPerPoint = max(
+                clipped.width / max(1, destination.width),
+                clipped.height / max(1, destination.height)
+            )
+            let overview = await RasterOverviewCache.shared.readyImage(fileURL: fileURL, tileSize: tileSize)
+            if let overview, sourcePixelsPerPoint > 1.05 {
+                let scale = Double(overview.width) / Double(max(1, pixelWidth))
+                // 概览的像素够用才拿它铺；不够就老实解原图（宁慢不错）。
+                if scale > 0,
+                   clipped.width * scale >= destination.width * 0.9,
+                   clipped.height * scale >= destination.height * 0.9,
+                   let image = Self.renderTile(
+                       from: overview,
+                       overviewScale: scale,
+                       clipped: clipped,
+                       destination: destination,
+                       tileSize: tileSize
+                   ) {
+                    return image
+                }
+            } else if overview == nil, RasterOverviewCache.qualifiesLargeImage(pixelWidth: pixelWidth, pixelHeight: pixelHeight) {
+                // 还没做好：把生成任务排到后台，这一屏继续走原路（下次打开就是现成的了）。
+                Self.scheduleOverviewGeneration(fileURL: fileURL, tileSize: tileSize)
+            }
+        }
         // 选层级：挑「刚好够这一屏分辨率」的最小一级（内建概览在这里发挥作用）。
         let level = Self.chooseLevel(for: rawPixelRect, in: file, pixelWidth: pixelWidth, tileSize: tileSize)
         let levelScale = Double(level.width) / Double(pixelWidth)
@@ -485,6 +523,14 @@ public struct RasterTileSource: TileImageSource {
         return Self.makeImage(canvas: canvas, size: tileSize)
     }
 
+    /// 瓦片的世界范围 → 影像像素矩形（四角都换算一遍，不能只看一个角）。
+    ///
+    /// 单幅影像与内存影像（差异叠加 / 坡度图）共用这一条口径：
+    /// 两边都对不上的话，叠加层就会相对底图整体偏移。
+    static func pixelRect(ofTileWorld tileWorld: CGRect, georeference: RasterGeoreference) -> CGRect? {
+        georeference.pixelRect(ofWorldRect: tileWorld)
+    }
+
     /// 选一级：分辨率刚好不小于「瓦片要显示的像素数」的那一级。
     static func chooseLevel(
         for pixelRect: CGRect,
@@ -501,6 +547,122 @@ public struct RasterTileSource: TileImageSource {
             }
         }
         return file.main
+    }
+
+    /// 把整幅影像按目标尺寸采一张图（无概览大图的持久化概览就是这么算出来的）。
+    ///
+    /// 走的是与取图完全相同的解码路径，只是区域取整幅；有内建概览时用最合适的那一级，
+    /// 因此不必把大图整张解进内存。
+    static func renderOverviewImage(
+        fileURL: URL,
+        pixelWidth: Int,
+        pixelHeight: Int,
+        maxPixelSize: Int = RasterOverviewCache.maximumPixelSize
+    ) -> CGImage? {
+        guard maxPixelSize > 0, pixelWidth > 0, pixelHeight > 0,
+              let file = TIFFFileCache.shared.file(for: fileURL) else { return nil }
+        let scale = min(1, Double(maxPixelSize) / Double(max(pixelWidth, pixelHeight)))
+        let width = max(1, Int((Double(pixelWidth) * scale).rounded()))
+        let height = max(1, Int((Double(pixelHeight) * scale).rounded()))
+        let level = chooseLevel(
+            for: CGRect(x: 0, y: 0, width: Double(pixelWidth), height: Double(pixelHeight)),
+            in: file,
+            pixelWidth: pixelWidth,
+            tileSize: max(width, height)
+        )
+        var canvas = [UInt8](repeating: 0, count: width * height * 4)
+        let drawn: Bool = canvas.withUnsafeMutableBufferPointer { buffer in
+            guard let base = buffer.baseAddress else { return false }
+            do {
+                try TIFFDecoder.draw(
+                    file: file,
+                    level: level,
+                    source: CGRect(x: 0, y: 0, width: Double(level.width), height: Double(level.height)),
+                    canvas: base,
+                    canvasWidth: width,
+                    canvasHeight: height,
+                    destination: CGRect(x: 0, y: 0, width: Double(width), height: Double(height))
+                )
+                return true
+            } catch {
+                TIFFDiagnostics.record(error: error, tile: SlippyTile(zoom: 0, x: 0, y: 0), file: fileURL)
+                return false
+            }
+        }
+        guard drawn else { return nil }
+        return makeImage(canvas: canvas, width: width, height: height)
+    }
+
+    /// 用持久化概览小图铺一块瓦片（低层级看全貌用）。
+    ///
+    /// 概览是整幅影像的等比缩小，所以「影像像素矩形」乘上 `overviewScale` 就是概览上的位置；
+    /// 与直接解原图那条路的结果在几何上完全一致，只是采样自一张小图。
+    static func renderTile(
+        from overview: CGImage,
+        overviewScale: Double,
+        clipped: CGRect,
+        destination: CGRect,
+        tileSize: Int
+    ) -> CGImage? {
+        guard overviewScale > 0, tileSize > 0 else { return nil }
+        let source = CGRect(
+            x: clipped.minX * overviewScale,
+            y: clipped.minY * overviewScale,
+            width: max(1, clipped.width * overviewScale),
+            height: max(1, clipped.height * overviewScale)
+        )
+        let imageBounds = CGRect(x: 0, y: 0, width: CGFloat(overview.width), height: CGFloat(overview.height))
+        let cropped = source.integral.intersection(imageBounds)
+        guard !cropped.isNull, cropped.width >= 1, cropped.height >= 1,
+              let piece = overview.cropping(to: cropped) else { return nil }
+        // 概览像素 → 目标像素的比例；裁剪区与目标矩形按同一个比例对应。
+        let pointsPerOverviewPixel = destination.width / max(0.0001, source.width)
+        let offsetX = (cropped.minX - source.minX) * pointsPerOverviewPixel
+        let offsetY = (cropped.minY - source.minY) * pointsPerOverviewPixel
+        let width = cropped.width * pointsPerOverviewPixel
+        let height = cropped.height * pointsPerOverviewPixel
+        let topDownY = destination.minY + offsetY
+
+        var canvas = [UInt8](repeating: 0, count: tileSize * tileSize * 4)
+        let drawn: Bool = canvas.withUnsafeMutableBufferPointer { buffer in
+            guard let base = buffer.baseAddress,
+                  let space = CGColorSpace(name: CGColorSpace.sRGB),
+                  let context = CGContext(
+                      data: base,
+                      width: tileSize,
+                      height: tileSize,
+                      bitsPerComponent: 8,
+                      bytesPerRow: tileSize * 4,
+                      space: space,
+                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                  ) else { return false }
+            context.interpolationQuality = .high
+            // 画布是「y 向下」，CGContext 的用户坐标是「y 向上」：位置换算一下即可
+            // （缓冲区首行仍然是画面顶部，与 `TIFFDecoder` 写出来的口径一致）。
+            context.draw(piece, in: CGRect(
+                x: destination.minX + offsetX,
+                y: CGFloat(tileSize) - (topDownY + height),
+                width: width,
+                height: height
+            ))
+            return true
+        }
+        guard drawn else { return nil }
+        return makeImage(canvas: canvas, width: tileSize, height: tileSize)
+    }
+
+    /// 把「生成概览」排到后台（铺图时发现还没做好就走它）。
+    static func scheduleOverviewGeneration(fileURL: URL, tileSize: Int) {
+        Task {
+            await RasterOverviewCache.shared.scheduleGeneration(fileURL: fileURL, tileSize: tileSize) {
+                guard let file = TIFFFileCache.shared.file(for: fileURL) else { return nil }
+                return renderOverviewImage(
+                    fileURL: fileURL,
+                    pixelWidth: file.pixelWidth,
+                    pixelHeight: file.pixelHeight
+                )
+            }
+        }
     }
 
     /// RGBA8 缓冲区 → CGImage。

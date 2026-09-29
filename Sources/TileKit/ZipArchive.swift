@@ -163,6 +163,15 @@ public final class ZipArchive: @unchecked Sendable {
         let size = try handle.seekToEnd()
         fileSize = size
         guard size >= 22 else { throw ZipError.notAZip }
+        // 先看有没有上次留下的索引：命中的话连中央目录都不用扫（一个 z18 分卷上百万条
+        // 记录，扫一遍要一二百毫秒，而索引落盘只要几 KB）。
+        if let cached = ZipIndexCache.load(for: url, fileSize: size) {
+            rowSpans = cached.rowSpans
+            entryCount = cached.entryCount
+            centralDirectorySize = cached.centralDirectorySize
+            isZip64 = cached.isZip64
+            return
+        }
         // 中央目录结束记录（EOCD）在文件末尾 22 字节 + 最多 65535 字节注释之内。
         let tailLength = Int(min(size, 22 + 65_535))
         let tail = read(at: size - UInt64(tailLength), count: tailLength)
@@ -196,6 +205,16 @@ public final class ZipArchive: @unchecked Sendable {
             throw ZipError.truncated("中央目录越过了文件末尾")
         }
         try indexRows(directoryOffset: directoryOffset, directorySize: directorySize)
+        // 扫完了就把索引存一份：下次打开同一份数据（同一路径、同一大小与修改时间）
+        // 直接命中，不用再逐个分卷扫一遍中央目录。还在下载中的分卷大小会变，自然不会命中旧索引。
+        ZipIndexCache.save(
+            rowSpans: rowSpans,
+            entryCount: entryCount,
+            centralDirectorySize: centralDirectorySize,
+            isZip64: isZip64,
+            for: url,
+            fileSize: size
+        )
     }
 
     /// 流式扫一遍中央目录，只记「行 → 字节范围」，不保留记录本身。

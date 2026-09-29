@@ -89,7 +89,23 @@ final class CanvasController {
         view.measurementStore = measurements
         view.areaUnit = areaUnit
         view.onDeleteLayer = onDeleteLayer
+        view.boundsPicker = boundsPicker
+        view.boundsPickCancel = boundsPickCancel
+        view.setSwipe(pivotLayerID: swipePivotLayerID, fraction: nil)
         pending?()
+    }
+
+    /// 「在视图上框选范围」的接收方（非 nil = 画布正在拉框）。
+    ///
+    /// 画布只认「有一个回调要范围」，不知道下载这回事；下载面板只管填自己的字段，
+    /// 不知道屏幕点怎么换算成经纬度。两边的耦合就剩这一个闭包。
+    var boundsPicker: ((GeoBounds) -> Void)? {
+        didSet { view?.boundsPicker = boundsPicker }
+    }
+
+    /// 「在视图上框选范围」被 Esc 取消时的接收方（与 `boundsPicker` 配对）。
+    var boundsPickCancel: (() -> Void)? {
+        didSet { view?.boundsPickCancel = boundsPickCancel }
     }
 
     /// 面积显示单位：界面改了要同步到画布上的面积标注。
@@ -103,6 +119,13 @@ final class CanvasController {
     /// 退格 / 前向删除的落点：画布监听键盘，模型决定「要不要删掉选中的图层」。
     var onDeleteLayer: (() -> Bool)? {
         didSet { view?.onDeleteLayer = onDeleteLayer }
+    }
+
+    /// 卷帘对比的分界层（nil = 关闭）。
+    ///
+    /// 画布只认这个 id：分界层**之上**的图层裁到分隔线左侧，它自己与下面那些铺满整屏。
+    var swipePivotLayerID: String? {
+        didSet { view?.setSwipe(pivotLayerID: swipePivotLayerID, fraction: nil) }
     }
 
     private weak var measurements: MeasurementStore?
@@ -126,6 +149,16 @@ final class CanvasController {
         view?.setExtent(extent)
     }
 
+    /// 当前视点（书签记的就是它）。
+    var viewpoint: (center: GeoCoordinate, zoomLevel: Double)? {
+        view?.currentViewpoint
+    }
+
+    /// 跳到指定视点（中心 + 层级）。
+    func jump(to coordinate: GeoCoordinate, zoomLevel: Double? = nil) {
+        view?.goTo(coordinate, zoomLevel: zoomLevel)
+    }
+
     func setTileGrid(_ isVisible: Bool) {
         view?.showTileGrid = isVisible
     }
@@ -147,6 +180,8 @@ final class CanvasController {
     func fit(to worldRect: CGRect) { view?.fitToWorldRect(worldRect) }
     func refreshOverlay() { view?.refreshOverlay() }
     func goTo(_ coordinate: GeoCoordinate) { view?.goTo(coordinate) }
+    /// 当前视野的归一化世界矩形（「只算这一屏」的分析用它）。
+    var visibleWorldRect: CGRect? { view?.camera.visibleWorldRect }
     /// 把指针位置记成一个点，返回落了哪条测量。
     @discardableResult
     func dropPointAtCursor() -> GeoMeasurement? { view?.dropPointAtCursor() }
@@ -165,12 +200,13 @@ final class CanvasController {
     /// 调试用：窗口当前是不是全屏。
     var debugIsFullscreen: Bool { view?.window?.styleMask.contains(.fullScreen) == true }
     func actualSize() { view?.zoomToActualSize() }
-    /// 把当前画面渲染成位图（导出图片用）。
-    func mapImage(includingMeasurements: Bool) -> CGImage? {
-        view?.renderMapImage(includingMeasurements: includingMeasurements)
+    /// 把当前画面抽成值类型快照（导出图片 / PDF 用）。
+    ///
+    /// 这一步必须在主线程做（要读视图里的图层树），但只是遍历一遍属性、拿几个不可变的
+    /// `CGImage` 引用，微秒级；真正贵的光栅化与编码由调用方拿到快照后丢到后台去做。
+    func mapSnapshot(includingMeasurements: Bool = true) -> MapRenderSnapshot? {
+        view?.renderSnapshot(includingMeasurements: includingMeasurements)
     }
-    /// 画布的设备像素比：导出图片时用它决定字号与线宽。
-    var backingScale: CGFloat { view?.backingScale ?? 2 }
 }
 
 /// 应用状态。
@@ -226,6 +262,28 @@ final class AppModel {
     }
     /// 在线瓦片下载面板是否展开。
     var showDownloadSheet = false
+
+    /// 进入「在视图上框选下载范围」。
+    ///
+    /// 下载面板是模态表单，展开时画布收不到鼠标事件；因此这里先把面板收起来，
+    /// 拉完框再把面板弹回来、并把范围填进去。中途 Esc 取消则原样弹回面板。
+    func pickDownloadBoundsFromView() {
+        showDownloadSheet = false
+        canvas.boundsPickCancel = { [weak self] in
+            guard let self else { return }
+            self.canvas.boundsPickCancel = nil
+            self.showDownloadSheet = true
+        }
+        canvas.boundsPicker = { [weak self] bounds in
+            guard let self else { return }
+            self.canvas.boundsPickCancel = nil
+            self.canvas.boundsPicker = nil
+            self.download.bounds = bounds
+            self.showDownloadSheet = true
+            self.setStatus("已框选下载范围：\(bounds.displayText)")
+        }
+        setStatus("在画布上按住左键拖出一个矩形，松手即填入下载范围（Esc 取消）", autoClearAfter: 8)
+    }
     /// 是否用在线底图。与下载面板共用同一套源参数（预设、模板、密钥），两处永远一致。
     var usesOnlineBasemap = false {
         didSet { applyBasemap() }
@@ -241,8 +299,47 @@ final class AppModel {
     /// 面板里选中的那一层（不透明度等属性作用于它）。
     var selectedLayerID: String?
 
+    /// 标签页：每一页记住自己那份「打开的东西」（数据集 / 影像、图层、视角、测量）。
+    ///
+    /// 空数组表示「还没分过页」—— 第一次需要时再按当前状态补出一页，启动路径不受影响。
+    var workspaceTabs: [WorkspaceTab] = []
+    /// 当前显示的是哪一页。
+    var activeWorkspaceTabID: UUID?
+    /// 正在切换标签页：切换过程中会改一堆状态，用它挡住「顺手重算 / 重装」的副作用。
+    @ObservationIgnored var isSwitchingWorkspaceTab = false
+
     var selectedLayer: MapLayer? {
         layers.first { $0.id == selectedLayerID } ?? anchorLayer ?? layers.last
+    }
+
+    /// 卷帘对比：分界层 id（nil = 关闭）。
+    ///
+    /// 它**之上**的图层只在分隔线左侧显示，它自己与下面那些铺满整屏 ——
+    /// 于是同一视野里两期影像各占一半，中间那条线可以直接拖。
+    /// 分界层被移除时自动关掉（见 `AppModel+Layers`）。
+    var swipePivotLayerID: String? {
+        didSet {
+            guard swipePivotLayerID != oldValue else { return }
+            canvas.swipePivotLayerID = swipePivotLayerID
+        }
+    }
+
+    /// 以某一层为分界开启 / 关闭卷帘对比。
+    func toggleSwipeCompare(layerID: String) {
+        if swipePivotLayerID == layerID {
+            swipePivotLayerID = nil
+            setStatus("已关闭卷帘对比", autoClearAfter: 4)
+            return
+        }
+        // 分界层必须在列表里、并且它上面真的还有一层可比的东西，否则对比看不出效果。
+        guard let index = layers.firstIndex(where: { $0.id == layerID }) else { return }
+        guard index < layers.count - 1 else {
+            setStatus("这一层上面没有别的图层，卷帘对比需要两层才能比出来", autoClearAfter: 6)
+            return
+        }
+        selectedLayerID = layerID
+        swipePivotLayerID = layerID
+        setStatus("卷帘对比：拖动画面中间的分隔线左右移动", autoClearAfter: 6)
     }
 
     /// 基准层（本地来源）。
@@ -268,6 +365,16 @@ final class AppModel {
     let viewport = ViewportState()
     let canvas = CanvasController()
     let measurements = MeasurementStore()
+    /// 书签视点（中心 + 层级），存在偏好里。
+    let bookmarks = BookmarkStore()
+    /// 可自定义的快捷键（⌘K 命令面板与键盘监视器共用）。
+    let shortcuts = ShortcutStore()
+    /// ⌘K 命令面板是否展开。
+    var showCommandPalette = false
+    /// 快捷键设置面板是否展开。
+    var showShortcutSettings = false
+    /// 全局按键监视器（装了就一直留着，见 `installCommandKeyMonitor`）。
+    @ObservationIgnored var commandKeyMonitor: Any?
     /// 左侧图层面板里的小缩略图。
     let thumbnails = LayerThumbnailStore()
     let download = TileDownloadModel()
@@ -279,6 +386,14 @@ final class AppModel {
     let tileServer = TileServerModel()
     /// 本地瓦片服务面板是否展开。
     var showTileServerSheet = false
+    /// 栅格分析（DEM 工具箱 / 两期差异）的状态。
+    let analysis = RasterAnalysisModel()
+    /// DEM 工具箱面板是否展开。
+    var showAnalysisSheet = false
+    /// 指针处高程读数的单像素缓存：同一像素内移动不重复解码。
+    @ObservationIgnored var pointElevationCache: (column: Int, row: Int, value: Float?)?
+    /// 分析读句柄的缓存（表头解析本身有缓存，这里省掉重复查找）。
+    @ObservationIgnored var analysisReaderCache: (url: URL, reader: RasterSampleReader)?
 
     /// 数据源代号：每次「扫描 / 打开影像 / 选中来源」都 +1，用来丢弃过期结果。
     ///
@@ -290,6 +405,10 @@ final class AppModel {
     var appliedOnlineSignature: String?
     /// 状态栏提示的自动清除任务。
     var statusClearTask: Task<Void, Never>?
+    /// 巡检图集导出任务（重新导出时先取消上一次）。
+    var atlasTask: Task<Void, Never>?
+    /// 上一次导出图集的目录（菜单里「在访达中显示」用）。
+    var lastAtlasDirectory: URL?
     /// 存档写入的防抖任务。
     var archiveTask: Task<Void, Never>?
 
@@ -444,6 +563,36 @@ final class AppModel {
     func zoomToMeasurement(_ measurement: GeoMeasurement) {
         guard let rect = measurement.worldRect else { return }
         canvas.fit(to: rect)
+    }
+
+    // MARK: - 书签视点
+
+    /// 把当前视点记成书签（名字留空时自动用「书签 N」）。
+    @discardableResult
+    func addBookmark(named name: String? = nil) -> ViewBookmark? {
+        guard let view = canvas.viewpoint, hasMapContent else {
+            setStatus("先打开一份数据，再记书签")
+            return nil
+        }
+        let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let fallback = "书签 \(bookmarks.items.count + 1)"
+        let bookmark = bookmarks.add(
+            name: trimmed.isEmpty ? fallback : trimmed,
+            center: view.center,
+            zoomLevel: view.zoomLevel
+        )
+        setStatus("已记下视点「\(bookmark.displayName)」")
+        return bookmark
+    }
+
+    func goToBookmark(_ bookmark: ViewBookmark) {
+        canvas.jump(to: bookmark.center, zoomLevel: bookmark.zoomLevel)
+        setStatus("已跳到「\(bookmark.displayName)」")
+    }
+
+    /// 删除书签（撤销用不上：书签是轻量的偏好，删错了再记一次）。
+    func removeBookmark(_ id: UUID) {
+        bookmarks.remove(id)
     }
 
     /// 打开启动时记录的数据集（由界面在首个窗口出现后调用）。

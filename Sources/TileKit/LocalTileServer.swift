@@ -208,6 +208,7 @@ public final class LocalTileServer: @unchecked Sendable {
         lock.lock()
         requestCount += 1
         let currentRoot = root
+        let port = boundPort
         lock.unlock()
 
         if method == "OPTIONS" {
@@ -218,6 +219,30 @@ public final class LocalTileServer: @unchecked Sendable {
                 status: 200,
                 contentType: "text/html; charset=utf-8",
                 body: Data(Self.indexHTML(rootName: currentRoot?.lastPathComponent ?? "—").utf8)
+            )
+        }
+        if path == "/tilejson.json" {
+            let metadata = self.metadata(for: currentRoot)
+            let body = Self.tileJSON(
+                root: currentRoot,
+                rootName: currentRoot?.lastPathComponent ?? "—",
+                port: port,
+                metadata: metadata
+            ) ?? Data("{}".utf8)
+            return Self.httpResponse(status: 200, contentType: "application/json; charset=utf-8", body: body)
+        }
+        if path == "/preview" || path == "/preview.html" {
+            let metadata = self.metadata(for: currentRoot)
+            return Self.httpResponse(
+                status: 200,
+                contentType: "text/html; charset=utf-8",
+                body: Data(
+                    Self.previewHTML(
+                        rootName: currentRoot?.lastPathComponent ?? "—",
+                        start: metadata.start,
+                        tileSize: metadata.tileSize
+                    ).utf8
+                )
             )
         }
         guard let currentRoot, let fileURL = Self.tileFile(for: path, root: currentRoot) else {
@@ -334,6 +359,303 @@ public final class LocalTileServer: @unchecked Sendable {
         return data
     }
 
+    // MARK: - 元数据与预览页
+
+    /// 一个数据集的元数据（层级 / 默认落点 / 瓦片边长）。
+    ///
+    /// 扫目录是有成本的（z18 的列目录可能有几万项），所以按根目录缓存一份，
+    /// 只在换数据集时重扫 —— `/tilejson.json` 与 `/preview` 不必每次请求都扫盘。
+    package struct RootMetadata {
+        package var zoomRange: ClosedRange<Int>?
+        package var start: (zoom: Int, x: Int, y: Int)?
+        package var tileSize: Int = 256
+
+        package init() {}
+    }
+
+    private var metadataRootPath: String?
+    private var metadataCache: RootMetadata?
+
+    /// 取（必要时重算）根目录元数据。锁内只做字典/指针级操作，扫盘在锁外。
+    func metadata(for root: URL?) -> RootMetadata {
+        guard let root else { return RootMetadata() }
+        lock.lock()
+        let cached = metadataRootPath == root.path ? metadataCache : nil
+        lock.unlock()
+        if let cached { return cached }
+
+        var fresh = RootMetadata()
+        fresh.zoomRange = Self.zoomRange(of: root)
+        fresh.start = Self.previewStart(of: root)
+        if let start = fresh.start,
+           let size = Self.tileSize(of: root, zoom: start.zoom, column: start.x, row: start.y) {
+            fresh.tileSize = size
+        }
+
+        lock.lock()
+        metadataRootPath = root.path
+        metadataCache = fresh
+        lock.unlock()
+        return fresh
+    }
+
+    /// 目录里实际存在的层级（只看根目录下的一层数字目录名，带条数上限）。
+    ///
+    /// 不给「全盘扫描」留口子：只枚举根目录，最多看 128 项，够用又不会在大数据集上卡住。
+    static func zoomRange(of root: URL?) -> ClosedRange<Int>? {
+        guard let root else { return nil }
+        let entries = (try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? []
+        var zooms: [Int] = []
+        for entry in entries.prefix(128) {
+            guard !entry.hasPrefix("."), !entry.hasPrefix("-"), let zoom = Int(entry),
+                  (0...30).contains(zoom) else { continue }
+            var isDirectory: ObjCBool = false
+            let path = root.appending(path: entry).path
+            guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
+                  isDirectory.boolValue else { continue }
+            zooms.append(zoom)
+        }
+        guard let lower = zooms.min(), let upper = zooms.max() else { return nil }
+        return lower...upper
+    }
+
+    /// 预览页的默认落点：取最高层级中「最中间」的那张瓦片，避免一打开就是空白边界。
+    static func previewStart(of root: URL) -> (zoom: Int, x: Int, y: Int)? {
+        guard let range = zoomRange(of: root) else { return nil }
+        let zoom = range.upperBound
+        let zoomURL = root.appending(path: String(zoom))
+        let columns = Self.numericEntries(at: zoomURL, limit: 4096)
+        guard !columns.isEmpty else { return nil }
+        let column = columns[columns.count / 2]
+        let rows = Self.tileRows(at: root, zoom: zoom, column: column, limit: 4096)
+        guard !rows.isEmpty else { return nil }
+        return (zoom, column, rows[rows.count / 2])
+    }
+
+    /// 取某个 `<z>/<x>` 目录里的行号（只认允许的图片后缀）。
+    private static func tileRows(at root: URL, zoom: Int, column: Int, limit: Int) -> [Int] {
+        let directory = root.appending(path: String(zoom)).appending(path: String(column))
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
+        var rows: [Int] = []
+        for name in names.prefix(limit) {
+            guard Self.allowedExtensions.contains((name as NSString).pathExtension.lowercased()) else { continue }
+            let stem = (name as NSString).deletingPathExtension
+            guard !stem.hasPrefix("-"), let row = Int(stem), row >= 0 else { continue }
+            rows.append(row)
+        }
+        return rows.sorted()
+    }
+
+    /// 目录下名字是纯数字的子目录，升序返回。
+    private static func numericEntries(at url: URL, limit: Int) -> [Int] {
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: url.path) else { return [] }
+        var values: [Int] = []
+        for name in names.prefix(limit) {
+            guard !name.hasPrefix("."), !name.hasPrefix("-"), let value = Int(name), value >= 0 else { continue }
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: url.appending(path: name).path, isDirectory: &isDirectory),
+                  isDirectory.boolValue else { continue }
+            values.append(value)
+        }
+        return values.sorted()
+    }
+
+    /// 从一张真实瓦片里嗅出瓦片边长（PNG 的 IHDR / JPEG 的 SOFn）。
+    ///
+    /// 报错尺寸会让外部编辑器整幅错位，所以宁可不报（返回 nil）也不猜。
+    static func tileSize(of root: URL, zoom: Int, column: Int, row: Int) -> Int? {
+        let directory = root.appending(path: String(zoom)).appending(path: String(column))
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else { return nil }
+        for name in names.prefix(64) {
+            let stem = (name as NSString).deletingPathExtension
+            guard Int(stem) == row else { continue }
+            let url = directory.appending(path: name)
+            guard let size = Self.imageSize(of: url), size.width == size.height, (16...4096).contains(size.width) else {
+                return nil
+            }
+            return size.width
+        }
+        return nil
+    }
+
+    /// 读文件头解析图片宽高：PNG 看 IHDR，JPEG 扫 SOFn 段。只读前 64 KB。
+    private static func imageSize(of url: URL) -> (width: Int, height: Int)? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        guard let head = try? handle.read(upToCount: 65536), head.count >= 24 else { return nil }
+        let bytes = [UInt8](head)
+        if bytes[0] == 0x89, bytes[1] == 0x50, bytes[2] == 0x4E, bytes[3] == 0x47 {
+            func be32(_ offset: Int) -> Int {
+                (Int(bytes[offset]) << 24) | (Int(bytes[offset + 1]) << 16)
+                    | (Int(bytes[offset + 2]) << 8) | Int(bytes[offset + 3])
+            }
+            guard bytes[12] == 0x49, bytes[13] == 0x48, bytes[14] == 0x44, bytes[15] == 0x52 else { return nil }
+            return (be32(16), be32(20))
+        }
+        if bytes[0] == 0xFF, bytes[1] == 0xD8 {
+            var index = 2
+            while index + 9 < bytes.count {
+                guard bytes[index] == 0xFF else { index += 1; continue }
+                let marker = bytes[index + 1]
+                // SOF0…SOF15（跳过 DHT/DAC/DRI 这些非 SOF 的 0xC4/0xC8/0xCC）。
+                if (0xC0...0xCF).contains(marker), marker != 0xC4, marker != 0xC8, marker != 0xCC {
+                    let height = (Int(bytes[index + 5]) << 8) | Int(bytes[index + 6])
+                    let width = (Int(bytes[index + 7]) << 8) | Int(bytes[index + 8])
+                    return (width, height)
+                }
+                // 其它段一律跳过：拿段长往后走，段长小于 2 说明文件已经乱了。
+                let length = (Int(bytes[index + 2]) << 8) | Int(bytes[index + 3])
+                guard length >= 2 else { return nil }
+                index += 2 + length
+            }
+        }
+        return nil
+    }
+
+    /// TileJSON 2.2：给 QGIS / MapLibre 这类工具直接「加一个源」用。
+    ///
+    /// `bounds` 只在能廉价拿到时给出：数据集的最高层级列目录过深（>4096 项）就直接省略这个可选字段，
+    /// 不用一次「为元数据而扫全盘」的代价换一个边界框。
+    package static func tileJSON(root: URL?, rootName: String, port: UInt16, metadata: RootMetadata) -> Data? {
+        var payload: [String: Any] = [
+            "tilejson": "2.2.0",
+            "name": rootName,
+            "scheme": "xyz",
+            "format": "png",
+            "tileSize": metadata.tileSize,
+            "attribution": "尺规 · 本地瓦片服务",
+            "tiles": ["http://127.0.0.1:\(port)/{z}/{x}/{y}.png"],
+        ]
+        if let range = metadata.zoomRange {
+            payload["minzoom"] = range.lowerBound
+            payload["maxzoom"] = range.upperBound
+        }
+        if let root, let start = metadata.start {
+            let columns = Self.numericEntries(at: root.appending(path: String(start.zoom)), limit: 4096)
+            let rows = Self.tileRows(at: root, zoom: start.zoom, column: start.x, limit: 4096)
+            if let minColumn = columns.first, let maxColumn = columns.last,
+               let minRow = rows.first, let maxRow = rows.last {
+                let n = Double(1 << min(start.zoom, 30))
+                let west = Double(minColumn) / n * 360 - 180
+                let east = Double(maxColumn + 1) / n * 360 - 180
+                let north = Self.latitude(row: Double(minRow), of: n)
+                let south = Self.latitude(row: Double(maxRow + 1), of: n)
+                payload["bounds"] = [west, south, east, north]
+            }
+        }
+        return try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+    }
+
+    /// Web 墨卡托行号 → 纬度。
+    private static func latitude(row: Double, of n: Double) -> Double {
+        let ratio = 1 - 2 * row / n
+        return atan(sinh(.pi * ratio)) * 180 / .pi
+    }
+
+    /// 自带预览页：不依赖网络（不引任何 CDN），拖拽平移、滚轮缩放，用来快速确认「服务真的通了」。
+    package static func previewHTML(
+        rootName: String,
+        start: (zoom: Int, x: Int, y: Int)?,
+        tileSize: Int
+    ) -> String {
+        let title = Self.escaped(rootName)
+        let startZoom = start?.zoom ?? 0
+        let startX = start?.x ?? 0
+        let startY = start?.y ?? 0
+        let startBlock: String
+        if start == nil {
+            startBlock = "document.getElementById('hint').textContent = '这个目录里没有找到瓦片。';"
+        } else {
+            startBlock = "view.z = \(startZoom); view.x = \(startX) + 0.5; view.y = \(startY) + 0.5; draw();"
+        }
+        return """
+        <!doctype html>
+        <html lang="zh-CN"><head><meta charset="utf-8"><title>预览 · \(title)</title>
+        <style>
+        html,body{margin:0;height:100%;overflow:hidden;background:#14161a;color:#e8eaed;
+        font:13px/1.6 -apple-system,system-ui,sans-serif}
+        #stage{position:absolute;inset:0;cursor:grab}
+        #stage.dragging{cursor:grabbing}
+        #stage img{position:absolute;width:\(tileSize)px;height:\(tileSize)px;user-select:none;-webkit-user-drag:none}
+        #hud{position:absolute;left:12px;top:12px;padding:6px 10px;border-radius:8px;
+        background:rgba(20,22,26,.72);backdrop-filter:blur(8px);pointer-events:none}
+        #hint{position:absolute;left:12px;bottom:12px;color:#9aa0a6}
+        </style></head>
+        <body>
+        <div id="stage"></div>
+        <div id="hud">\(title) · <span id="z">z\(startZoom)</span></div>
+        <div id="hint">拖拽平移 · 滚轮缩放</div>
+        <script>
+        const stage = document.getElementById('stage');
+        const size = \(tileSize);
+        const view = { z: \(startZoom), x: \(startX) + 0.5, y: \(startY) + 0.5 };
+        const pool = new Map();
+        function draw() {
+          const w = innerWidth, h = innerHeight, n = Math.pow(2, view.z);
+          const cx = view.x * size, cy = view.y * size;
+          const x0 = Math.floor((cx - w / 2) / size), x1 = Math.floor((cx + w / 2) / size);
+          const y0 = Math.floor((cy - h / 2) / size), y1 = Math.floor((cy + h / 2) / size);
+          const live = new Set();
+          for (let ty = y0; ty <= y1; ty++) {
+            for (let tx = x0; tx <= x1; tx++) {
+              if (tx < 0 || ty < 0 || tx >= n || ty >= n) continue;
+              const key = view.z + '/' + tx + '/' + ty;
+              live.add(key);
+              let img = pool.get(key);
+              if (!img) {
+                img = new Image();
+                img.decoding = 'async';
+                img.src = '/' + key + '.png';
+                pool.set(key, img);
+                stage.appendChild(img);
+              }
+              img.style.transform = 'translate(' + Math.round(tx * size - cx + w / 2) + 'px,'
+                + Math.round(ty * size - cy + h / 2) + 'px)';
+            }
+          }
+          for (const [key, img] of pool) {
+            if (!live.has(key)) { img.remove(); pool.delete(key); }
+          }
+          document.getElementById('z').textContent = 'z' + view.z;
+        }
+        let dragging = false, lastX = 0, lastY = 0;
+        stage.addEventListener('pointerdown', e => {
+          dragging = true; lastX = e.clientX; lastY = e.clientY;
+          stage.classList.add('dragging'); stage.setPointerCapture(e.pointerId);
+        });
+        stage.addEventListener('pointermove', e => {
+          if (!dragging) return;
+          view.x -= (e.clientX - lastX) / size; view.y -= (e.clientY - lastY) / size;
+          lastX = e.clientX; lastY = e.clientY; draw();
+        });
+        stage.addEventListener('pointerup', e => {
+          dragging = false; stage.classList.remove('dragging');
+          try { stage.releasePointerCapture(e.pointerId); } catch (_) {}
+        });
+        stage.addEventListener('wheel', e => {
+          e.preventDefault();
+          const step = e.deltaY < 0 ? 1 : -1;
+          const next = Math.min(24, Math.max(0, view.z + step));
+          if (next === view.z) return;
+          const factor = Math.pow(2, next - view.z);
+          view.x *= factor; view.y *= factor;
+          view.z = next; draw();
+        }, { passive: false });
+        addEventListener('resize', draw);
+        \(startBlock)
+        </script>
+        </body></html>
+        """
+    }
+
+    /// 拼 HTML 前的转义（目录名可能带 `&`、`<` 这类字符）。
+    private static func escaped(_ text: String) -> String {
+        text.replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
+    }
+
     static func indexHTML(rootName: String) -> String {
         """
         <!doctype html>
@@ -347,6 +669,8 @@ public final class LocalTileServer: @unchecked Sendable {
         <p><code>/{{z}}/{{x}}/{{y}}.png</code>（把前缀换成本机地址与端口）</p>
         <p>例：OSM 在线编辑器 iD → 背景设置 → 自定义 → 粘贴完整模板。</p>
         <p>只监听 127.0.0.1，只读，只响应瓦片路径。</p>
+        <p>本机自测入口：<a href="/preview">打开预览页</a> ·
+        元数据：<a href="/tilejson.json">/tilejson.json</a></p>
         </body></html>
         """
     }
