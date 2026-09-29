@@ -156,6 +156,14 @@ final class CanvasController {
     func zoomOut(anchor: CGPoint? = nil) { view?.zoomOut(anchor: anchor) }
     /// 调试用：把画布离屏渲染成 PNG（见 `EUCLID_DEBUG_SNAPSHOT`）。
     func snapshot(index: Int) { view?.writeDebugSnapshot(index: index) }
+    /// 调试用：把画布与窗口的几何打一行到 stderr（见 `EUCLID_DEBUG_FULLSCREEN`）。
+    func debugDumpGeometry(_ tag: String) { view?.debugDumpGeometry(tag) }
+    /// 调试用：切一次全屏，用来复现跟窗口状态有关的缺陷。
+    func debugToggleFullscreen() { view?.window?.toggleFullScreen(nil) }
+    /// 调试用：画布视图是否已经装进窗口（脚本要等它到位再动手）。
+    var debugHasWindow: Bool { view?.window != nil }
+    /// 调试用：窗口当前是不是全屏。
+    var debugIsFullscreen: Bool { view?.window?.styleMask.contains(.fullScreen) == true }
     func actualSize() { view?.zoomToActualSize() }
     /// 把当前画面渲染成位图（导出图片用）。
     func mapImage(includingMeasurements: Bool) -> CGImage? {

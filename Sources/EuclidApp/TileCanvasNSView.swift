@@ -67,6 +67,11 @@ final class TileCanvasNSView: NSView {
     private var awaitingExtent = false
     private var extentRect: CGRect?
     private var zoomBounds: ClosedRange<Double> = 0...30
+    /// 「按适配算出来」的缩放下限（不含铺图预算那一道收紧）。
+    ///
+    /// 视口尺寸一变就要重算缩放下限，而重算得拿这个「原始下限」当基准 ——
+    /// 直接拿收紧后的 `zoomBounds.lowerBound` 重算的话，窗口缩回去下限也松不回来。
+    private var zoomLowerBoundFromFit: Double = 0
     private var trackingArea: NSTrackingArea?
     /// 相机是否已经被放到过一个有意义的视野（用户平移缩放、或按数据范围适配过）。
     /// 用它区分「首次打开的内容」与「用户自己调好的视野」：前者可以自动适配，后者一律不许动。
@@ -129,6 +134,8 @@ final class TileCanvasNSView: NSView {
     /// 判断里，光这一下就吃掉双指平移每次事件 90 µs 里的五六十微秒，因此统一提前读成常量。
     private static let tracesScroll = ProcessInfo.processInfo.environment["EUCLID_TRACE_SCROLL"] != nil
     private static let tracesView = ProcessInfo.processInfo.environment["EUCLID_TRACE_VIEW"] != nil
+    private static let tracesLayers = ProcessInfo.processInfo.environment["EUCLID_TRACE_LAYERS"] != nil
+    private var lastLayerDump = Date.distantPast
     private static let reportsReadoutDuringPan =
         ProcessInfo.processInfo.environment["EUCLID_PAN_NO_REPORT"] == nil
     private static let debugSnapshotDirectory = ProcessInfo.processInfo.environment["EUCLID_DEBUG_SNAPSHOT"]
@@ -220,6 +227,7 @@ final class TileCanvasNSView: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        traceGeometryEvent(window == nil ? "摘出窗口" : "装入窗口")
         updateContentsScale()
         // 视图换窗口时先清掉上一次的订阅，避免重复注册。
         if let resignObserver { NotificationCenter.default.removeObserver(resignObserver) }
@@ -414,6 +422,10 @@ final class TileCanvasNSView: NSView {
     func setLayers(_ newLayers: [MapLayer], focus: CGRect?) {
         let hadContent = !stacks.isEmpty
         let previousScale = camera.groundMetersPerPoint
+        if Self.tracesLayers {
+            let names = newLayers.map { "\($0.id.prefix(6))/\($0.sourceKey.prefix(24))" }
+            traceGeometryEvent("setLayers 层数=\(newLayers.count) [\(names.joined(separator: " "))]")
+        }
         layers = newLayers
 
         // 删掉不再需要的层
@@ -455,6 +467,7 @@ final class TileCanvasNSView: NSView {
             stack.hostLayer.removeFromSuperlayer()
             layer_hostAdd(stack)
         }
+        syncHostLayerFrames()
 
         // 本地数据集的范围还没算出来时先不铺图：此时相机只能停在数据之外，
         // 铺出来只会是一屏空占位并白读磁盘（范围一到画面还要整体跳一次）。
@@ -485,6 +498,26 @@ final class TileCanvasNSView: NSView {
     /// 把图层栈插到测量标注之下。
     private func layer_hostAdd(_ stack: TileLayerStack) {
         layer?.insertSublayer(stack.hostLayer, below: overlay.hostLayer)
+    }
+
+    /// 让底色层与各瓦片栈的宿主图层都跟画布等大。
+    ///
+    /// 这件事**不能只在 `layout()` 里做**：图层栈是打开数据的那一刻才建的，而那时候窗口
+    /// 早就布局完了 —— 拖一个目录进来、或者从「最近打开」切一份数据，都不会再触发
+    /// AppKit 的 `layout()`。新建的宿主图层于是停在 0×0，它又是 `masksToBounds`，
+    /// 整层瓦片被裁得一片不剩：状态栏写着「已载入 858 片」、缩略图也有图，
+    /// 画面却只剩底色，看着就是「打开了却是全灰」。
+    ///
+    /// 因此每帧同步前都兜一次底，代价只是几次 frame 比较。
+    private func syncHostLayerFrames() {
+        let needsWork = backgroundLayer.frame != bounds
+            || stacks.values.contains { $0.hostLayer.frame != bounds }
+        guard needsWork else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        backgroundLayer.frame = bounds
+        for stack in stacks.values { stack.hostLayer.frame = bounds }
+        CATransaction.commit()
     }
 
     /// 依据当前激活的图层重配相机（瓦片边长、缩放上下限，以及可选的窗口适配）。
@@ -519,6 +552,7 @@ final class TileCanvasNSView: NSView {
         var lower = rect == nil
             ? min(zoomBounds.lowerBound, upper - 0.001)
             : min(max(-2, fitCamera.zoomLevel - 1.2), upper - 0.001)
+        zoomLowerBoundFromFit = lower
         // 主图层的最低数据层级比适配层级“深”很多时（整省 z12 之类的数据在「适应窗口」下就是这样），
         // 再往外缩一屏就要铺几千片，安全阀会把画布清空 —— 看着像数据没打开。
         // 把「一屏还铺得出来」的最低层级也算进缩放下限，宁可少看一点，也不留一屏空白。
@@ -531,6 +565,27 @@ final class TileCanvasNSView: NSView {
         lower = min(lower, upper - 0.001)
         zoomBounds = lower...upper
         camera = fitCamera.clamped(zoomLevelRange: zoomBounds)
+    }
+
+    /// 视口尺寸变了（进全屏、拉大窗口、从「适应窗口」回来）就按新视口重算缩放下限。
+    ///
+    /// 缩放下限里有一道来自铺图安全阀的收紧（见 `refreshCamera` 里对 `affordableCameraZoom`
+    /// 的调用），但那只在适配视野的那一刻算过一次，用的是当时的视口。进全屏之后视口变大，
+    /// 同一个层级一屏要铺的片数跟着涨，越过 `TileLayerStack.maximumTilesPerFrame` 之后
+    /// 每一帧都会走「清空画布」那条路 —— 画面就整屏空掉，而且**再也不会自己回来**：
+    /// 相机停在原地、视口也不再变，之后每一帧都还是超预算。
+    ///
+    /// 所以每次视口尺寸变化都重算一遍，把相机夹回「一屏还铺得出来」的范围。窗口缩回去
+    /// 时限界也跟着松回来（`zoomLowerBoundFromFit` 那一步就是为此留的）。
+    private func adoptZoomBoundsToViewport() {
+        guard let primary = primaryStack else { return }
+        let affordable = primary.affordableCameraZoom(
+            viewportSize: bounds.size, displayScale: displayScale
+        )
+        let lower = min(max(zoomLowerBoundFromFit, affordable), zoomBounds.upperBound - 0.001)
+        guard abs(lower - zoomBounds.lowerBound) > 0.0005 else { return }
+        zoomBounds = lower...zoomBounds.upperBound
+        camera = camera.clamped(zoomLevelRange: zoomBounds)
     }
 
     /// 画布是自绘的，给读屏一个可读的名字与当前层级。
@@ -646,8 +701,10 @@ final class TileCanvasNSView: NSView {
 
     override func layout() {
         super.layout()
+        traceGeometryEvent("layout")
         guard bounds.width > 1, bounds.height > 1 else { return }
         camera.viewportSize = bounds.size
+        adoptZoomBoundsToViewport()
         camera = camera.clamped(zoomLevelRange: zoomBounds)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -721,6 +778,9 @@ final class TileCanvasNSView: NSView {
         }
         guard bounds.width > 1, bounds.height > 1 else { return }
         camera.viewportSize = bounds.size
+        adoptZoomBoundsToViewport()
+        // 新建的图层栈可能还没被 `layout()` 量过尺寸（拖放 / 切数据都不会再触发它）。
+        syncHostLayerFrames()
         for stack in stacks.values { stack.updateSortCenter(camera.center) }
         // 拖窗口期间先不做预取这类后台活；拖动视图时反过来要预取，边上才有图。
         for stack in stacks.values {
@@ -768,10 +828,100 @@ final class TileCanvasNSView: NSView {
 
         refreshOverlay()
         for frame in frames { Self.traceView(layer: frame, camera: camera, zoomBounds: zoomBounds) }
+        dumpLayersIfRequested()
         reportTileStats(loadedTiles: loadedTiles, missingTiles: missingTiles, loadsTiles: loadsTiles)
         reportViewport(visibleTiles: visibleTiles)
         traceDetail = "需要 \(visibleTiles) 片 · 已上屏 \(loadedTiles) · 缺 \(missingTiles)"
         setAccessibilityValue("z\(currentDataZoom)")
+    }
+
+    /// 调试用（`EUCLID_TRACE_LAYERS=1`）：每秒打一次图层树的关键几何，定位「有图却看不见」。
+    private func dumpLayersIfRequested() {
+        guard Self.tracesLayers, Date().timeIntervalSince(lastLayerDump) > 1 else { return }
+        lastLayerDump = Date()
+        var lines: [String] = []
+        lines.append(String(
+            format: "[layers-dump] 画布=%.0fx%.0f 相机中心=(%.5f,%.5f) z=%.2f 每世界单位=%.0fpt 视口=(%.0fx%.0f) 背景层=%@",
+            bounds.width, bounds.height, camera.center.x, camera.center.y,
+            camera.zoomLevel, camera.pixelsPerWorldUnit,
+            camera.viewportSize.width, camera.viewportSize.height,
+            backgroundLayer.isHidden ? "隐藏" : "显示"
+        ))
+        for (id, stack) in stacks {
+            let tiles = stack.debugTileLayerSummary()
+            lines.append(
+                "[layers-dump] 层 \(id.prefix(6)) \(stack.name) 装配=\(stack.isActive ? "是" : "否")"
+                    + " 隐藏=\(stack.hostLayer.isHidden ? "是" : "否")"
+                    + " 不透明=\(String(format: "%.2f", stack.hostLayer.opacity))"
+                    + " 父层=\(stack.hostLayer.superlayer != nil ? "有" : "无")"
+                    + " frame=\(Self.describe(stack.hostLayer.frame))"
+                    + " 网格=\(stack.grid.kind.rawValue)"
+                    + " 瓦片数=\(tiles.count) 有图=\(tiles.withImage)"
+                    + " x=\(Self.describe(tiles.xRange)) y=\(Self.describe(tiles.yRange))"
+                    + " 尺寸=\(Self.describe(tiles.sizeRange))"
+            )
+        }
+        FileHandle.standardError.write(Data((lines.joined(separator: "\n") + "\n").utf8))
+    }
+
+    private static func describe(_ range: ClosedRange<Double>?) -> String {
+        guard let range else { return "无" }
+        return String(format: "%.0f…%.0f", range.lowerBound, range.upperBound)
+    }
+
+    private static func describe(_ range: ClosedRange<CGFloat>?) -> String {
+        guard let range else { return "无" }
+        return String(format: "%.0f…%.0f", range.lowerBound, range.upperBound)
+    }
+
+    private static func describe(_ rect: CGRect) -> String {
+        String(format: "(%.0f,%.0f %.0fx%.0f)", rect.origin.x, rect.origin.y, rect.width, rect.height)
+    }
+
+    /// 调试用（`EUCLID_TRACE_LAYERS=1`）：记一次会改变画布几何的事件。
+    ///
+    /// 「打开数据后全灰」这类缺陷的现场全在窗口几何上，而 `syncLayers()` 只会在需要重铺时
+    /// 被调用 —— 光看有没有重铺日志，分不清「AppKit 没来 `layout()`」还是「来了但没铺上」。
+    /// 这里在每一次几何事件上无条件留一行，答案就唯一了。
+    private func traceGeometryEvent(_ event: String) {
+        guard Self.tracesLayers else { return }
+        NSLog("[geom-event] %@ 视图 %@ bounds=%@ 窗口=%@ 全屏=%@",
+              event, Self.describe(frame), Self.describe(bounds),
+              window == nil ? "无" : Self.describe(window!.frame),
+              window?.styleMask.contains(.fullScreen) == true ? "是" : "否")
+    }
+
+    /// 调试用：把画布、窗口与各图层栈的几何整体打一遍（`EUCLID_DEBUG_FULLSCREEN` 脚本会调）。
+    func debugDumpGeometry(_ tag: String) {
+        let windowText: String
+        if let window {
+            windowText = String(
+                format: "窗口=%@ 全屏=%@ 缩放=%.1f",
+                Self.describe(window.frame),
+                window.styleMask.contains(.fullScreen) ? "是" : "否",
+                Double(window.backingScaleFactor)
+            )
+        } else {
+            windowText = "窗口=无"
+        }
+        var lines = [String]()
+        lines.append(String(
+            format: "[geom] %@ 视图=%@ bounds=%@ %@ 底色层=%@",
+            tag, Self.describe(frame), Self.describe(bounds), windowText,
+            Self.describe(backgroundLayer.frame)
+        ))
+        for (id, stack) in stacks {
+            let tiles = stack.debugTileLayerSummary()
+            lines.append(String(
+                format: "[geom] %@ 层 %@ %@ 父层=%@ frame=%@ 有图=%d/%d z=%.2f 视口=%.0fx%.0f",
+                tag, String(id.prefix(6)), stack.name,
+                stack.hostLayer.superlayer != nil ? "有" : "无",
+                Self.describe(stack.hostLayer.frame),
+                tiles.withImage, tiles.count, camera.zoomLevel,
+                camera.viewportSize.width, camera.viewportSize.height
+            ))
+        }
+        FileHandle.standardError.write(Data((lines.joined(separator: "\n") + "\n").utf8))
     }
 
     /// 瓦片读数是给状态栏看的，手势期间它本来也没在变，别白刷一次界面。

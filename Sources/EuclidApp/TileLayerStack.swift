@@ -107,6 +107,15 @@ final class TileLayerStack {
     /// 每格瓦片向外撑出的量（点）：一半像素左右刚好盖住图层边缘的采样渗色。
     private static let tileSeamOverlap: CGFloat = 0.5
 
+    /// 调试用（`EUCLID_TRACE_LAYERS=1`）：把这一层的装配 / 清空 / 提前退出打到 stderr。
+    private static let tracesLayers =
+        ProcessInfo.processInfo.environment["EUCLID_TRACE_LAYERS"] != nil
+
+    private func traceStack(_ text: String) {
+        guard Self.tracesLayers else { return }
+        FileHandle.standardError.write(Data("[stack] \(text)\n".utf8))
+    }
+
     init() {
         hostLayer.isGeometryFlipped = true
         hostLayer.masksToBounds = true
@@ -132,6 +141,7 @@ final class TileLayerStack {
         generation += 1
         cancelRequests()
         removeAllLayers()
+        traceStack("configure 名称=\(name) 层级=\(zoomRange.lowerBound)…\(zoomRange.upperBound)")
         provider = TileProvider(
             source: source,
             memoryLimitBytes: memoryLimitBytes,
@@ -152,6 +162,7 @@ final class TileLayerStack {
         generation += 1
         cancelRequests()
         removeAllLayers()
+        traceStack("clear 名称=\(name)")
         provider = nil
         name = ""
         isActive = false
@@ -202,6 +213,7 @@ final class TileLayerStack {
     }
 
     private func removeAllLayers() {
+        traceStack("清空全部瓦片层（原有 \(tileLayers.count) 片）")
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         for layer in tileLayers.values { layer.removeFromSuperlayer() }
@@ -232,6 +244,10 @@ final class TileLayerStack {
     ) -> TileLayerFrame? {
         scale = CGFloat(displayScale)
         guard let provider, viewportSize.width > 1, viewportSize.height > 1 else {
+            traceStack(
+                "sync 提前退出：provider=\(provider == nil ? "无" : "有")"
+                    + " 视口=\(Int(viewportSize.width))x\(Int(viewportSize.height))"
+            )
             removeAllLayers()
             return nil
         }
@@ -241,6 +257,7 @@ final class TileLayerStack {
         let offset = worldOffset(for: camera)
         let rangeCamera = self.rangeCamera(camera, offset: offset)
         guard let range = grid.tileRange(zoom: zoom, worldRect: rangeCamera.visibleWorldRect) else {
+            traceStack("sync 算不出瓦片范围：z=\(zoom)")
             return nil
         }
         let columns = range.columns
@@ -248,6 +265,7 @@ final class TileLayerStack {
         let total = columns.count * rows.count
         guard total <= Self.maximumTilesPerFrame else {
             // 超出安全阀时宁可清空，也不要留着上一帧的残影误导判读。
+            traceStack("sync 超出安全阀：要铺 \(total) 片 > \(Self.maximumTilesPerFrame)")
             removeAllLayers()
             return TileLayerFrame(name: name, zoom: zoom, needed: total, loaded: 0,
                                   fallback: 0, missing: missingTiles.count, tileDisplaySize: 0)
@@ -627,6 +645,34 @@ final class TileLayerStack {
               CFGetTypeID(contents as CFTypeRef) == CGImage.typeID else { return nil }
         // 上面已经用 CFTypeID 核对过类型，这里的桥接是确定的（`as?` 反而会被编译器判为恒成立）。
         return (contents as! CGImage)
+    }
+
+    /// 调试用：当前瓦片图层的几何概况（`EUCLID_TRACE_LAYERS` 时打到 stderr）。
+    func debugTileLayerSummary() -> (
+        count: Int, withImage: Int,
+        xRange: ClosedRange<Double>?, yRange: ClosedRange<Double>?,
+        sizeRange: ClosedRange<Double>?
+    ) {
+        guard !tileLayers.isEmpty else { return (0, 0, nil, nil, nil) }
+        var minX = Double.greatestFiniteMagnitude
+        var maxX = -Double.greatestFiniteMagnitude
+        var minY = Double.greatestFiniteMagnitude
+        var maxY = -Double.greatestFiniteMagnitude
+        var minSide = Double.greatestFiniteMagnitude
+        var maxSide = -Double.greatestFiniteMagnitude
+        var withImage = 0
+        for layer in tileLayers.values {
+            let frame = layer.frame
+            minX = min(minX, frame.minX); maxX = max(maxX, frame.maxX)
+            minY = min(minY, frame.minY); maxY = max(maxY, frame.maxY)
+            minSide = min(minSide, Double(min(frame.width, frame.height)))
+            maxSide = max(maxSide, Double(max(frame.width, frame.height)))
+            if Self.contentsImage(of: layer) != nil { withImage += 1 }
+        }
+        return (
+            tileLayers.count, withImage,
+            minX...maxX, minY...maxY, minSide...maxSide
+        )
     }
 
     /// 把图片装进格子：来源可能是自己，也可能是祖先（按 `contentsRect` 裁出对应子区域）。

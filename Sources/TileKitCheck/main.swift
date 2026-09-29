@@ -2206,6 +2206,29 @@ let wideAffordable = TileBudget.affordableZoomLevel(
     minimumDataZoom: 12, maximumTiles: 1200
 )
 expect(wideAffordable > affordable, "视口大一倍时下限应更高（更靠近数据最低层级）")
+// 进全屏（或把窗口拉大）之后，同一个缩放下要铺的片数会跟着涨：1728×1060 点的全屏画布
+// 沿用窗口态那一档下限（z10.14）时要铺约 1475 片，越过 1200 的安全阀 ——
+// 这正是「全屏一下画面整屏变灰、而且再也不会自己回来」的成因。
+// 视口变大后重算下限，片数必须重新落回安全阀以内。
+let fullscreenViewport = CGSize(width: 1728, height: 1060)
+let tilesAtWindowFit = TileBudget.tilesPerScreen(
+    viewportSize: fullscreenViewport, tilePixelSize: 256, displayScale: 2,
+    cameraZoom: affordable, dataZoom: 12
+)
+expect(tilesAtWindowFit > 1200,
+       "全屏画布沿用窗口态下限应越过安全阀（实际 \(tilesAtWindowFit)）—— 这就是整屏变灰的成因")
+let fullscreenAffordable = TileBudget.affordableZoomLevel(
+    viewportSize: fullscreenViewport, tilePixelSize: 256, displayScale: 2,
+    minimumDataZoom: 12, maximumTiles: 1200
+)
+expect(fullscreenAffordable > affordable, "视口变大后「一屏还铺得出来」的下限必须上抬")
+expectClose(fullscreenAffordable, 10.5, accuracy: 0.05, "福建全省 z12 在 1728×1060 全屏画布下的最低可铺层级")
+let tilesAtFullscreenFloor = TileBudget.tilesPerScreen(
+    viewportSize: fullscreenViewport, tilePixelSize: 256, displayScale: 2,
+    cameraZoom: fullscreenAffordable, dataZoom: 12
+)
+expect(tilesAtFullscreenFloor <= 1200,
+       "全屏下限的一屏片数应在安全阀以内（实际 \(tilesAtFullscreenFloor)）")
 // 退化输入不许崩、不许返回 NaN。
 expectClose(
     TileBudget.affordableZoomLevel(
@@ -2426,11 +2449,12 @@ do {
 
 // MARK: - 真实 zip 数据集（挂了福建数据盘时才跑）
 
-/// 真机数据：`/Volumes/Samsung/福建省瓦片`（可用 `EUCLID_ZIP_ROOT` 换到别处）。
+/// 真机数据：数据盘上的「福建省瓦片」目录（默认 `/Volumes/数据盘/福建省瓦片`，
+/// 可用 `EUCLID_ZIP_ROOT` 指向别处）。
 ///
 /// 这些期望值来自 manifest.json 与已知的下载结果（z12：1 卷 2772 片；z18：仍在下载）。
 let fujianRoot = URL(fileURLWithPath: ProcessInfo.processInfo.environment["EUCLID_ZIP_ROOT"]
-    ?? "/Volumes/Samsung/福建省瓦片")
+    ?? "/Volumes/数据盘/福建省瓦片")
 
 if FileManager.default.fileExists(atPath: fujianRoot.appending(path: "manifest.json").path(percentEncoded: false)) {
     section("真实 zip 数据集：\(fujianRoot.lastPathComponent)")

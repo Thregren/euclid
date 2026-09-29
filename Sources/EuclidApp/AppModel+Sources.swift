@@ -303,6 +303,7 @@ extension AppModel {
                 canvas.refreshOverlay()
             }
             DebugZoomScript.runIfRequested(canvas: canvas)
+            DebugFullscreenScript.runIfRequested(canvas: canvas)
             return
         }
 
@@ -348,6 +349,7 @@ extension AppModel {
                 canvas.refreshOverlay()
             }
             DebugZoomScript.runIfRequested(canvas: canvas)
+            DebugFullscreenScript.runIfRequested(canvas: canvas)
         }
     }
 

@@ -105,6 +105,48 @@ enum DebugZoomScript {
     }
 }
 
+/// 开发调试用的全屏脚本。
+///
+/// `EUCLID_DEBUG_FULLSCREEN=<秒>` 时，启动后第 N 秒切一次全屏，并在切换前后各打一遍
+/// 画布 / 窗口 / 图层几何到 stderr；用来复现「进全屏后画面变灰」这类只和窗口状态有关的缺陷。
+/// 正式使用不会触发。
+@MainActor
+enum DebugFullscreenScript {
+    static func runIfRequested(canvas: CanvasController) {
+        guard let raw = ProcessInfo.processInfo.environment["EUCLID_DEBUG_FULLSCREEN"],
+              let delay = Double(raw) else { return }
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(delay))
+            // 视图可能还没挂上窗口（启动时脚本跑得早）：每 0.5 秒看一次，最多等 10 秒。
+            for _ in 0..<20 where !canvas.debugHasWindow {
+                try? await Task.sleep(for: .seconds(0.5))
+            }
+            guard canvas.debugHasWindow else {
+                FileHandle.standardError.write(Data("[geom] 画布没有窗口，全屏脚本跳过\n".utf8))
+                return
+            }
+            // 系统会恢复上次退出时的全屏状态：先从全屏退出来，保证复现的是「窗口 → 全屏」这条路。
+            if canvas.debugIsFullscreen {
+                canvas.debugToggleFullscreen()
+                try? await Task.sleep(for: .seconds(4))
+                // 窗口态的「适应窗口」会把相机放到这一档的缩放下限上，正是用户平时的起点。
+                canvas.fit()
+                try? await Task.sleep(for: .seconds(2))
+                canvas.debugDumpGeometry("退回窗口后")
+            }
+            canvas.debugDumpGeometry("全屏前")
+            canvas.debugToggleFullscreen()
+            // 三次采样：切换动画刚结束、稳定后、以及再等一会儿，看画面会不会自己回来。
+            try? await Task.sleep(for: .seconds(2))
+            canvas.debugDumpGeometry("全屏后 2 秒")
+            try? await Task.sleep(for: .seconds(3))
+            canvas.debugDumpGeometry("全屏后 5 秒")
+            try? await Task.sleep(for: .seconds(4))
+            canvas.debugDumpGeometry("全屏后 9 秒")
+        }
+    }
+}
+
 /// 开发调试用的自动下载脚本。
 ///
 /// `EUCLID_DEBUG_DOWNLOAD="<URL 模板>|<西>,<南>,<东>,<北>|<最小层级>|<最大层级>|<输出目录>"`
