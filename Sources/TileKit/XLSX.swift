@@ -34,7 +34,9 @@ public enum XLSX {
     }
 
     /// 生成工作簿。
-    public static func workbook(sheets: [Sheet]) -> Data {
+    ///
+    /// - Throws: 内容超过 ZIP32 上限时抛 `ZIPError.tooLarge`（工作表极大时才会遇到）。
+    public static func workbook(sheets: [Sheet]) throws -> Data {
         let usable = sheets.isEmpty ? [Sheet(name: "Sheet1", rows: [])] : sheets
         var parts: [(name: String, data: Data)] = []
 
@@ -46,7 +48,7 @@ public enum XLSX {
         for (index, sheet) in usable.enumerated() {
             parts.append(("xl/worksheets/sheet\(index + 1).xml", data(worksheet(sheet, index: index))))
         }
-        return ZIP.stored(parts)
+        return try ZIP.stored(parts)
     }
 
     // MARK: - 部件
@@ -259,11 +261,34 @@ public enum XLSX {
 /// OOXML 允许成员以 store 方式存放，所以压缩是可选的；但表格 XML 里同名字段成片重复，
 /// 几千行导出时压完常常只剩两三成，值得走一趟。压缩用的是系统 `Compression`，
 /// 不引入任何第三方库。
+
+/// ZIP 打包失败的原因。
+///
+/// 只保留一种：内容超出了 ZIP32 能表达的字段上限。本文件不生成 ZIP64，
+/// 与其静默把长度字段截断成一个写着错误长度的包，不如当场报错让调用方处理。
+public enum ZIPError: Error, Equatable, CustomStringConvertible {
+    /// 单个成员超过 4 GB、总偏移超过 4 GB，或者条目数超过 65535。
+    case tooLarge
+
+    public var description: String {
+        switch self {
+        case .tooLarge: return "内容超过 ZIP 上限（单个成员或总长度超过 4 GB，或条目数超过 65535）"
+        }
+    }
+}
+
 public enum ZIP {
     /// 打包。
     ///
     /// - Parameter compress: 是否尝试 deflate（默认尝试；单个成员压完更大时自动改存）。
-    public static func stored(_ entries: [(name: String, data: Data)], compress: Bool = true) -> Data {
+    /// - Throws: 内容超过 ZIP32 上限时抛 `ZIPError.tooLarge`。
+    ///
+    /// 长度字段一律用 `UInt32(exactly:)` 换算：换算不出来就报错，绝不截断。
+    public static func stored(
+        _ entries: [(name: String, data: Data)],
+        compress: Bool = true
+    ) throws -> Data {
+        guard entries.count <= Int(UInt16.max) else { throw ZIPError.tooLarge }
         var output = Data()
         var directory = Data()
         // 固定为 2000-01-01 00:00:00 的 DOS 时间戳，保证输出可复现。
@@ -272,6 +297,7 @@ public enum ZIP {
 
         for entry in entries {
             let nameData = Data(entry.name.utf8)
+            guard nameData.count <= Int(UInt16.max) else { throw ZIPError.tooLarge }
             let checksum = crc32(entry.data)
             // 压完不比原样小就用存储：小部件（几百字节的 rels）本来就没什么余量，
             // 压缩后反而多几十字节的头。
@@ -279,9 +305,10 @@ public enum ZIP {
             let useDeflate = deflated.map { $0.count < entry.data.count } ?? false
             let payload = useDeflate ? (deflated ?? entry.data) : entry.data
             let method: UInt16 = useDeflate ? 8 : 0
-            let size = UInt32(entry.data.count)
-            let packedSize = UInt32(payload.count)
-            let offset = UInt32(output.count)
+            guard let size = UInt32(exactly: entry.data.count),
+                  let packedSize = UInt32(exactly: payload.count),
+                  let offset = UInt32(exactly: output.count)
+            else { throw ZIPError.tooLarge }
 
             output.appendLittleEndian(UInt32(0x0403_4B50))
             output.appendLittleEndian(UInt16(20))
@@ -317,26 +344,37 @@ public enum ZIP {
             directory.append(nameData)
         }
 
-        let directoryOffset = UInt32(output.count)
+        guard let directoryOffset = UInt32(exactly: output.count),
+              let directorySize = UInt32(exactly: directory.count)
+        else { throw ZIPError.tooLarge }
         output.append(directory)
         output.appendLittleEndian(UInt32(0x0605_4B50))
         output.appendLittleEndian(UInt16(0))
         output.appendLittleEndian(UInt16(0))
         output.appendLittleEndian(UInt16(entries.count))
         output.appendLittleEndian(UInt16(entries.count))
-        output.appendLittleEndian(UInt32(directory.count))
+        output.appendLittleEndian(directorySize)
         output.appendLittleEndian(directoryOffset)
         output.appendLittleEndian(UInt16(0))
         return output
     }
 
+    /// CRC-32（IEEE 802.3，与 ZIP 的校验和一致）。
+    ///
+    /// 查表法：逐位循环在几千行导出时要跑上亿次内层迭代，查表后每字节一次查表加一次异或，
+    /// 同样的字节数快一个数量级。表是纯函数、只算一次，`static let` 天然线程安全。
+    private static let crcTable: [UInt32] = (0..<256).map { index -> UInt32 in
+        var value = UInt32(index)
+        for _ in 0..<8 {
+            value = (value & 1) == 1 ? (value >> 1) ^ 0xEDB8_8320 : value >> 1
+        }
+        return value
+    }
+
     public static func crc32(_ data: Data) -> UInt32 {
         var crc: UInt32 = 0xFFFF_FFFF
         for byte in data {
-            crc ^= UInt32(byte)
-            for _ in 0..<8 {
-                crc = (crc & 1) == 1 ? (crc >> 1) ^ 0xEDB8_8320 : crc >> 1
-            }
+            crc = (crc >> 8) ^ crcTable[Int((crc ^ UInt32(byte)) & 0xFF)]
         }
         return crc ^ 0xFFFF_FFFF
     }

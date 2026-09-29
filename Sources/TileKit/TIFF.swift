@@ -197,6 +197,13 @@ package enum TIFFLimits {
     package static let maximumChunkPixels = 1 << 26
     /// 允许的最大边长（宽松值，主要拦明显荒谬的数字）。
     package static let maximumChunkSide = 1_000_000
+    /// 单个目录项允许声明的最大字节数。
+    ///
+    /// 条目里的 `count` 完全来自文件，而解析时会照着它去读一整块数据。一个损坏
+    /// （或恶意写出）的 IFD 声称「这个条目有十亿个元素」，就能让应用按天文数字申请内存。
+    /// 合法的地理标签、分块表与色彩表都远小于这个数（最大的常见项是 16 位调色板，384 KB），
+    /// 因此 64 MB 既宽松又足够把「声明出来的天文数字」挡在门外。
+    package static let maximumEntryBytes = 64 << 20
 
     package static func isSaneChunk(width: Int, height: Int) -> Bool {
         guard width > 0, height > 0 else { return false }
@@ -210,7 +217,8 @@ package enum TIFFLimits {
 /// 按偏移读字节的小工具（解码时反复用到，所以保留一个句柄）。
 package final class TIFFSourceFile: @unchecked Sendable {
     private let handle: FileHandle
-    private let lock = NSLock()
+    private let closeLock = NSLock()
+    private var isClosed = false
     let byteCount: Int
 
     init(url: URL) throws {
@@ -219,18 +227,36 @@ package final class TIFFSourceFile: @unchecked Sendable {
         byteCount = size ?? 0
     }
 
+    /// 按偏移读一段字节；读不满或出错返回 nil。
+    ///
+    /// 用 `pread` 而不是「seek + read」：句柄的读写位置是所有线程共享的，
+    /// 而这里被多个解码线程同时用（拖动时一块几十 MB 的条带会把别的读全堵住）。
+    /// `pread` 不依赖句柄状态，因此不需要加锁排队。
     package func read(offset: Int, count: Int) -> Data? {
-        guard offset >= 0, count > 0 else { return nil }
-        lock.lock()
-        defer { lock.unlock() }
-        guard (try? handle.seek(toOffset: UInt64(offset))) != nil else { return nil }
-        return try? handle.read(upToCount: count)
+        guard offset >= 0, count > 0, offset <= Int.max - count else { return nil }
+        var data = Data(count: count)
+        var total = 0
+        let descriptor = handle.fileDescriptor
+        data.withUnsafeMutableBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            while total < count {
+                let read = pread(descriptor, base.advanced(by: total), count - total, off_t(offset + total))
+                if read <= 0 { break }
+                total += read
+            }
+        }
+        guard total > 0 else { return nil }
+        return total == count ? data : data.prefix(total)
     }
 
     func close() {
-        lock.lock()
-        defer { lock.unlock() }
-        try? handle.close()
+        // 只关一次：重复 `close` 会把文件描述符号还给系统，
+        // 而那个号码可能已经被别的 `open` 拿去用了（等于关掉别人的文件）。
+        closeLock.lock()
+        let shouldClose = !isClosed
+        isClosed = true
+        closeLock.unlock()
+        if shouldClose { try? handle.close() }
     }
 }
 
@@ -328,7 +354,12 @@ public enum TIFFReader {
         guard let header = reader.read(offset: offset, count: countSize), header.count == countSize else {
             throw TIFFError.truncated
         }
-        let entryCount = Int(isBigTIFF ? header.u64(at: 0, order: order) : UInt64(header.u16(at: 0, order: order)))
+        // `Int(_:)` 对超出范围的值是直接 trap（BigTIFF 的 64 位条目数轻易就能越界），
+        // 所以先走一遍可失败转换，再判范围。
+        let rawEntryCount = isBigTIFF
+            ? header.u64(at: 0, order: order)
+            : UInt64(header.u16(at: 0, order: order))
+        guard let entryCount = Int(exactly: rawEntryCount) else { throw TIFFError.truncated }
         guard entryCount > 0, entryCount < 4096 else { throw TIFFError.truncated }
         guard let block = reader.read(offset: offset + countSize, count: entryCount * entrySize + (isBigTIFF ? 8 : 4)) else {
             throw TIFFError.truncated
@@ -340,14 +371,24 @@ public enum TIFFReader {
             let base = index * entrySize
             let tag = Int(block.u16(at: base, order: order))
             let type = Int(block.u16(at: base + 2, order: order))
-            let count = Int(isBigTIFF ? block.u64(at: base + 4, order: order) : UInt64(block.u32(at: base + 4, order: order)))
+            let rawCount = isBigTIFF
+                ? block.u64(at: base + 4, order: order)
+                : UInt64(block.u32(at: base + 4, order: order))
+            let count = Int(exactly: rawCount) ?? Int.max
             let valueStart = base + (isBigTIFF ? 12 : 8)
-            let byteSize = size(ofType: type) * count
+            guard let byteSize = entryByteSize(type: type, count: count) else {
+                throw TIFFError.unsupported("目录项 \(tag) 声明了不可信的数据长度（\(count) 个元素）")
+            }
             var inline: [UInt8] = []
             for i in 0..<inlineSize where valueStart + i < block.count {
                 inline.append(block[block.startIndex + valueStart + i])
             }
-            let offsetValue = Int(isBigTIFF ? block.u64(at: valueStart, order: order) : UInt64(block.u32(at: valueStart, order: order)))
+            let rawOffset = isBigTIFF
+                ? block.u64(at: valueStart, order: order)
+                : UInt64(block.u32(at: valueStart, order: order))
+            guard let offsetValue = Int(exactly: rawOffset) else {
+                throw TIFFError.unsupported("目录项 \(tag) 的数据偏移超出可表示范围")
+            }
             entries[tag] = Entry(
                 tag: tag,
                 type: type,
@@ -360,9 +401,12 @@ public enum TIFFReader {
 
         // 注意：`block` 是从「条目数」之后开始读的，所以下一个 IFD 的偏移就在所有条目之后。
         let nextOffset = entryCount * entrySize
-        let next = Int(isBigTIFF
+        let rawNext = isBigTIFF
             ? block.u64(at: nextOffset, order: order)
-            : UInt64(block.u32(at: nextOffset, order: order)))
+            : UInt64(block.u32(at: nextOffset, order: order))
+        guard let next = Int(exactly: rawNext) else {
+            throw TIFFError.unsupported("目录链的偏移超出可表示范围")
+        }
 
         func entry(_ tag: Int) -> Entry? { entries[tag] }
         func ints(_ tag: Int) -> [Int] {
@@ -462,6 +506,17 @@ public enum TIFFReader {
         case 5, 10, 12, 16, 17, 18: return 8
         default: return 1
         }
+    }
+
+    /// 目录项声明的数据长度；溢出或超出可信上限时返回 nil。
+    ///
+    /// 这一层是「文件说了算的数字」与「内存分配」之间唯一的闸门：`count` 来自文件，
+    /// 而下游会照 `byteSize` 申请缓冲区（见 `rawBytes(of:)`）。
+    private static func entryByteSize(type: Int, count: Int) -> Int? {
+        guard count >= 0 else { return nil }
+        let (bytes, overflow) = size(ofType: type).multipliedReportingOverflow(by: count)
+        guard !overflow, bytes <= TIFFLimits.maximumEntryBytes else { return nil }
+        return bytes
     }
 
     /// 取出一个目录项的值（统一成 Double）。

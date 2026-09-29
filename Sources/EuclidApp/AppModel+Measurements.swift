@@ -54,10 +54,12 @@ enum MeasurementExportFormat: String, CaseIterable, Identifiable {
     }
 
     /// 导出用的字节内容。
-    func data(_ measurements: [GeoMeasurement], datasetName: String? = nil) -> Data {
+    ///
+    /// - Throws: Excel 超过 ZIP32 上限时抛 `ZIPError.tooLarge`。文本格式不会抛。
+    func data(_ measurements: [GeoMeasurement], datasetName: String? = nil) throws -> Data {
         switch self {
         case .excel:
-            return MeasurementExporter.excel(measurements, datasetName: datasetName)
+            return try MeasurementExporter.excel(measurements, datasetName: datasetName)
         default:
             return Data(render(measurements).utf8)
         }

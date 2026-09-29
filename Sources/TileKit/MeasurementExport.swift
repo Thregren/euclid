@@ -232,12 +232,14 @@ public enum MeasurementExporter {
     // MARK: - Excel
 
     /// 导出为 xlsx：汇总、点坐标、分段明细三张表，外加一页说明。
+    ///
+    /// - Throws: 内容超过 ZIP32 上限时抛 `ZIPError.tooLarge`。
     public static func excel(
         _ measurements: [GeoMeasurement],
         datasetName: String? = nil,
         exportedAt: Date = Date()
-    ) -> Data {
-        XLSX.workbook(sheets: [
+    ) throws -> Data {
+        try XLSX.workbook(sheets: [
             summarySheet(measurements),
             vertexSheet(measurements),
             segmentSheet(measurements),

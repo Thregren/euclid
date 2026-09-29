@@ -201,23 +201,38 @@ private final class ChunkStore {
         let rowBytes = level.chunkWidth * samplesPerPixel * bytesPerSample
         let capacity = level.chunkHeight * rowBytes
 
+        // 数据块比声明的短时，编解码器会补零把长度凑够（否则调用方按块尺寸索引会越界）。
+        // 补齐本身是对的，但「这个块是坏的」必须留下痕迹：以前它是完全静默的，
+        // 画面上只是那一块发黑，查起来毫无线索。
+        let reportShort: (String) -> (Int) -> Void = { [file] codec in
+            { produced in
+                TIFFDiagnostics.record(
+                    message: "第 \(index) 块的 \(codec) 数据比声明的短（解出 \(produced) / 期望 \(capacity) 字节），缺口已补零",
+                    file: file.url
+                )
+            }
+        }
+
         var raw: [UInt8]
         switch level.compression {
         case .none:
             raw = [UInt8](data)
-            if raw.count < capacity { raw.append(contentsOf: [UInt8](repeating: 0, count: capacity - raw.count)) }
+            if raw.count < capacity {
+                reportShort("未压缩")(raw.count)
+                raw.append(contentsOf: [UInt8](repeating: 0, count: capacity - raw.count))
+            }
         case .deflate:
-            guard let inflated = TIFFCodec.inflate(data, capacity: capacity) else {
+            guard let inflated = TIFFCodec.inflate(data, capacity: capacity, onShort: reportShort("Deflate")) else {
                 throw TIFFError.decodeFailed("Deflate 解压失败（第 \(index) 块）")
             }
             raw = inflated
         case .lzw:
-            guard let decoded = TIFFCodec.lzwDecode(data, capacity: capacity) else {
+            guard let decoded = TIFFCodec.lzwDecode(data, capacity: capacity, onShort: reportShort("LZW")) else {
                 throw TIFFError.decodeFailed("LZW 解码失败（第 \(index) 块）")
             }
             raw = decoded
         case .packBits:
-            guard let decoded = TIFFCodec.packBitsDecode(data, capacity: capacity) else {
+            guard let decoded = TIFFCodec.packBitsDecode(data, capacity: capacity, onShort: reportShort("PackBits")) else {
                 throw TIFFError.decodeFailed("PackBits 解码失败（第 \(index) 块）")
             }
             raw = decoded
@@ -292,13 +307,17 @@ package enum TIFFCodec {
     /// 而系统 `Compression` 框架的 `COMPRESSION_ZLIB` **只吃裸 deflate**
     /// （它自己编码出来的就是裸流；把标准 zlib 流丢给它一律报错）。
     /// 所以这里先剥掉 zlib 外壳，剥不动或者解不出再按裸流试一次。
-    static func inflate(_ data: Data, capacity: Int) -> [UInt8]? {
+    static func inflate(
+        _ data: Data,
+        capacity: Int,
+        onShort: ((Int) -> Void)? = nil
+    ) -> [UInt8]? {
         guard capacity > 0, !data.isEmpty else { return nil }
         if data.count > 6, isZlibWrapped(data) {
             let body = Data(data.dropFirst(2).dropLast(4))
-            if let decoded = rawInflate(body, capacity: capacity) { return decoded }
+            if let decoded = rawInflate(body, capacity: capacity, onShort: onShort) { return decoded }
         }
-        return rawInflate(data, capacity: capacity)
+        return rawInflate(data, capacity: capacity, onShort: onShort)
     }
 
     /// 是不是标准 zlib 包装（CMF/FLG 校验 + 没有预置字典）。
@@ -311,13 +330,19 @@ package enum TIFFCodec {
         return true
     }
 
-    private static func rawInflate(_ data: Data, capacity: Int) -> [UInt8]? {
+    private static func rawInflate(
+        _ data: Data,
+        capacity: Int,
+        onShort: ((Int) -> Void)? = nil
+    ) -> [UInt8]? {
         var output = [UInt8](repeating: 0, count: capacity)
         let written = output.withUnsafeMutableBytes { destination -> Int in
             data.withUnsafeBytes { source -> Int in
-                guard let sourceBase = source.bindMemory(to: UInt8.self).baseAddress else { return 0 }
+                guard let sourceBase = source.bindMemory(to: UInt8.self).baseAddress,
+                      let destinationBase = destination.bindMemory(to: UInt8.self).baseAddress
+                else { return 0 }
                 return compression_decode_buffer(
-                    destination.bindMemory(to: UInt8.self).baseAddress!, capacity,
+                    destinationBase, capacity,
                     sourceBase, data.count,
                     nil, COMPRESSION_ZLIB
                 )
@@ -337,13 +362,18 @@ package enum TIFFCodec {
             FileHandle.standardError.write(Data(line.utf8))
         }
         if written < capacity {
+            onShort?(written)
             for index in written..<capacity { output[index] = 0 }
         }
         return output
     }
 
     /// PackBits（TIFF 6.0 的 RLE）。
-    package static func packBitsDecode(_ data: Data, capacity: Int) -> [UInt8]? {
+    package static func packBitsDecode(
+        _ data: Data,
+        capacity: Int,
+        onShort: ((Int) -> Void)? = nil
+    ) -> [UInt8]? {
         let bytes = [UInt8](data)
         var output: [UInt8] = []
         output.reserveCapacity(capacity)
@@ -366,6 +396,7 @@ package enum TIFFCodec {
         }
         guard !output.isEmpty else { return nil }
         if output.count < capacity {
+            onShort?(output.count)
             output.append(contentsOf: [UInt8](repeating: 0, count: capacity - output.count))
         }
         return Array(output.prefix(capacity))
@@ -375,16 +406,23 @@ package enum TIFFCodec {
     ///
     /// 位宽增长的时机（「提前一位」）各家写法偶有出入，所以两种规则都试一遍：
     /// 先按规范（提前一位）解，长度不对再按不提前解；哪个正好填满就采用哪个。
-    package static func lzwDecode(_ data: Data, capacity: Int) -> [UInt8]? {
-        if let decoded = lzwDecode(data, capacity: capacity, earlyChange: true), decoded.count == capacity {
-            return decoded
-        }
-        if let decoded = lzwDecode(data, capacity: capacity, earlyChange: false), decoded.count == capacity {
-            return decoded
-        }
+    ///
+    /// `onShort` 只在「两种规则都填不满、只好补零交差」时回调一次（参数是真正解出的字节数）：
+    /// 这种块以前是完全静默的，画面上只是那一块发黑，没人知道为什么。
+    package static func lzwDecode(
+        _ data: Data,
+        capacity: Int,
+        onShort: ((Int) -> Void)? = nil
+    ) -> [UInt8]? {
+        // 最多解两遍。老写法在「两种规则都不对」时会把第一遍再算一次。
+        let first = lzwDecode(data, capacity: capacity, earlyChange: true)
+        if let first, first.count == capacity { return first }
+        let second = lzwDecode(data, capacity: capacity, earlyChange: false)
+        if let second, second.count == capacity { return second }
         // 两种规则都没正好填满（截断 / 损坏的块）：按「解出多少算多少」补齐到容量再交出去。
         // 调用方是**按块尺寸索引像素**的，返回一个短数组会让它越界。
-        guard let decoded = lzwDecode(data, capacity: capacity, earlyChange: true) else { return nil }
+        guard let decoded = first ?? second else { return nil }
+        onShort?(decoded.count)
         if decoded.count >= capacity { return Array(decoded.prefix(capacity)) }
         return decoded + [UInt8](repeating: 0, count: capacity - decoded.count)
     }
@@ -395,13 +433,41 @@ package enum TIFFCodec {
 
         var output: [UInt8] = []
         output.reserveCapacity(capacity)
-        var dictionary: [[UInt8]] = []
+        // 扁平字典：每个码一条「前缀码 + 末字节」，整块共用三个数组。
+        // 老写法是 `[[UInt8]]`，每解一块要新建四千多个小数组，分配抖动全落在
+        // 解压这条热路径上（拖动时每张瓦片都要走一遍）。
+        var prefix = [Int](repeating: -1, count: 4096)
+        var suffix = [UInt8](repeating: 0, count: 4096)
+        var next = 258
+        /// 展开一个码用的暂存（复用：不再一个码分配一次）。
+        var scratch: [UInt8] = []
+        scratch.reserveCapacity(1024)
         func resetDictionary() {
-            dictionary = (0..<256).map { [UInt8($0)] }
-            dictionary.append([])   // 256：清除
-            dictionary.append([])   // 257：结束
+            for code in 0..<256 {
+                prefix[code] = -1
+                suffix[code] = UInt8(code)
+            }
+            prefix[256] = -1   // 256：清除
+            prefix[257] = -1   // 257：结束
+            next = 258
         }
         resetDictionary()
+
+        /// 沿前缀链把一个码展开进 `scratch`；码不在字典里就返回 false。
+        func expand(_ code: Int) -> Bool {
+            scratch.removeAll(keepingCapacity: true)
+            var current = code
+            var steps = 0
+            while current >= 0 {
+                guard current < next, current < 4096 else { return false }
+                scratch.append(suffix[current])
+                current = prefix[current]
+                steps += 1
+                if steps > 4096 { return false }   // 损坏数据里的环，兜底
+            }
+            scratch.reverse()
+            return true
+        }
 
         var codeWidth = 9
         var bitBuffer = 0
@@ -420,32 +486,33 @@ package enum TIFFCodec {
             return code
         }
 
-        var previous: [UInt8]?
+        var previous = -1
         while let code = nextCode() {
             if code == 256 {
                 resetDictionary()
                 codeWidth = 9
-                previous = nil
+                previous = -1
                 continue
             }
             if code == 257 { break }
 
-            let entry: [UInt8]
-            if code < dictionary.count, !dictionary[code].isEmpty {
-                entry = dictionary[code]
-            } else if let previous, !previous.isEmpty {
-                entry = previous + [previous[0]]
-            } else {
-                return nil
+            // KwKwK：这个码就是「正在生成的下一个词条」，即上一串再加它的首字节。
+            let isNewCode = code >= next
+            guard !isNewCode || (code == next && previous >= 0) else { return nil }
+            guard expand(isNewCode ? previous : code) else { return nil }
+            let firstByte = scratch.first ?? 0
+            output.append(contentsOf: scratch)
+            if isNewCode { output.append(firstByte) }
+
+            if previous >= 0, next < 4096 {
+                prefix[next] = previous
+                suffix[next] = firstByte
+                next += 1
             }
-            output.append(contentsOf: entry)
-            if let previous, !previous.isEmpty {
-                dictionary.append(previous + [entry[0]])
-            }
-            previous = entry
+            previous = code
 
             let threshold = earlyChange ? (1 << codeWidth) - 1 : (1 << codeWidth)
-            if dictionary.count >= threshold, codeWidth < 12 {
+            if next >= threshold, codeWidth < 12 {
                 codeWidth += 1
             }
             if output.count >= capacity { break }

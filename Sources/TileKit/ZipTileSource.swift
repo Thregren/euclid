@@ -172,6 +172,17 @@ public actor ZipArchivePool {
         order.removeAll()
     }
 
+    /// 只留下仍然在用的归档，其余全放掉。
+    ///
+    /// 换数据集、删图层时按「当前还有哪些图层真的在用」过一遍：池子本来就有 4 个名额的
+    /// 上限，但主动清一次能立刻把名额与文件句柄让给新数据，不必等下一屏图把它们挤出去。
+    public func forgetAll(except keeping: Set<String>) {
+        for key in Array(archives.keys) where !keeping.contains(key) {
+            archives[key] = nil
+        }
+        order.removeAll { !keeping.contains($0) }
+    }
+
     private func archive(for url: URL) -> ZipArchive? {
         let key = url.path(percentEncoded: false)
         if let cached = archives[key] { return cached }

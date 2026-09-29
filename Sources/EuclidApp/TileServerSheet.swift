@@ -93,7 +93,10 @@ struct TileServerSheet: View {
                     server.stop()
                     dismiss()
                 }
-                Button(server.isRunning ? "停止服务" : "启动服务") { server.toggle() }
+                Button(server.isRunning ? "停止服务" : "启动服务") {
+                    // 启动要等监听器就绪（可能几百毫秒到几秒），放 `Task` 里别冻住按钮。
+                    Task { await server.toggle() }
+                }
                     .buttonStyle(.borderedProminent)
             }
             .padding(.horizontal, 16)

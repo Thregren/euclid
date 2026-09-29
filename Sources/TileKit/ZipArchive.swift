@@ -87,10 +87,7 @@ public final class ZipArchive: @unchecked Sendable {
 
     /// 按完整名字查一条记录（例如 `45224/215425.jpg`）。
     public func entry(named name: String) -> Entry? {
-        let row = Self.rowPrefix(of: name)
-        lock.lock()
-        defer { lock.unlock() }
-        return table(forRow: row)[name]
+        table(forRow: Self.rowPrefix(of: name))[name]
     }
 
     /// 读出并校验一条记录的内容。
@@ -101,8 +98,9 @@ public final class ZipArchive: @unchecked Sendable {
         guard entry.uncompressedSize <= UInt64(Self.maximumEntryBytes) else {
             throw ZipError.unsupported("单条记录解压后 \(entry.uncompressedSize) 字节")
         }
-        lock.lock()
-        defer { lock.unlock() }
+        // 这里不加锁：读走 `pread`（无句柄状态），`fileSize` 在 init 之后只读，
+        // 解压与 CRC 都是纯函数。持锁读一整条记录会把同包其他行全挡住 ——
+        // 一个 64 MB 的条目就是一次几百毫秒的停顿。
 
         // 本地文件头：长度字段可能与中央目录不同（数据描述符），
         // 所以**只**用它算数据的起点，长度与 CRC 一律以中央目录为准。
@@ -149,14 +147,14 @@ public final class ZipArchive: @unchecked Sendable {
 
     /// 某一行的全部条目名（升序）。探测覆盖范围用。
     public func entryNames(inRow row: String) -> [String] {
-        lock.lock()
-        defer { lock.unlock() }
         return table(forRow: row).keys.sorted()
     }
 
     /// 索引里出现过的行号（升序，数字行号）。
     public var indexedRows: [Int] {
-        rowSpans.keys.compactMap(Int.init).sorted()
+        lock.lock()
+        defer { lock.unlock() }
+        return rowSpans.keys.compactMap(Int.init).sorted()
     }
 
     // MARK: - 中央目录
@@ -213,22 +211,48 @@ public final class ZipArchive: @unchecked Sendable {
     }
 
     /// 解析某一行的全部记录（带缓存）。
+    ///
+    /// 两处讲究：
+    /// 1. **失败不写缓存**。读盘出错或中央目录当场损坏时，如果把空表记进 LRU，
+    ///    这一行就永久变成「没有瓦片」——画面一直缺那一块，重启才好。
+    ///    一次瞬时失败（外置盘掉线、分卷还在下载）不该有这种后果。
+    /// 2. **解析在锁外做**。一行可能有几千条记录、几十到几百 KB，持锁解析会把
+    ///    同一个包里其他行的读全挡住，正好落在拖动取图的热路径上。
     private func table(forRow row: String) -> [String: Entry] {
-        if let cached = rowTables[row] { return cached }
-        guard let span = rowSpans[row] else { return [:] }
+        lock.lock()
+        if let cached = rowTables[row] {
+            lock.unlock()
+            return cached
+        }
+        guard let span = rowSpans[row] else {
+            lock.unlock()
+            return [:]
+        }
+        lock.unlock()
 
         var table: [String: Entry] = [:]
         let prefix = row.isEmpty ? "" : row + "/"
-        try? forEachRecord(from: span.start, to: span.end) { name, entry, _, _ in
-            guard name.hasPrefix(prefix) else { return }
-            table[name] = entry
+        do {
+            try forEachRecord(from: span.start, to: span.end) { name, entry, _, _ in
+                guard name.hasPrefix(prefix) else { return }
+                table[name] = entry
+            }
+        } catch {
+            return [:]
         }
 
+        lock.lock()
+        // 期间可能有别的线程把同一行填好了：用它那份，别覆盖。
+        if let cached = rowTables[row] {
+            lock.unlock()
+            return cached
+        }
         rowTables[row] = table
         rowOrder.append(row)
         while rowOrder.count > Self.rowCacheLimit {
             rowTables[rowOrder.removeFirst()] = nil
         }
+        lock.unlock()
         return table
     }
 
@@ -330,14 +354,25 @@ public final class ZipArchive: @unchecked Sendable {
 
     // MARK: - 工具
 
+    /// 按绝对偏移读一段；读不满或出错就返回读到的那部分（调用方各自校验长度）。
+    ///
+    /// 走 `pread`（不依赖句柄的读写位置）：这样多线程同时查同一个包的不同行时
+    /// 不必互相排队，`lock` 也就只需要保护索引缓存，不再覆盖磁盘 IO。
     private func read(at offset: UInt64, count: Int) -> Data {
-        guard count > 0 else { return Data() }
-        do {
-            try handle.seek(toOffset: offset)
-            return try handle.read(upToCount: count) ?? Data()
-        } catch {
-            return Data()
+        guard count > 0, offset <= UInt64(Int64.max), offset <= UInt64(Int.max - count) else { return Data() }
+        var data = Data(count: count)
+        var total = 0
+        let descriptor = handle.fileDescriptor
+        data.withUnsafeMutableBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            while total < count {
+                let read = pread(descriptor, base.advanced(by: total), count - total, off_t(offset) + off_t(total))
+                if read <= 0 { break }
+                total += read
+            }
         }
+        guard total > 0 else { return Data() }
+        return total == count ? data : data.prefix(total)
     }
 
     /// 名字里的第一段（`45224/215425.jpg` → `45224`）。

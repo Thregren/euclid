@@ -280,8 +280,11 @@ final class AppModel {
     /// 本地瓦片服务面板是否展开。
     var showTileServerSheet = false
 
-    /// 扫描代号，用于丢弃过期的扫描结果。
-    var scanGeneration = 0
+    /// 数据源代号：每次「扫描 / 打开影像 / 选中来源」都 +1，用来丢弃过期结果。
+    ///
+    /// 连点几个数据集、或者扫描还没回来就换了一份数据时，先发的那个慢任务回来得晚，
+    /// 对不上代号就整段丢掉 —— 否则它会拿旧结果把用户刚选的东西覆盖掉。
+    var sourceGeneration = 0
     /// 已经装配到画布上的本地数据集与在线源，避免重复重装。
     var appliedLocalDatasetID: TileDataset.ID?
     var appliedOnlineSignature: String?

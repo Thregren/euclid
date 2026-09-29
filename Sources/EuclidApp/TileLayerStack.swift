@@ -641,10 +641,13 @@ final class TileLayerStack {
 
     /// 取出图层里装的图片（`CALayer.contents` 是 `Any?`，用 CFTypeID 判断再取）。
     static func contentsImage(of layer: CALayer) -> CGImage? {
-        guard let contents = layer.contents,
-              CFGetTypeID(contents as CFTypeRef) == CGImage.typeID else { return nil }
-        // 上面已经用 CFTypeID 核对过类型，这里的桥接是确定的（`as?` 反而会被编译器判为恒成立）。
-        return (contents as! CGImage)
+        // `contents` 是 `Any?`：先用 CFTypeID 核对确实是 CGImage，再走 CoreFoundation 的桥接。
+        // 全程不用 `as!`，万一 AppKit 往 `contents` 里放了别的东西，这里只是返回 nil 而不是崩。
+        guard let contents = layer.contents, CFGetTypeID(contents as CFTypeRef) == CGImage.typeID else {
+            return nil
+        }
+        return Unmanaged<CGImage>.fromOpaque(Unmanaged.passUnretained(contents as AnyObject).toOpaque())
+            .takeUnretainedValue()
     }
 
     /// 调试用：当前瓦片图层的几何概况（`EUCLID_TRACE_LAYERS` 时打到 stderr）。
@@ -844,7 +847,9 @@ final class TileLayerStack {
 
     /// 把这一层的瓦片缓存压到上限的给定比例（内存压力下由画布统一调用）。
     func trimCache(toFraction fraction: Double) {
-        guard let provider, cacheLimitBytes > 0 else { return }
+        // NaN 会让下面的 `Int(Double)` 直接 trap（`min`/`max` 拦不住 NaN），
+        // 所以换算之前先把「不是一个数」挡掉。
+        guard let provider, cacheLimitBytes > 0, fraction.isFinite else { return }
         let target = Int(Double(cacheLimitBytes) * min(max(fraction, 0), 1))
         Task { await provider.trimCache(keepingBytes: target) }
     }

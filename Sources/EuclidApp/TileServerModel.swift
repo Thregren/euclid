@@ -44,18 +44,27 @@ final class TileServerModel {
         rootURL = url
     }
 
-    func toggle() {
-        isRunning ? stop() : start()
+    func toggle() async {
+        if isRunning {
+            stop()
+        } else {
+            await start()
+        }
     }
 
-    func start() {
+    /// 启动服务。
+    ///
+    /// 等监听器就绪的那几秒挂在 `await` 上：这个方法是 `@MainActor`，
+    /// 同步等就等于整个界面冻三秒（点「启动服务」时尤其明显）。
+    func start() async {
         guard let rootURL else {
             errorMessage = "请先选择要提供的瓦片目录"
             return
         }
         errorMessage = nil
+        isRunning = false
         do {
-            actualPort = Int(try server.start(rootURL: rootURL, port: UInt16(clamping: port)))
+            actualPort = Int(try await server.startAsync(rootURL: rootURL, port: UInt16(clamping: port)))
             isRunning = true
             startPolling()
         } catch {

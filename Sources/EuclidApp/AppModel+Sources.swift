@@ -60,6 +60,8 @@ extension AppModel {
             layers.insert(layer, at: 0)   // 本地影像放最下层，参考底图叠在它上面
         }
         pushLayers()
+        // 换数据集时把旧分卷的归档放掉，别让它们继续占着池子里的名额。
+        releaseUnusedZipArchives()
     }
 
     /// 重建「在线底图层」：签名没变就不动。
@@ -230,14 +232,36 @@ extension AppModel {
         UserDefaults.standard.set(recentFolders.map { $0.path(percentEncoded: false) }, forKey: "recentFolders")
     }
 
+    /// 清空「最近打开」列表（检查器里那个「清空」按钮）。
+    ///
+    /// `lastRootFolder` 一并清掉：它记的是「上次打开的目录」，只清列表的话，下次启动还是会
+    /// 自动打开上一份数据，看起来就像没清干净。清的是偏好，不动任何数据文件。
+    func clearRecentFolders() {
+        let defaults = UserDefaults.standard
+        guard !recentFolders.isEmpty || defaults.string(forKey: "lastRootFolder") != nil else {
+            setStatus("最近记录本来就是空的", autoClearAfter: 4)
+            return
+        }
+        recentFolders.removeAll()
+        defaults.removeObject(forKey: "recentFolders")
+        defaults.removeObject(forKey: "lastRootFolder")
+        // 启动时已经排队、还没执行的那次「自动打开上次目录」也要撤掉。
+        initialURL = nil
+        setStatus("已清空最近记录", autoClearAfter: 4)
+    }
+
     /// 读单幅影像：只读文件头（IFD），因此再大的图也是秒开。
     func openRaster(_ url: URL) {
+        sourceGeneration += 1
+        let generation = sourceGeneration
         isResolvingExtent = true
         setStatus("正在读取影像…", autoClearAfter: 0)
         Task {
             let result: Result<RasterDataset, Error> = await Task.detached(priority: .userInitiated) {
                 do { return .success(try RasterLoader.load(url: url)) } catch { return .failure(error) }
             }.value
+            // 这中间用户又打开了别的数据：这份结果已经过期，直接丢掉（连状态栏都不改）。
+            guard generation == self.sourceGeneration else { return }
             isResolvingExtent = false
             AppModel.trace("raster loaded \(url.lastPathComponent)")
             switch result {
@@ -252,8 +276,8 @@ extension AppModel {
     }
 
     private func scan(_ url: URL, preferring preferred: URL? = nil) {
-        scanGeneration += 1
-        let generation = scanGeneration
+        sourceGeneration += 1
+        let generation = sourceGeneration
         AppModel.trace("scan start \(url.path(percentEncoded: false))")
         isScanning = true
         setStatus("正在扫描目录…", autoClearAfter: 0)
@@ -262,7 +286,7 @@ extension AppModel {
                 DatasetLocator.discover(at: url)
             }.value
             AppModel.trace("scan finished datasets=\(found.count)")
-            guard generation == self.scanGeneration else { return }
+            guard generation == self.sourceGeneration else { return }
             isScanning = false
             datasets = found
             if found.isEmpty {
@@ -286,6 +310,8 @@ extension AppModel {
 
     /// 选中一个本地来源：瓦片数据集或单幅影像。
     func selectSource(_ id: String?) {
+        sourceGeneration += 1
+        let generation = sourceGeneration
         AppModel.trace("select \(id ?? "nil")")
         selectedSourceID = id
         extent = nil
@@ -325,7 +351,8 @@ extension AppModel {
             let result = await Task.detached(priority: .userInitiated) {
                 DatasetLocator.extent(of: dataset)
             }.value
-            guard selectedSourceID == dataset.id else { return }
+            // 代号与选中项都对得上才落地：少一个都可能把旧范围盖到新选的数据上。
+            guard generation == self.sourceGeneration, selectedSourceID == dataset.id else { return }
             isResolvingExtent = false
             AppModel.trace("extent done \(String(describing: result?.tileCount))")
             extent = result

@@ -23,8 +23,28 @@ public final class LocalTileServer: @unchecked Sendable {
     private var root: URL?
     private var boundPort: UInt16 = 0
 
+    /// 已读过的瓦片（键是请求路径）。
+    private struct CachedTile {
+        var data: Data
+        var contentType: String
+        var cachedAt: Date
+    }
+
+    private var cache: [String: CachedTile] = [:]
+    /// 插入顺序，用来按「最老的先扔」淘汰。
+    private var cacheOrder: [String] = []
+    private var cacheBytes = 0
+
     /// 允许的文件后缀（与瓦片目录里可能出现的保持一致）。
     private static let allowedExtensions: Set<String> = ["png", "jpg", "jpeg", "webp"]
+    /// 响应缓存的上限：浏览器一次要一屏几十张瓦片，每次都从磁盘读一遍纯属浪费。
+    /// 上限压在 64 MB / 512 条：瓦片通常几十 KB，够放好几屏，又不会把内存吃出坑。
+    private static let cacheLimitBytes = 64 << 20
+    private static let cacheLimitEntries = 512
+    private static let cacheLifetime: TimeInterval = 600
+    /// 单张瓦片的读取上限：正常瓦片撑死几 MB，超过这个数说明这不是瓦片（或文件被写坏了），
+    /// 与其把几百 MB 塞进内存再发出去，不如直接当 404。
+    private static let maximumTileBytes = 32 << 20
 
     public init() {}
 
@@ -47,9 +67,66 @@ public final class LocalTileServer: @unchecked Sendable {
     }
 
     /// 启动服务。`port` 传 0 时让系统分配一个空闲端口，返回实际端口。
+    ///
+    /// 会阻塞到监听器就绪（最多 3 秒）。主线程上别用它 —— 用 `startAsync`。
     @discardableResult
     public func start(rootURL: URL, port: UInt16 = 0) throws -> UInt16 {
         stop()
+        let listener = try makeListener(port: port)
+        let ready = DispatchSemaphore(value: 0)
+        listener.stateUpdateHandler = { state in
+            switch state {
+            case .ready, .failed, .cancelled: ready.signal()
+            default: break
+            }
+        }
+        listener.start(queue: queue)
+
+        // 等它真的起来（超时也不至于卡住界面）。
+        _ = ready.wait(timeout: .now() + 3)
+        return try adopt(listener, rootURL: rootURL)
+    }
+
+    /// 异步启动：等就绪的那三秒挂在 `await` 上，不再占着调用线程（主 actor 上尤其重要）。
+    @discardableResult
+    public func startAsync(rootURL: URL, port: UInt16 = 0) async throws -> UInt16 {
+        stop()
+        let listener = try makeListener(port: port)
+        do {
+            try await Self.waitUntilReady(listener, queue: queue)
+        } catch {
+            // 没起来就把监听器收掉，别留一个还在后台重试的半拉服务。
+            listener.cancel()
+            throw error
+        }
+        return try adopt(listener, rootURL: rootURL)
+    }
+
+    /// 等监听器就绪（`NWListener` 的三种终局状态任一到达，或者 5 秒超时）。
+    private static func waitUntilReady(_ listener: NWListener, queue: DispatchQueue) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            let resumed = LockedFlag()
+            listener.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    if resumed.setIfUnset() { continuation.resume() }
+                case .failed, .cancelled:
+                    if resumed.setIfUnset() { continuation.resume(throwing: TileServerError.cannotStart) }
+                default:
+                    break
+                }
+            }
+            listener.start(queue: queue)
+            // 兜底超时：`NWListener` 万一既不就绪也不报错（端口被某种方式占着时会这样），
+            // 不能让这个 await 永远挂着 —— 那就成了「点了启动，界面一直转圈」。
+            queue.asyncAfter(deadline: .now() + 5) {
+                if resumed.setIfUnset() { continuation.resume(throwing: TileServerError.cannotStart) }
+            }
+        }
+    }
+
+    /// 建监听器（两种启动路径共用）。
+    private func makeListener(port: UInt16) throws -> NWListener {
         let parameters = NWParameters.tcp
         parameters.allowLocalEndpointReuse = true
         // 只监听回环地址：这是本机工具之间的桥，不该暴露到局域网。
@@ -64,21 +141,14 @@ public final class LocalTileServer: @unchecked Sendable {
             }
             listener = try NWListener(using: parameters, on: value)
         }
-
-        let ready = DispatchSemaphore(value: 0)
-        listener.stateUpdateHandler = { state in
-            switch state {
-            case .ready, .failed, .cancelled: ready.signal()
-            default: break
-            }
-        }
         listener.newConnectionHandler = { [weak self] connection in
             self?.handle(connection)
         }
-        listener.start(queue: queue)
+        return listener
+    }
 
-        // 等它真的起来（超时也不至于卡住界面）。
-        _ = ready.wait(timeout: .now() + 3)
+    /// 记录已经就绪的监听器；端口取不到就收摊报错。
+    private func adopt(_ listener: NWListener, rootURL: URL) throws -> UInt16 {
         guard let actualPort = listener.port?.rawValue else {
             listener.cancel()
             throw TileServerError.cannotStart
@@ -88,6 +158,9 @@ public final class LocalTileServer: @unchecked Sendable {
         root = rootURL
         boundPort = actualPort
         requestCount = 0
+        cache.removeAll()
+        cacheOrder.removeAll()
+        cacheBytes = 0
         lock.unlock()
         return actualPort
     }
@@ -96,6 +169,9 @@ public final class LocalTileServer: @unchecked Sendable {
         lock.lock()
         let current = listener
         listener = nil
+        cache.removeAll()
+        cacheOrder.removeAll()
+        cacheBytes = 0
         lock.unlock()
         current?.cancel()
     }
@@ -147,19 +223,65 @@ public final class LocalTileServer: @unchecked Sendable {
         guard let currentRoot, let fileURL = Self.tileFile(for: path, root: currentRoot) else {
             return Self.httpResponse(status: 404, contentType: "text/plain", body: Data("no such tile".utf8))
         }
-        guard let data = try? Data(contentsOf: fileURL, options: .mappedIfSafe), !data.isEmpty else {
+        guard let tile = cachedTile(for: path, fileURL: fileURL) else {
             return Self.httpResponse(status: 404, contentType: "text/plain", body: Data("no such tile".utf8))
         }
         return Self.httpResponse(
             status: 200,
-            contentType: Self.contentType(for: fileURL.pathExtension),
-            body: data,
+            contentType: tile.contentType,
+            body: tile.data,
             extra: ["Cache-Control": "public, max-age=600"]
         )
     }
 
+    /// 取一张瓦片：先查缓存，没有再读盘并放进缓存。
+    ///
+    /// 编辑器拉一屏就是几十个请求，缓存命中时既省磁盘、也省得起一次 `Data(contentsOf:)`。
+    /// 读盘与写缓存都在锁外算好、锁内只做字典操作。
+    private func cachedTile(for path: String, fileURL: URL) -> CachedTile? {
+        let now = Date()
+        lock.lock()
+        if let hit = cache[path] {
+            if now.timeIntervalSince(hit.cachedAt) < Self.cacheLifetime {
+                lock.unlock()
+                return hit
+            }
+            cache[path] = nil
+            cacheOrder.removeAll { $0 == path }
+            cacheBytes -= hit.data.count
+        }
+        lock.unlock()
+
+        // 先看大小再读：一份被写坏的「瓦片」可能几百 MB，读进来再判断就晚了。
+        let size = (try? fileURL.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+        guard size > 0, size <= Self.maximumTileBytes else { return nil }
+        guard let data = try? Data(contentsOf: fileURL, options: .mappedIfSafe), !data.isEmpty else { return nil }
+        let tile = CachedTile(
+            data: data,
+            contentType: Self.contentType(for: fileURL.pathExtension),
+            cachedAt: now
+        )
+
+        lock.lock()
+        if cache[path] == nil {
+            cache[path] = tile
+            cacheOrder.append(path)
+            cacheBytes += data.count
+        }
+        // 超出预算就从最老的开始扔（FIFO 足够：瓦片的大小与访问热度都很均匀）。
+        while cacheBytes > Self.cacheLimitBytes || cacheOrder.count > Self.cacheLimitEntries {
+            guard let oldest = cacheOrder.first else { break }
+            cacheOrder.removeFirst()
+            if let dropped = cache.removeValue(forKey: oldest) {
+                cacheBytes -= dropped.data.count
+            }
+        }
+        lock.unlock()
+        return tile
+    }
+
     /// 把 `/z/x/y.ext` 解析成磁盘路径；不是合法瓦片路径就返回 nil（顺带挡掉目录穿越）。
-    static func tileFile(for path: String, root: URL) -> URL? {
+    public static func tileFile(for path: String, root: URL) -> URL? {
         let components = path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
         guard components.count == 3,
               let zoom = Int(components[0]), let column = Int(components[1]), zoom >= 0, column >= 0,
@@ -175,7 +297,7 @@ public final class LocalTileServer: @unchecked Sendable {
             .appending(path: "\(row).\(ext)")
     }
 
-    static func contentType(for fileExtension: String) -> String {
+    public static func contentType(for fileExtension: String) -> String {
         switch fileExtension.lowercased() {
         case "png": return "image/png"
         case "jpg", "jpeg": return "image/jpeg"
@@ -239,5 +361,23 @@ public enum TileServerError: Error, CustomStringConvertible {
         case .invalidPort(let port): return "端口不可用：\(port)"
         case .cannotStart: return "本地服务没能启动（端口可能被占用）"
         }
+    }
+}
+
+/// 只允许「第一个到的」通过的开关（用来给 `CheckedContinuation` 收口）。
+///
+/// `NWListener` 的状态回调可能连着来两次（ready 之后紧跟着 cancelled），
+/// 而 continuation 只能 resume 一次 —— 第二次直接丢弃。
+private final class LockedFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isSet = false
+
+    /// 第一次调用返回 true，之后都返回 false。
+    func setIfUnset() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isSet else { return false }
+        isSet = true
+        return true
     }
 }

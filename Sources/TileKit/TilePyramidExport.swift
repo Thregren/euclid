@@ -244,7 +244,9 @@ public struct TilePyramidExporter: Sendable {
                         }
                         let tile = SlippyTile(zoom: range.zoom, x: column, y: row)
                         group.addTask {
-                            await limiter.acquire()
+                            // 等待期间被取消时不占名额，也别去渲染，更不能陪着调一次 `release`
+                            //（那会把名额算歪，后面的片会超额并发）。
+                            guard await limiter.acquire() else { return .skipped(zoom: tile.zoom) }
                             let outcome = await Self.render(
                                 tile: tile,
                                 source: source,

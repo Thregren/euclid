@@ -593,7 +593,7 @@ let circleKML = MeasurementExporter.kml([circle])
 expect(circleKML.contains("<Polygon>"), "圆在 KML 中应是 Polygon")
 
 // Excel：三个数据表 + 一页说明，并且必须是结构合法的 xlsx（ZIP）。
-let workbook = MeasurementExporter.excel(
+let workbook = try MeasurementExporter.excel(
     [sampleMeasurement, circle],
     datasetName: "自检数据集",
     exportedAt: Date(timeIntervalSince1970: 1_700_000_000)
@@ -643,8 +643,8 @@ if let entries = ZIP.parse(workbook) {
     expect(false, "xlsx 应是可解析的 ZIP 容器")
 }
 
-// 少量测量也要能导出（空列表不应崩溃）。
-expect(!MeasurementExporter.excel([]).isEmpty, "空测量列表也应产出可打开的工作簿")
+// 少量测量也要能导出（空列表不应崩溃，也不该抛）。
+expect((try? MeasurementExporter.excel([]))?.isEmpty == false, "空测量列表也应产出可打开的工作簿")
 
 section("ZIP：deflate 压缩与解回")
 
@@ -658,8 +658,8 @@ do {
 
     // 表格 XML 里成片重复的字段：压完应当明显小一圈。
     let repetitive = Data(String(repeating: "侧边补测-119.12345678-正射影像-", count: 2000).utf8)
-    let packed = ZIP.stored([("a.xml", repetitive)])
-    let raw = ZIP.stored([("a.xml", repetitive)], compress: false)
+    let packed = try ZIP.stored([("a.xml", repetitive)])
+    let raw = try ZIP.stored([("a.xml", repetitive)], compress: false)
     expect(firstEntryMethod(raw) == 0, "关掉压缩时应写成「存储」方式")
     expect(firstEntryMethod(packed) == 8, "重复内容应走 deflate（实际方式 \(firstEntryMethod(packed))）")
     expect(packed.count < raw.count / 2,
@@ -672,7 +672,7 @@ do {
     }
 
     // 压不动的极小条目要退回「存储」，不能为了走压缩把文件撑大。
-    let tiny = ZIP.stored([("b.txt", Data("abc".utf8))])
+    let tiny = try ZIP.stored([("b.txt", Data("abc".utf8))])
     expect(firstEntryMethod(tiny) == 0, "压不动的极小条目应退回存储方式")
     if let entries = ZIP.parse(tiny) {
         expect(entries.first?.data == Data("abc".utf8), "退回存储的条目内容应一致")
@@ -687,10 +687,22 @@ do {
         seed = seed &* 1_664_525 &+ 1_013_904_223
         noisy[index] = UInt8((seed >> 16) & 0xFF)
     }
-    if let entries = ZIP.parse(ZIP.stored([("c.bin", noisy)])) {
+    if let entries = ZIP.parse(try ZIP.stored([("c.bin", noisy)])) {
         expect(entries.first?.data == noisy, "随机内容应能原样往返")
     } else {
         expect(false, "随机内容的 ZIP 应能读回")
+    }
+
+    // 长度字段一律不许截断：超过 ZIP32 上限时必须抛错，而不是写出一个谎报长度的包。
+    // （真造 4 GB 数据太慢，这里直接验条目数上限：65536 个条目已经超出 ZIP32 的表达。）
+    do {
+        let many = (0...UInt16.max).map { ("t\($0).txt", Data("x".utf8)) }
+        _ = try ZIP.stored(many, compress: false)
+        expect(false, "超过 65535 个条目应当抛「太大」，而不是把条目数截断")
+    } catch let error as ZIPError {
+        expect(error == .tooLarge, "超过 65535 个条目应抛 tooLarge（实际 \(error)）")
+    } catch {
+        expect(false, "超过 65535 个条目应抛 ZIPError（实际 \(error)）")
     }
 
     // 坏数据不许「读出一个错的还当成功」：把压缩体改一个字节，校验和必须拦住它。
@@ -2344,12 +2356,12 @@ for useDeflate in [false, true] {
 
 // 截断：中央目录都没了（正在下载、只写了一半的分卷就是这样），必须当场报错。
 let truncatedURL = archiveRoot.appending(path: "truncated.zip")
-try? ZIP.stored(zipEntries, compress: false).prefix(120).write(to: truncatedURL)
+try? (try ZIP.stored(zipEntries, compress: false)).prefix(120).write(to: truncatedURL)
 expect(zipOpeningError(truncatedURL) != nil, "被截断的 zip 应当打不开")
 
 // 中央目录自称越过了文件末尾：要报「截断」，不能被当成正常文件。
 do {
-    var forged = ZIP.stored(zipEntries, compress: false)
+    var forged = try ZIP.stored(zipEntries, compress: false)
     // 从尾部往前找 EOCD（0x06054B50），把其中的「中央目录大小」字段改成谎报的值。
     var eocd = forged.count - 22
     while eocd >= 0 {
@@ -2393,7 +2405,7 @@ do {
 // 中央目录谎报记录长度（32 MB，而文件只有几十 KB）：索引只认名字，所以包还能打开，
 // 但读那一格必须报错 —— 而且是**在**分配缓冲之前就报错，否则一个畸形索引就能把内存吃掉。
 do {
-    var forged = ZIP.stored(zipEntries, compress: false)
+    var forged = try ZIP.stored(zipEntries, compress: false)
     var patched = false
     var index = 0
     while index + 46 <= forged.count {
@@ -2447,16 +2459,113 @@ do {
     expect(noZoom == nil, "没有该层级时应当返回 nil")
 }
 
+// MARK: - 本地瓦片服务
+
+section("本地瓦片服务：路径解析、响应与异步启动")
+
+// 路径解析：只认「三层、整数、白名单后缀」，并且必须挡住目录穿越。
+do {
+    let root = URL(fileURLWithPath: "/tmp/euclid-server-root")
+    expect(LocalTileServer.tileFile(for: "/12/3375/701.jpg", root: root)?.lastPathComponent == "701.jpg",
+           "合法的 /z/x/y.jpg 应解析出文件路径")
+    expect(LocalTileServer.tileFile(for: "/12/3375/701.PNG", root: root)?.lastPathComponent == "701.png",
+           "后缀应统一成小写")
+    expect(LocalTileServer.tileFile(for: "/../../etc/passwd", root: root) == nil,
+           "带 .. 的路径必须被拒（目录穿越）")
+    expect(LocalTileServer.tileFile(for: "/12/3375/701.sh", root: root) == nil,
+           "白名单之外的后缀必须被拒")
+    expect(LocalTileServer.tileFile(for: "/12/-3375/701.jpg", root: root) == nil,
+           "负数坐标必须被拒")
+    expect(LocalTileServer.tileFile(for: "/12/3375/701", root: root) == nil,
+           "没有后缀的路径必须被拒")
+    expect(LocalTileServer.contentType(for: "JPG") == "image/jpeg", "后缀大小写都要认")
+}
+
+// 真起一个服务：系统分配端口，取一张瓦片，再取一次（走响应缓存）。
+do {
+    let root = archiveRoot.appending(path: "server-root")
+    do {
+        try FileManager.default.createDirectory(
+            at: root.appending(path: "12/3375"),
+            withIntermediateDirectories: true
+        )
+        try fakeTile("S", repeats: 8).write(to: root.appending(path: "12/3375/701.png"))
+    } catch {
+        expect(false, "构造本地服务测试目录失败：\(error)")
+    }
+
+    let server = LocalTileServer()
+    do {
+        let port = try await server.startAsync(rootURL: root, port: 0)
+        expect(port > 0, "异步启动应拿到一个真实端口（实际 \(port)）")
+
+        // 用不带缓存的会话：`URLSession.shared` 会拿 `Cache-Control` 把重取的瓦片塞进自己的
+        // URLCache，第二次请求根本到不了服务端 —— 那样既验不了响应缓存，也数不准请求数。
+        let config = URLSessionConfiguration.ephemeral
+        config.urlCache = nil
+        config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        let session = URLSession(configuration: config)
+        defer { session.invalidateAndCancel() }
+
+        /// 发一个最简 HTTP 请求，拿回状态码、响应头与正文。
+        func get(_ path: String) async -> (status: Int, body: String, header: (String) -> String?)? {
+            guard let url = URL(string: "http://127.0.0.1:\(port)\(path)") else { return nil }
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 5
+            request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+            guard let (data, response) = try? await session.data(for: request),
+                  let http = response as? HTTPURLResponse else { return nil }
+            return (http.statusCode, String(decoding: data, as: UTF8.self), { http.value(forHTTPHeaderField: $0) })
+        }
+
+        let first = await get("/12/3375/701.png")
+        expect(first?.status == 200, "取一张存在的瓦片应回 200（实际 \(first?.status ?? -1)）")
+        expect(first?.body.contains("瓦片-S-") == true, "取一张存在的瓦片应返回它的内容")
+        expect(first?.header("Access-Control-Allow-Origin") == "*",
+               "响应要带 CORS 头，否则浏览器里的编辑器拿不到图")
+        // 再取一次：第二次走的是服务端响应缓存，内容必须一模一样。
+        let second = await get("/12/3375/701.png")
+        expect(second?.status == 200 && second?.body == first?.body,
+               "第二次取同一张瓦片应命中缓存且内容一致")
+        let missing = await get("/12/3375/999.png")
+        expect(missing?.status == 404, "不存在的瓦片应报 404（实际 \(missing?.status ?? -1)）")
+        expect(server.status.requests >= 3, "三次请求都应被计数（实际 \(server.status.requests)）")
+    } catch {
+        expect(false, "本地服务启动失败：\(error)")
+    }
+    server.stop()
+    expect(server.status.isRunning == false, "停止之后状态应为未运行")
+}
+
 // MARK: - 真实 zip 数据集（挂了福建数据盘时才跑）
 
-/// 真机数据：数据盘上的「福建省瓦片」目录（默认 `/Volumes/数据盘/福建省瓦片`，
-/// 可用 `EUCLID_ZIP_ROOT` 指向别处）。
+/// 真机数据：数据盘上的「福建省瓦片」目录。
+///
+/// 依次找：`EUCLID_ZIP_ROOT` 环境变量 → 挂载卷里的任意「福建省瓦片」（只扫一层，不递归）。
+/// 卷标因人而异（数据盘、Samsung…），写死卷名会让这段自检在别人机器上永远被跳过。
 ///
 /// 这些期望值来自 manifest.json 与已知的下载结果（z12：1 卷 2772 片；z18：仍在下载）。
-let fujianRoot = URL(fileURLWithPath: ProcessInfo.processInfo.environment["EUCLID_ZIP_ROOT"]
-    ?? "/Volumes/数据盘/福建省瓦片")
+func findFujianRoot() -> URL? {
+    let environment = ProcessInfo.processInfo.environment
+    if let path = environment["EUCLID_ZIP_ROOT"] {
+        return URL(fileURLWithPath: path)
+    }
+    let mounted = (try? FileManager.default.contentsOfDirectory(
+        at: URL(fileURLWithPath: "/Volumes"),
+        includingPropertiesForKeys: [.isDirectoryKey],
+        options: [.skipsHiddenFiles]
+    )) ?? []
+    for volume in mounted {
+        let candidate = volume.appending(path: "福建省瓦片")
+        let manifest = candidate.appending(path: "manifest.json").path(percentEncoded: false)
+        if FileManager.default.fileExists(atPath: manifest) { return candidate }
+    }
+    return nil
+}
 
-if FileManager.default.fileExists(atPath: fujianRoot.appending(path: "manifest.json").path(percentEncoded: false)) {
+let fujianRoot = findFujianRoot()
+
+if let fujianRoot {
     section("真实 zip 数据集：\(fujianRoot.lastPathComponent)")
     if let dataset = ZipDatasetLocator.makeDataset(at: fujianRoot), let info = dataset.zipInfo {
         expect(dataset.grid.kind == .geographic, "福建数据集应认成经纬度网格")
@@ -2563,7 +2672,7 @@ if FileManager.default.fileExists(atPath: fujianRoot.appending(path: "manifest.j
         expect(false, "福建数据目录应被认成 zip 数据集")
     }
 } else {
-    print("\n▸ 真实 zip 数据集：未挂载（跳过 \(fujianRoot.path(percentEncoded: false))）")
+    print("\n▸ 真实 zip 数据集：没有找到带 manifest.json 的「福建省瓦片」（跳过）")
 }
 
 // MARK: - 汇总

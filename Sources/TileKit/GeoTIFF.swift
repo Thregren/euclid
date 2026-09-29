@@ -562,29 +562,33 @@ final class TIFFFileCache: @unchecked Sendable {
     func file(for url: URL) -> TIFFFile? {
         let key = url.path(percentEncoded: false)
         let now = Date()
-        let shouldCheckStamp = now.timeIntervalSince(lastStampCheck) >= stampCheckInterval
-        let stamp = shouldCheckStamp ? Self.stamp(of: url) : nil
 
         lock.lock()
-        if let cached = files[key] {
-            // 文件没被改过（或者这次还没到该检查的时候）就直接用解析结果；
-            // 改过就丢掉重解析 —— 否则用户重新导出一份同名影像，界面还按旧结构解码。
-            if stamp == nil || cached.stamp == stamp {
-                lock.unlock()
-                return cached.file
-            }
-            files.removeValue(forKey: key)
-            order.removeAll { $0 == key }
-            lock.unlock()
-            // 文件被换掉了：结构要重解析，已经解出来的块也不能再用（尺寸/分块都可能变了）。
-            TIFFChunkCache.shared.invalidate(path: key)
-        } else {
-            lock.unlock()
-        }
+        // `lastStampCheck` 也在这个锁里 —— 它是个可变状态，多个解码线程同时进来时
+        // 在锁外读写就是数据竞争（`Date` 不是原子的）。
+        let shouldCheckStamp = now.timeIntervalSince(lastStampCheck) >= stampCheckInterval
         if shouldCheckStamp { lastStampCheck = now }
+        let known = files[key]
+        lock.unlock()
+
+        if let known {
+            // 没到该检查的间隔就直接用解析结果；到了就 stat 一次看看文件是不是被换过
+            //（stat 放在锁外做，别让磁盘 IO 占着这份表的锁）。
+            guard shouldCheckStamp else { return known.file }
+            let stamp = Self.stamp(of: url)
+            if known.stamp == stamp { return known.file }
+            // 文件被换掉了：结构要重解析，已经解出来的块也不能再用（尺寸 / 分块都可能变了）。
+            lock.lock()
+            if files[key]?.stamp == known.stamp {
+                files.removeValue(forKey: key)
+                order.removeAll { $0 == key }
+            }
+            lock.unlock()
+            TIFFChunkCache.shared.invalidate(path: key)
+        }
 
         guard let parsed = try? TIFFReader.parse(url: url) else { return nil }
-        let entry = Entry(file: parsed, stamp: stamp ?? Self.stamp(of: url))
+        let entry = Entry(file: parsed, stamp: Self.stamp(of: url))
         lock.lock()
         if files[key] == nil {
             files[key] = entry
@@ -633,6 +637,17 @@ enum TIFFDiagnostics {
         guard store.insertIfNew(key) else { return }
         FileHandle.standardError.write(Data(
             "[tiff] \(file.lastPathComponent) 瓦片 \(tile)：\(error)\n".utf8
+        ))
+    }
+
+    /// 记一条「不致命但值得知道」的情况（例如某个块解出来比声明的短，只能补零）。
+    ///
+    /// 这类问题以前是完全静默的：画面上只是那一块发黑，没人知道为什么。
+    static func record(message: String, file: URL) {
+        let key = "\(file.lastPathComponent):\(message)"
+        guard store.insertIfNew(key) else { return }
+        FileHandle.standardError.write(Data(
+            "[tiff] \(file.lastPathComponent)：\(message)\n".utf8
         ))
     }
 }

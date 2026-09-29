@@ -7,7 +7,7 @@ struct RecentDataSection: View {
 
     var body: some View {
         if !model.recentFolders.isEmpty {
-            Section("最近打开") {
+            Section {
                 ForEach(model.recentFolders, id: \.self) { url in
                     Button {
                         model.open(url)
@@ -26,6 +26,18 @@ struct RecentDataSection: View {
                     .buttonStyle(.plain)
                     .foregroundStyle(model.rootFolder == url ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
                     .help(url.path(percentEncoded: false))
+                }
+            } header: {
+                HStack(spacing: 6) {
+                    Text("最近打开")
+                    Spacer(minLength: 8)
+                    Button("清空") {
+                        model.clearRecentFolders()
+                    }
+                    .buttonStyle(.plain)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .help("清掉这份列表，同时取消下次启动自动打开上次的数据（不会删除任何文件）")
                 }
             }
         }

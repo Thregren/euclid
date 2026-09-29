@@ -129,6 +129,7 @@ extension AppModel {
         }
         normalizeAnchor()
         pushLayers()
+        releaseUnusedZipArchives()
     }
 
     /// 保证「基准层」这个不变量：本地数据里有且只有一层是基准层。
@@ -225,6 +226,25 @@ extension AppModel {
     /// 把图层列表推给画布（图层与来源两个扩展都要用，故不加 private）。
     func pushLayers() {
         canvas.set(layers: layers, focus: anchorLayer?.fitRect)
+    }
+
+    /// 把不再被任何图层使用的 zip 归档从池子里放掉。
+    ///
+    /// 归档池只留 4 个分卷，用完会自己淘汰；但「换数据集」「删图层」这种一次性丢一片的场景，
+    /// 主动过一遍能让新数据立刻拿到名额、也尽早把大分卷的文件句柄还回去。
+    /// 池子是 actor，调用点在主线程上，因此这里发一个后台任务去做，不占着界面。
+    /// （跨文件要用，所以不是 `private`。）
+    func releaseUnusedZipArchives() {
+        var inUse: Set<String> = []
+        for layer in layers {
+            guard let source = layer.source as? ZipTileSource else { continue }
+            for volumes in source.parts.values {
+                for volume in volumes { inUse.insert(volume.url.path(percentEncoded: false)) }
+            }
+        }
+        Task.detached(priority: .utility) {
+            await ZipArchivePool.shared.forgetAll(except: inUse)
+        }
     }
 
     /// 由本地来源造一层。

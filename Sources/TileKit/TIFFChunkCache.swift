@@ -212,6 +212,10 @@ package final class TIFFChunkCache: @unchecked Sendable {
 
     /// 内存压力下按比例收缩（0…1 表示留多少）。
     package func trim(toFraction fraction: Double) {
+        // `Int(Double)` 遇到 NaN 会直接 trap，而 `min(max(nan, 0), 1)` **拦不住** NaN
+        //（Swift 的 min/max 见 NaN 原样返回）。现在调用方传的是字面量，
+        // 但内存压力回调将来若改成算出来的比例，这里就是一条崩溃路径。
+        guard fraction.isFinite else { return }
         let target = Int(Double(byteLimit) * min(max(fraction, 0), 1))
         lock.lock()
         defer { lock.unlock() }

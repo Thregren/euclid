@@ -432,6 +432,10 @@ public struct TileDownloader: Sendable {
                 let result = try await fetcher.fetch(TileRequest(url: url, headers: headers))
                 do {
                     try await directories.ensure(destination.deletingLastPathComponent())
+                    // 一律原子落盘（先写临时文件再 rename）。这里刻意不为了省一次 rename 改成直接写：
+                    // 下载跑到一半被中断（关窗口、断电）时，直接写会留下一个「半张瓦片」，
+                    // 而 `overwriteExisting = false` 的下一次下载会把它当成「已经有了」跳过 ——
+                    // 那格就永久坏了。rename 在 APFS 上是微秒级，相对一次网络取图可以忽略。
                     try result.data.write(to: destination, options: .atomic)
                 } catch {
                     return .failed("\(tile)：写入失败 \(error.localizedDescription)")
