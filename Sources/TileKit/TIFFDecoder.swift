@@ -11,13 +11,14 @@ enum TIFFDecoder {
     /// 把影像的一个像素区域采样进 RGBA8 画布的指定矩形。
     ///
     /// - Parameters:
-    ///   - source: 源图像素矩形（左上角为原点、y 向下）。允许越界，越界部分不画。
+    ///   - mapping: 画布像素（左上角为原点、y 向下）→ 该级影像像素 的映射。
+    ///     带旋转也行 —— 影像的平面坐标与铺图网格之间可能差着子午线收敛角。
+    ///   - destination: 要写的画布矩形（画布像素坐标，允许小数）。越界部分不画。
     ///   - canvas: RGBA8 缓冲区（预乘 alpha 由调用方决定，这里按「直通」写）。
-    ///   - destination: 目标矩形（画布像素坐标，允许小数）；`source` 线性映射到这里。
     static func draw(
         file: TIFFFile,
         level: TIFFImageFileDirectory,
-        source: CGRect,
+        mapping: RasterTileMapping,
         canvas: UnsafeMutablePointer<UInt8>,
         canvasWidth: Int,
         canvasHeight: Int,
@@ -82,8 +83,8 @@ enum TIFFDecoder {
         // 一个目标像素对应多少源像素：据此决定采样点个数。
         // 缩得很小时只取少量采样点（否则第一屏要把整幅影像的每个像素都摸一遍），
         // 接近 1:1 时用单点，避免把清晰的影像抹平。
-        let boxWidth = source.width / destinationWidth
-        let boxHeight = source.height / destinationHeight
+        let boxWidth = hypot(mapping.columnStep.dx, mapping.columnStep.dy)
+        let boxHeight = hypot(mapping.rowStep.dx, mapping.rowStep.dy)
         let taps = max(boxWidth, boxHeight) <= 1.2
             ? 1
             : (max(boxWidth, boxHeight) <= 12 ? 2 : 3)
@@ -93,7 +94,7 @@ enum TIFFDecoder {
         if store.usesSamples {
             try drawSamples(
                 store: store,
-                source: source,
+                mapping: mapping,
                 boxWidth: boxWidth,
                 boxHeight: boxHeight,
                 taps: taps,
@@ -109,14 +110,14 @@ enum TIFFDecoder {
         for row in 0..<rows {
             let y = startY + row
             guard y >= 0, y < canvasHeight else { continue }
-            // 目标像素中心反投到源像素坐标。
-            let v = (Double(row) + 0.5) / destinationHeight
-            let sourceY = source.minY + v * source.height
+            let canvasRow = Double(y) + 0.5
             for column in 0..<columns {
                 let x = startX + column
                 guard x >= 0, x < canvasWidth else { continue }
-                let u = (Double(column) + 0.5) / destinationWidth
-                let sourceX = source.minX + u * source.width
+                // 目标像素中心按映射反投到源像素坐标。
+                let point = mapping.source(column: Double(x) + 0.5, row: canvasRow)
+                let sourceX = point.x
+                let sourceY = point.y
 
                 var sumR = 0, sumG = 0, sumB = 0, sumA = 0, count = 0
                 if taps == 1 {
@@ -154,7 +155,7 @@ enum TIFFDecoder {
     /// 样本值而不是 RGBA；均值算完再统一映射，避免逐点量化带来的条纹。
     private static func drawSamples(
         store: ChunkStore,
-        source: CGRect,
+        mapping: RasterTileMapping,
         boxWidth: Double,
         boxHeight: Double,
         taps: Int,
@@ -175,13 +176,13 @@ enum TIFFDecoder {
         for row in 0..<rows {
             let y = startY + row
             guard y >= 0, y < canvasHeight else { continue }
-            let v = (Double(row) + 0.5) / destinationHeight
-            let sourceY = source.minY + v * source.height
+            let canvasRow = Double(y) + 0.5
             for column in 0..<columns {
                 let x = startX + column
                 guard x >= 0, x < canvasWidth else { continue }
-                let u = (Double(column) + 0.5) / destinationWidth
-                let sourceX = source.minX + u * source.width
+                let point = mapping.source(column: Double(x) + 0.5, row: canvasRow)
+                let sourceX = point.x
+                let sourceY = point.y
 
                 var totals: (Float, Float, Float) = (0, 0, 0)
                 var count = 0

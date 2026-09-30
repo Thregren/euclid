@@ -5,7 +5,8 @@ import Foundation
 ///
 /// 与 `RasterTileSource`（按需解文件里的某一块）分开：那边管磁盘上亿像素的大图，
 /// 这边只管一张已经算好、有地理参考的小图（几百万像素以内），因此可以直接裁剪采样。
-/// 定位口径两边共用 `RasterTileSource.pixelRect(ofTileWorld:georeference:)`。
+/// 定位口径两边共用 `RasterTileSource.mapping(ofTileWorld:georeference:tileSize:)`：
+/// 影像的平面坐标与铺图网格之间可能有旋转，按包围盒摊开会让接缝错位。
 public struct ImageTileSource: TileImageSource {
     public let image: CGImage
     public let georeference: RasterGeoreference
@@ -56,70 +57,36 @@ public struct ImageTileSource: TileImageSource {
     public func image(for tile: SlippyTile) async -> CGImage? {
         let tileWorld = tile.worldRect
         guard tileWorld.intersects(worldRect),
-              let rawPixelRect = RasterTileSource.pixelRect(
+              let mapping = RasterTileSource.mapping(
                   ofTileWorld: tileWorld,
-                  georeference: georeference
+                  georeference: georeference,
+                  tileSize: Double(tileSize)
               ) else { return nil }
-        let clipped = rawPixelRect.intersection(
-            CGRect(x: 0, y: 0, width: Double(pixelWidth), height: Double(pixelHeight))
-        )
-        guard !clipped.isNull, clipped.width >= 0.01, clipped.height >= 0.01,
-              rawPixelRect.width > 0, rawPixelRect.height > 0 else { return nil }
-
-        let scaleX = Double(image.width) / Double(pixelWidth)
-        let scaleY = Double(image.height) / Double(pixelHeight)
-        let source = CGRect(
-            x: clipped.minX,
-            y: clipped.minY,
-            width: clipped.width,
-            height: clipped.height
-        )
-        let destination = CGRect(
-            x: (clipped.minX - rawPixelRect.minX) * Double(tileSize) / rawPixelRect.width,
-            y: (clipped.minY - rawPixelRect.minY) * Double(tileSize) / rawPixelRect.height,
-            width: clipped.width * Double(tileSize) / rawPixelRect.width,
-            height: clipped.height * Double(tileSize) / rawPixelRect.height
-        )
+        let imageBounds = CGRect(x: 0, y: 0, width: Double(pixelWidth), height: Double(pixelHeight))
+        let canvasBounds = CGRect(x: 0, y: 0, width: Double(tileSize), height: Double(tileSize))
+        let clipped = mapping.sourceBoundingBox(ofCanvas: canvasBounds).intersection(imageBounds)
+        guard !clipped.isNull, clipped.width >= 0.01, clipped.height >= 0.01 else { return nil }
+        let destination = mapping.canvasBoundingBox(ofSource: clipped).integral.intersection(canvasBounds)
+        guard !destination.isNull, destination.width >= 0.5, destination.height >= 0.5 else { return nil }
 
         // 影像像素 → CGImage 像素：两者常常一样（1:1），但缩略图会不一样。
-        let crop = CGRect(
-            x: source.minX * scaleX,
-            y: source.minY * scaleY,
-            width: max(1, source.width * scaleX),
-            height: max(1, source.height * scaleY)
-        ).integral.intersection(CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        let imageMapping = mapping.scaled(
+            columnScale: Double(image.width) / Double(max(1, pixelWidth)),
+            rowScale: Double(image.height) / Double(max(1, pixelHeight))
+        )
+        let bounds = CGRect(x: 0, y: 0, width: Double(image.width), height: Double(image.height))
+        // 多留 1 像素边：旋转 / 双线性插值会用到边界外侧的像素。
+        let crop = imageMapping.sourceBoundingBox(ofCanvas: destination)
+            .integral
+            .insetBy(dx: -1, dy: -1)
+            .intersection(bounds)
         guard !crop.isNull, crop.width >= 1, crop.height >= 1,
               let piece = image.cropping(to: crop) else { return nil }
 
-        let pointsPerImagePixel = destination.width / max(0.0001, source.width * scaleX)
-        let offsetX = (crop.minX - source.minX * scaleX) * pointsPerImagePixel
-        let offsetY = (crop.minY - source.minY * scaleY) * pointsPerImagePixel
-        let width = crop.width * pointsPerImagePixel
-        let height = crop.height * pointsPerImagePixel
-        let topDownY = destination.minY + offsetY
-
         var canvas = [UInt8](repeating: 0, count: tileSize * tileSize * 4)
         let drawn: Bool = canvas.withUnsafeMutableBufferPointer { buffer in
-            guard let base = buffer.baseAddress,
-                  let space = CGColorSpace(name: CGColorSpace.sRGB),
-                  let context = CGContext(
-                      data: base,
-                      width: tileSize,
-                      height: tileSize,
-                      bitsPerComponent: 8,
-                      bytesPerRow: tileSize * 4,
-                      space: space,
-                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-                  ) else { return false }
-            context.interpolationQuality = .high
-            // 缓冲区首行是画面顶部，而 CGContext 的用户坐标 y 向上，换算一次。
-            context.draw(piece, in: CGRect(
-                x: destination.minX + offsetX,
-                y: CGFloat(tileSize) - (topDownY + height),
-                width: width,
-                height: height
-            ))
-            return true
+            guard let base = buffer.baseAddress else { return false }
+            return imageMapping.draw(piece: piece, pieceRect: crop, canvas: base, canvasSize: tileSize)
         }
         guard drawn else { return nil }
         return RasterTileSource.makeImage(canvas: canvas, width: tileSize, height: tileSize)

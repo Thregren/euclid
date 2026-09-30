@@ -2325,6 +2325,253 @@ do {
     }
 }
 
+// MARK: - 斜置影像的瓦片接缝（子午线收敛角）
+
+section("单幅影像：斜置影像的瓦片接缝")
+
+/// 造一张「上黑下白」的小图：分界线落在第 `size / 2` 行上。
+///
+/// 用灰度跃变当探针：铺图口径一旦按「包围盒 + 线性摊开」把影像的斜度吞掉，
+/// 相邻两块瓦片接缝两侧的分界线就会差出好几个画布像素，一条直线看着就是一跳一跳的。
+func makeSplitImage(size: Int) -> CGImage? {
+    var bytes = [UInt8](repeating: 0, count: size * size * 4)
+    for row in 0..<size {
+        let value: UInt8 = row < size / 2 ? 0 : 255
+        for column in 0..<size {
+            let index = (row * size + column) * 4
+            bytes[index] = value
+            bytes[index + 1] = value
+            bytes[index + 2] = value
+            bytes[index + 3] = 255
+        }
+    }
+    guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+          let provider = CGDataProvider(data: Data(bytes) as CFData) else { return nil }
+    return CGImage(
+        width: size,
+        height: size,
+        bitsPerComponent: 8,
+        bitsPerPixel: 32,
+        bytesPerRow: size * 4,
+        space: space,
+        bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+        provider: provider,
+        decode: nil,
+        shouldInterpolate: true,
+        intent: .defaultIntent
+    )
+}
+
+/// 把一张图缩成 `size` 见方（用来模拟「持久化概览小图」那条路）。
+func downscaleImage(_ image: CGImage, to size: Int) -> CGImage? {
+    guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+          let context = CGContext(
+              data: nil,
+              width: size,
+              height: size,
+              bitsPerComponent: 8,
+              bytesPerRow: 0,
+              space: space,
+              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+          ) else { return nil }
+    context.interpolationQuality = .high
+    context.draw(image, in: CGRect(x: 0, y: 0, width: size, height: size))
+    return context.makeImage()
+}
+
+do {
+    // 参数取自实测的 ODM 正射影像（7502 × 8176、EPSG:32650、0.05 米/像素，瓦片网格是墨卡托）：
+    // 影像自带一套 UTM 平面坐标，和铺图网格之间差着**子午线收敛角**
+    // （该点约 119.18°E、中央经线 117°E，γ ≈ 0.9°），因此影像在屏幕上是斜的。
+    //
+    // 旧口径把一块瓦片的四角换算成像素后取轴对齐包围盒，等于把这 0.9° 吞掉：
+    // 相邻两块瓦片各按各的包围盒拉伸，接缝两侧算出来的源像素差着「一块瓦片宽 × tan γ」，
+    // 在这份影像的 z21 上约 5.7 像素 —— 512 点的瓦片每块一跳，看着就是「瓦片错乱」。
+    // 现在改用「三只角定一个仿射」，下面把两条口径都算一遍。
+    guard let utm50 = TransverseMercator.fromEPSG(32650) else {
+        expect(false, "应认出 EPSG:32650（斜置影像自检）")
+        throw TilePyramidError.emptyRange
+    }
+    let odm = RasterGeoreference(
+        placement: .georeferenced,
+        crs: .transverseMercator(utm50),
+        originX: 718_007.767416,
+        originY: 2_885_031.540126,
+        pixelSizeX: 0.049995,
+        pixelSizeY: -0.049995
+    )
+    let world = odm.worldRect(pixelWidth: 7502, pixelHeight: 8176)
+    let zoom = 21
+    let tileSize = 512.0
+    let gridCount = Double(1 << zoom)
+    let left = SlippyTile(zoom: zoom, x: Int(world.midX * gridCount), y: Int(world.midY * gridCount))
+    let right = SlippyTile(zoom: zoom, x: left.x + 1, y: left.y)
+
+    /// 几何真值：画布点先按比例插值到该瓦片的**世界坐标**，再墨卡托反算经纬度、投影正算回影像像素。
+    /// 这条路上没有仿射近似，因此可以拿来量「铺图口径偏了多少像素」。
+    func groundTruth(tile: SlippyTile, column: Double, row: Double) -> CGPoint? {
+        let rect = tile.worldRect
+        let normalized = CGPoint(
+            x: rect.minX + column / tileSize * Double(rect.width),
+            y: rect.minY + row / tileSize * Double(rect.height)
+        )
+        return odm.pixel(for: WebMercator.coordinate(fromNormalized: normalized))
+    }
+    /// 旧口径：包围盒 + 线性摊开（这次修掉的那一条）。
+    func boundingBoxPoint(tile: SlippyTile, column: Double, row: Double) -> CGPoint? {
+        guard let rect = odm.pixelRect(ofWorldRect: tile.worldRect) else { return nil }
+        return CGPoint(
+            x: rect.minX + column / tileSize * Double(rect.width),
+            y: rect.minY + row / tileSize * Double(rect.height)
+        )
+    }
+    /// 新口径：三只角定仿射（铺图真正在用的那一条）。
+    func mappedPoint(tile: SlippyTile, column: Double, row: Double) -> CGPoint? {
+        RasterTileSource.pixelPoint(
+            ofTileWorld: tile.worldRect,
+            georeference: odm,
+            tileSize: tileSize,
+            column: column,
+            row: row
+        )
+    }
+    func gap(_ lhs: CGPoint?, _ rhs: CGPoint?) -> Double {
+        guard let lhs, let rhs else { return .infinity }
+        return hypot(lhs.x - rhs.x, lhs.y - rhs.y)
+    }
+
+    var worstMapped = 0.0
+    var worstBoundingBox = 0.0
+    for row in stride(from: 0.0, through: tileSize, by: 32) {
+        for (tile, column) in [(left, 0.0), (left, tileSize), (right, 0.0), (right, tileSize)] {
+            let reference = groundTruth(tile: tile, column: column, row: row)
+            worstMapped = max(worstMapped, gap(mappedPoint(tile: tile, column: column, row: row), reference))
+            worstBoundingBox = max(
+                worstBoundingBox,
+                gap(boundingBoxPoint(tile: tile, column: column, row: row), reference)
+            )
+        }
+    }
+    print(String(format: "    与几何真值的最大偏差：三只角定仿射 %.4f 像素，旧「包围盒 + 线性」 %.3f 像素",
+                 worstMapped, worstBoundingBox))
+    expect(worstMapped < 0.05, "三只角定仿射的口径误差应远小于一个像素（实际 \(worstMapped)）")
+    expect(worstBoundingBox > 1, "旧口径确实偏出若干像素（这正是错位的根因，实际 \(worstBoundingBox)）")
+
+    // 接缝本身：左右相邻的两块瓦片，在共享边界上应当取到**同一个影像像素**。
+    var seamGap = 0.0
+    var seamGapBoundingBox = 0.0
+    for row in stride(from: 0.0, through: tileSize, by: 32) {
+        seamGap = max(seamGap, gap(
+            mappedPoint(tile: left, column: tileSize, row: row),
+            mappedPoint(tile: right, column: 0, row: row)
+        ))
+        seamGapBoundingBox = max(seamGapBoundingBox, gap(
+            boundingBoxPoint(tile: left, column: tileSize, row: row),
+            boundingBoxPoint(tile: right, column: 0, row: row)
+        ))
+    }
+    print(String(format: "    相邻瓦片在共享边界上的源像素差：修好后 %.4f 像素，旧口径 %.2f 像素",
+                 seamGap, seamGapBoundingBox))
+    expect(seamGap < 0.05, "接缝两侧应取到同一个影像像素（实际差 \(seamGap) 像素）")
+    expect(seamGapBoundingBox > 1, "旧口径在接缝上会错开若干像素（实际 \(seamGapBoundingBox) 像素）")
+
+    // 端到端：真的取两张左右相邻的瓦片，看接缝两侧的灰度分界线落在同一画布行上。
+    if let split = makeSplitImage(size: 64) {
+        // 64 像素 × 0.4 米 = 25.6 米见方，分界线在影像第 32 行（上黑下白）。
+        let placed = RasterGeoreference(
+            placement: .georeferenced,
+            crs: .transverseMercator(utm50),
+            originX: odm.originX,
+            originY: odm.originY,
+            pixelSizeX: 0.4,
+            pixelSizeY: -0.4
+        )
+        let source = ImageTileSource(image: split, georeference: placed, tileSize: 512)
+        let extent = source.worldRect
+        let deep = 24
+        let deepCount = Double(1 << deep)
+        let seed = SlippyTile(
+            zoom: deep,
+            x: Int(extent.midX * deepCount),
+            y: Int(extent.midY * deepCount)
+        )
+        let neighbor = SlippyTile(zoom: deep, x: seed.x + 1, y: seed.y)
+
+        /// 这一小块影像自己的映射（注意：不能借用上面那份 7502 像素影像的 `mappedPoint`，
+        /// 两者的像素尺度差了 8 倍）。
+        func placedPoint(tile: SlippyTile, column: Double, row: Double) -> CGPoint? {
+            RasterTileSource.pixelPoint(
+                ofTileWorld: tile.worldRect,
+                georeference: placed,
+                tileSize: tileSize,
+                column: column,
+                row: row
+            )
+        }
+        /// 某一列上「黑 → 白」的跃变行（画布行号，自上而下）。
+        func transitionRow(_ bytes: [UInt8], column: Int, size: Int) -> Double? {
+            var previous = -1
+            for row in 0..<size {
+                let value = Int(bytes[(row * size + column) * 4])
+                if previous >= 0, previous < 128, value >= 128 { return Double(row) }
+                previous = value
+            }
+            return nil
+        }
+        /// 分界线（影像第 32 行）在这一列上的画布行号，按仿射口径算。
+        func expectedRow(tile: SlippyTile, column: Double) -> Double? {
+            guard let top = placedPoint(tile: tile, column: column, row: 0),
+                  let bottom = placedPoint(tile: tile, column: column, row: tileSize),
+                  abs(bottom.y - top.y) > 1e-9 else { return nil }
+            return tileSize * (32 - top.y) / (bottom.y - top.y)
+        }
+
+        if let leftBytes = await source.image(for: seed).flatMap(rgbaBytes), let rightBytes = await
+            source.image(for: neighbor).flatMap(rgbaBytes),
+           let rowLeft = transitionRow(leftBytes, column: source.tileSize - 1, size: source.tileSize),
+           let rowRight = transitionRow(rightBytes, column: 0, size: source.tileSize),
+           let wantLeft = expectedRow(tile: seed, column: Double(source.tileSize) - 0.5),
+           let wantRight = expectedRow(tile: neighbor, column: 0.5) {
+            print(String(format: "    接缝处的分界行：左块 %.1f（应为 %.1f），右块 %.1f（应为 %.1f）",
+                         rowLeft, wantLeft, rowRight, wantRight))
+            expect(abs(rowLeft - wantLeft) <= 1.5, "左块分界行应与几何真值一致（差 \(rowLeft - wantLeft)）")
+            expect(abs(rowRight - wantRight) <= 1.5, "右块分界行应与几何真值一致（差 \(rowRight - wantRight)）")
+            expect(abs(rowLeft - rowRight) <= 1.5, "接缝两侧的分界行应一致（差 \(rowLeft - rowRight) 行）")
+        } else {
+            expect(false, "应能取到接缝两侧的瓦片并读出分界行（seed=\(seed)）")
+        }
+
+        // 「没有内建概览的大图」低层级是拿持久化概览小图铺的，走的是同一个 `draw`，
+        // 只是映射多了一次等比缩小。这里用 32 像素的小图模拟，核对它同样不翻、不错位。
+        if let small = downscaleImage(split, to: 32) {
+            let thumbnail = ImageTileSource(
+                image: small,
+                georeference: placed,
+                pixelWidth: 64,
+                pixelHeight: 64,
+                tileSize: 512
+            )
+            if let bytes = await thumbnail.image(for: seed).flatMap(rgbaBytes),
+               let middle = transitionRow(bytes, column: 255, size: 512),
+               let want = expectedRow(tile: seed, column: 255.5) {
+                let top = Int(bytes[(8 * 512 + 255) * 4])
+                let bottom = Int(bytes[(504 * 512 + 255) * 4])
+                print("    概览小图铺瓦片：上端亮度 \(top)、下端 \(bottom)、分界行 \(String(format: "%.0f", middle))"
+                    + "（应为 \(String(format: "%.0f", want))）")
+                // 32 像素的小图放大到 512 点，一个源像素就是 16 点，容差按一个源像素给。
+                expect(top < 64 && bottom > 192, "概览铺出来的瓦片不应上下颠倒（上端 \(top)、下端 \(bottom)）")
+                expect(abs(middle - want) <= 24, "概览铺出来的分界线应与几何真值一致（差 \(middle - want)）")
+            } else {
+                expect(false, "概览小图应能铺出瓦片并读出分界线")
+            }
+        } else {
+            expect(false, "应能把自检用的小图缩成概览尺寸")
+        }
+    } else {
+        expect(false, "应能造出自检用的「上黑下白」小图")
+    }
+}
+
 // MARK: - 瓦片网格（墨卡托 / 经纬度）
 
 section("瓦片网格")
