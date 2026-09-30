@@ -606,9 +606,11 @@ final class TileCanvasNSView: NSView {
         }
         syncHostLayerFrames()
 
-        // 本地数据集的范围还没算出来时先不铺图：此时相机只能停在数据之外，
+        // 基准数据集的范围还没算出来时先不铺图：此时相机只能停在数据之外，
         // 铺出来只会是一屏空占位并白读磁盘（范围一到画面还要整体跳一次）。
-        awaitingExtent = layers.contains { $0.kind == .dataset && $0.fitRect == nil }
+        // 只认基准层：叠加进来的数据集在算自己那份范围时，当前视野与它无关，
+        // 不该把已经在看的画面一起停掉。
+        awaitingExtent = layers.contains { $0.isAnchor && $0.kind == .dataset && $0.fitRect == nil }
 
         updateAccessibilityLabel()
         let focusRect = focus ?? anchorLayer?.fitRect

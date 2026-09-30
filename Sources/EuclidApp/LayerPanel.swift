@@ -156,12 +156,13 @@ struct LayersPanel: View {
             }
             Section("本地数据") {
                 ForEach(model.rasters) { raster in
-                    Button(raster.name) { model.addLayer(model.makeLayer(raster: raster)) }
+                    Button(raster.name) { model.stackLayer(model.makeLayer(raster: raster)) }
                 }
                 ForEach(model.datasets) { dataset in
-                    Button(dataset.name) { model.addLayer(model.makeLayer(dataset: dataset)) }
+                    Button(dataset.name) { model.addDatasetLayer(dataset) }
                 }
                 Divider()
+                // 已经开着数据时这两个也会**叠加**成新图层（见 `openWithoutRemembering`）。
                 Button("打开单幅影像…") { model.promptForRaster() }
                 Button("打开瓦片目录…") { model.promptForFolder() }
             }

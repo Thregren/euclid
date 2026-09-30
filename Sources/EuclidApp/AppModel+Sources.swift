@@ -20,6 +20,13 @@ extension AppModel {
     /// 界面上是否有可看的内容（本地数据集或在线底图）。
     var hasMapContent: Bool { selectedSourceName != nil || onlineBasemap != nil }
 
+    /// 画布上是否已经有本地数据（瓦片数据集或单幅影像）。
+    ///
+    /// 这是「打开」的分岔点：已经有本地内容时，新打开的东西**叠加**成一层，
+    /// 而不是被设为基准层、把老的那份顶掉（老图层、测量与视野都保持不动）。
+    /// 要换「当前数据」走 `activateLayer`（点图层面板里那一行）。
+    var hasLocalLayer: Bool { layers.contains { $0.kind != .online } }
+
     /// 正在忙什么；nil 表示空闲。用于画布上的进度指示（HIG：加载时别只留空白）。
     var loadingMessage: String? {
         if isScanning { return "正在扫描目录…" }
@@ -191,46 +198,138 @@ extension AppModel {
         openWithoutRemembering(url, isDirectory: isDirectory.boolValue)
     }
 
-    /// 一次打开多个路径：第一个当主内容，其余作为**叠加图层**依次加上去。
+    /// 一次拖入多个路径：第一个当「打开」（会写进最近记录），其余的一律**叠加成新图层**。
     ///
-    /// 拖进来的东西可能混着目录、zip 分卷与单幅影像；这里只在能读出地理参考的
-    /// 单幅影像上做叠加 —— 其余的逐个打开会把刚铺好的主内容顶掉，反而不是用户要的。
+    /// 拖进来的东西可能混着目录、zip 分卷与单幅影像，因此这里按和 `openWithoutRemembering`
+    /// 完全相同的规则分流：画布上已经有数据时，每个后面的路径都只加一层，
+    /// 老图层、当前数据、测量与视野全都不动。谁都顶替不掉谁。
     func open(_ urls: [URL]) {
         guard let first = urls.first else { return }
         open(first)
-        let extras = urls.dropFirst().filter {
+        for url in urls.dropFirst() {
             var isDirectory: ObjCBool = false
-            let exists = FileManager.default.fileExists(
-                atPath: $0.path(percentEncoded: false), isDirectory: &isDirectory
-            )
-            // 只有「确实存在、而且不是目录」的才当叠加影像去读；
-            // 目录 / zip 分卷这些一律交给第一个路径那条链路处理。
-            return exists && !isDirectory.boolValue
+            guard FileManager.default.fileExists(atPath: url.canonicalFilePath, isDirectory: &isDirectory) else {
+                setStatus("找不到这个路径：\(url.lastPathComponent)", autoClearAfter: 6)
+                continue
+            }
+            if isDirectory.boolValue {
+                addDatasetLayer(at: url)
+            } else if url.pathExtension.lowercased() == "zip" {
+                addDatasetLayer(at: DatasetLocator.datasetRoot(containing: url), preferring: url)
+            } else {
+                addRasterLayer(at: url)
+            }
         }
-        guard !extras.isEmpty else { return }
-        addOverlayRasters(from: Array(extras))
     }
 
-    /// 把一批影像读进来当叠加图层。
+    // MARK: - 叠加（已经开着数据时，把新打开的东西加为新图层）
+
+    /// 把一层本地数据**叠**到现有图层上，返回是否真的加了一层。
     ///
-    /// 读完再挂：`RasterLoader.load` 要读文件头（可能几百毫秒），逐个在主线程读会卡住界面。
-    /// 每挂一层都走 `addLayer`，于是图层顺序、基准层、不透明度这些既有规则全都不用另写一套。
-    private func addOverlayRasters(from urls: [URL]) {
+    /// 「同一份数据在画布上只留一层」是既有约定（见 `applyLocalLayer`）：重复打开同一份
+    /// 数据、或从 ＋ 菜单里点一份已经在画布上的数据，都不该再叠出第二个一模一样的图层。
+    ///
+    /// 这里不碰基准层身份 —— 它只由「设为当前数据」（`activateLayer`）决定。
+    @discardableResult
+    func stackLayer(_ layer: MapLayer) -> Bool {
+        let hadLocalLayer = hasLocalLayer
+        if layers.contains(where: { $0.kind != .online && $0.sourceID == layer.sourceID }) {
+            setStatus("「\(layer.name)」已经在画布上了", autoClearAfter: 6)
+            return false
+        }
+        var layer = layer
+        if layer.kind != .online { layer.isAnchor = false }
+        addLayer(layer, announce: false)
+        setStatus(
+            hadLocalLayer ? "已叠加图层：\(layer.name)（原图层保留）" : "已添加图层：\(layer.name)",
+            autoClearAfter: 6
+        )
+        return true
+    }
+
+    /// 把一份单幅影像叠成图层（已经开着数据时走这条，见 `openWithoutRemembering`）。
+    ///
+    /// 与 `openRaster` 的区别是**什么都不换**：不进加载态、不动基准层与测量，
+    /// 读完文件头挂一层就完事 —— 用户在看的还是原来那份数据。
+    func addRasterLayer(at url: URL) {
+        let tabID = activeWorkspaceTabID
         Task {
-            var added = 0
-            for url in urls {
-                let raster = await Task.detached(priority: .userInitiated) {
-                    try? RasterLoader.load(url: url)
-                }.value
-                guard let raster else {
-                    setStatus("叠加失败：读不出 \(url.lastPathComponent)", autoClearAfter: 6)
-                    continue
-                }
-                addLayer(makeLayer(raster: raster))
-                added += 1
+            let raster = await Task.detached(priority: .userInitiated) {
+                try? RasterLoader.load(url: url)
+            }.value
+            // 读文件头的这几百毫秒里用户可能已经切到别的标签页了：这份结果就不属于当前画面了。
+            guard activeWorkspaceTabID == tabID else { return }
+            guard let raster else {
+                setStatus("叠加失败：读不出 \(url.lastPathComponent)", autoClearAfter: 8)
+                return
             }
-            if added > 0 {
-                setStatus("已叠加 \(added) 个图层", autoClearAfter: 6)
+            rasters.removeAll { $0.id == raster.id }
+            rasters.insert(raster, at: 0)
+            stackLayer(makeLayer(raster: raster))
+        }
+    }
+
+    /// 把一份瓦片数据集叠成图层（已经开着数据时走这条，见 `openWithoutRemembering`）。
+    ///
+    /// 扫出来的数据并进「已打开的数据」列表（＋ 菜单里仍可各自加一层），
+    /// 但只把其中一份挂上画布：拖进来的是某个分卷时优先选包含它的那份，
+    /// 否则就是扫到的第一份 —— 与「第一次打开这个目录」选的完全是同一份。
+    func addDatasetLayer(at url: URL, preferring preferred: URL? = nil) {
+        let tabID = activeWorkspaceTabID
+        Task {
+            let found = await Task.detached(priority: .userInitiated) {
+                DatasetLocator.discover(at: url)
+            }.value
+            guard activeWorkspaceTabID == tabID else { return }
+            guard !found.isEmpty else {
+                setStatus("在 \(url.lastPathComponent) 中没有找到瓦片目录（<z>/<x>/<y>）或 zip 分卷包", autoClearAfter: 0)
+                return
+            }
+            // 新扫到的并进列表，老的那些原样留着（＋ 菜单里还能把它们各自加一层）。
+            datasets = DatasetLocator.merging(datasets, with: found)
+
+            // 拖进来的是某个分卷时，加的是包含它的那份数据（与第一次打开时选的是同一份）。
+            let match = preferred.flatMap { DatasetLocator.dataset(containingVolume: $0, in: found) }
+            let dataset = match ?? found[0]
+            addDatasetLayer(dataset)
+        }
+    }
+
+    /// 把一份**已经发现过**的数据集叠成图层（＋ 菜单里点的那条路）。
+    func addDatasetLayer(_ dataset: TileDataset) {
+        var layer = makeLayer(dataset: dataset)
+        // 这份数据的范围还不知道（`extent` 是当前数据那一份的）：先留空，
+        // 别拿当前数据的范围冒充它。算出来再填。
+        layer.fitRect = nil
+        guard stackLayer(layer) else { return }
+        resolveFitRect(of: layer.id, dataset: dataset)
+    }
+
+    /// 给叠加进来的数据集补上它自己的适配范围。
+    ///
+    /// 只更新这一层，**不动相机**：用户在看的还是原来那份数据
+    /// （「适配窗口」也仍然以基准层为准）。范围要扫完目录才知道，因此放后台。
+    private func resolveFitRect(of layerID: String, dataset: TileDataset) {
+        let tabID = activeWorkspaceTabID
+        Task {
+            let result = await Task.detached(priority: .userInitiated) {
+                DatasetLocator.extent(of: dataset)
+            }.value
+            guard activeWorkspaceTabID == tabID else { return }
+            // 图层可能已经被用户删掉了（或者换了数据集）：那就没有要更新的东西。
+            guard let index = layers.firstIndex(where: { $0.id == layerID }) else { return }
+            guard let result else {
+                setStatus("「\(dataset.name)」的数据范围读不出来，已按默认层级显示", autoClearAfter: 8)
+                return
+            }
+            layers[index].fitRect = result.worldRect
+            pushLayers()
+            // 新数据要是在视野之外，画面上一点变化都没有，用户会以为没打开成功 —— 补一句怎么过去。
+            if let visible = canvas.visibleWorldRect, visible.intersection(result.worldRect).isNull {
+                setStatus(
+                    "已叠加图层：\(dataset.name)（不在当前视野，点图层面板里那一行可切过去）",
+                    autoClearAfter: 12
+                )
             }
         }
     }
@@ -245,35 +344,54 @@ extension AppModel {
         openWithoutRemembering(url, isDirectory: isDirectory.boolValue)
     }
 
+    /// 「打开」的唯一分岔口。
+    ///
+    /// 画布上还没有本地数据时，这份数据就是**当前数据**（成为基准层，相机按它适配）；
+    /// 已经有数据在看时，它**叠加**成一层新图层 —— 老图层、`selectedSourceID`、
+    /// 测量存档与相机视野一律不动（用户说的「叠加为新图册，而不是把老图层顶掉」）。
     private func openWithoutRemembering(_ url: URL, isDirectory: Bool) {
-        guard isDirectory else {
+        let stacking = hasLocalLayer
+        if !isDirectory {
             // 拖进来一个 zip 分卷：当成「打开它所在的那份数据」。
-            // 分卷通常躺在 `z12/` 这种层级目录里，那就再往上走一层找数据集根目录。
             if url.pathExtension.lowercased() == "zip" {
-                let parent = url.deletingLastPathComponent()
-                let root = Int(parent.lastPathComponent) != nil ? parent.deletingLastPathComponent() : parent
-                rootFolder = root
-                scan(root, preferring: url)
+                let root = DatasetLocator.datasetRoot(containing: url)
+                if stacking {
+                    addDatasetLayer(at: root, preferring: url)
+                } else {
+                    rootFolder = DatasetLocator.canonicalURL(root)
+                    scan(root, preferring: url)
+                }
                 return
             }
             // 文件：按单幅影像打开（GeoTIFF / TIFF / 普通图片）。
-            openRaster(url)
+            if stacking {
+                addRasterLayer(at: url)
+            } else {
+                openRaster(url)
+            }
             return
         }
-        rootFolder = url
-        scan(url)
+        if stacking {
+            addDatasetLayer(at: url)
+        } else {
+            rootFolder = DatasetLocator.canonicalURL(url)
+            scan(url)
+        }
     }
 
     /// 记住最近打开过的目录或文件。
     private func remember(_ url: URL) {
-        let path = url.path(percentEncoded: false)
+        // 最近列表里存的是规范路径：拖放给的目录 URL 常常带尾斜杠，
+        // 不规范化同一份数据会在列表里出现两行、点哪行都看不出区别。
+        let url = DatasetLocator.canonicalURL(url)
+        let path = url.canonicalFilePath
         UserDefaults.standard.set(path, forKey: "lastRootFolder")
-        recentFolders.removeAll { $0.path(percentEncoded: false) == path }
+        recentFolders.removeAll { $0.canonicalFilePath == path }
         recentFolders.insert(url, at: 0)
         if recentFolders.count > 8 {
             recentFolders = Array(recentFolders.prefix(8))
         }
-        UserDefaults.standard.set(recentFolders.map { $0.path(percentEncoded: false) }, forKey: "recentFolders")
+        UserDefaults.standard.set(recentFolders.map(\.canonicalFilePath), forKey: "recentFolders")
     }
 
     /// 清空「最近打开」列表（检查器里那个「清空」按钮）。
@@ -338,15 +456,7 @@ extension AppModel {
                 selectSource(nil)
             } else {
                 // 拖具体某个分卷进来时，优先选中包含它的那份数据。
-                let preferredPath = preferred?.path(percentEncoded: false)
-                let match = preferredPath.flatMap { path in
-                    found.first { dataset in
-                        guard let info = dataset.zipInfo else { return false }
-                        return info.parts.values.contains { volumes in
-                            volumes.contains { $0.url.path(percentEncoded: false) == path }
-                        }
-                    }
-                }
+                let match = preferred.flatMap { DatasetLocator.dataset(containingVolume: $0, in: found) }
                 selectSource((match ?? found[0]).id)
             }
         }

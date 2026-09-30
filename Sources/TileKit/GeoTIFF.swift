@@ -366,9 +366,9 @@ public enum RasterLoader {
             tileCount: (pixelWidth + tileSize - 1) / tileSize * ((pixelHeight + tileSize - 1) / tileSize)
         )
         return RasterDataset(
-            id: url.path(percentEncoded: false),
+            id: url.canonicalFilePath,
             name: name,
-            fileURL: url,
+            fileURL: DatasetLocator.canonicalURL(url),
             pixelWidth: pixelWidth,
             pixelHeight: pixelHeight,
             georeference: georeference,

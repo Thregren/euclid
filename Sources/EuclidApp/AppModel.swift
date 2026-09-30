@@ -453,7 +453,7 @@ final class AppModel {
         }
         if let saved = UserDefaults.standard.string(forKey: "lastRootFolder"),
            FileManager.default.fileExists(atPath: saved) {
-            initialURL = URL(fileURLWithPath: saved)
+            initialURL = DatasetLocator.canonicalURL(URL(fileURLWithPath: saved))
         }
         installMemoryPressureMonitor()
     }
@@ -482,9 +482,11 @@ final class AppModel {
 
     static func loadRecentFolders() -> [URL] {
         let paths = UserDefaults.standard.stringArray(forKey: "recentFolders") ?? []
+        var seen: Set<String> = []
         return paths
-            .filter { FileManager.default.fileExists(atPath: $0) }
-            .map { URL(fileURLWithPath: $0) }
+            .map { DatasetLocator.canonicalURL(URL(fileURLWithPath: $0)) }
+            .filter { FileManager.default.fileExists(atPath: $0.canonicalFilePath) }
+            .filter { seen.insert($0.canonicalFilePath).inserted }
     }
 
     // MARK: - 状态栏提示

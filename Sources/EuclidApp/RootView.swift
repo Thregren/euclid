@@ -69,6 +69,7 @@ struct RootView: View {
             DebugAnalysisScript.runIfRequested(model: model)
             DebugTabsScript.runIfRequested(model: model)
             DebugLayerScript.runIfRequested(model: model)
+            DebugOpenStackScript.runIfRequested(model: model)
             DebugInputScript.runIfRequested(model: model)
             DebugMemoryScript.runIfRequested(model: model)
         }

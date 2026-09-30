@@ -1,6 +1,19 @@
 import CoreGraphics
 import Foundation
 
+public extension URL {
+    /// 「路径即身份」时用的规范路径：**去掉末尾的 `/`**。
+    ///
+    /// 数据集 / 影像的 `id` 就是这段路径字符串。拖放给的目录 URL 常常带尾斜杠
+    /// （`URL(fileURLWithPath:)` 对**已存在的目录**往返一圈也会把斜杠加回来），
+    /// 不规范化的话同一份数据会变成两个 id：列表里出现两行、叠加时去重也认不出来。
+    var canonicalFilePath: String {
+        var path = path(percentEncoded: false)
+        while path.count > 1 && path.hasSuffix("/") { path.removeLast() }
+        return path
+    }
+}
+
 /// 一个可打开的瓦片数据集。
 public struct TileDataset: Identifiable, Hashable, Sendable {
     public let id: String
@@ -87,6 +100,66 @@ public enum DatasetLocator {
         return result
     }
 
+    /// 把新扫到的数据并进「已经打开的数据」列表：同一条只留一份、新的排前面。
+    ///
+    /// 「又打开一份数据」不该把已经打开的那些从列表里抹掉 —— 它们还挂在画布上，
+    /// 也还要能在 ＋ 菜单里再叠一层（见 `AppModel.addDatasetLayer`）。
+    /// 同 id 时留新扫到的那份：目录被重新扫过，新的描述更可信。
+    public static func merging(_ existing: [TileDataset], with found: [TileDataset]) -> [TileDataset] {
+        var seen: Set<String> = []
+        var merged: [TileDataset] = []
+        for dataset in found + existing where seen.insert(dataset.id).inserted {
+            merged.append(dataset)
+        }
+        return merged
+    }
+
+    /// 在一批数据里找出「包含这个分卷文件」的那一份。
+    ///
+    /// 拖进来的可能是 `z12/xxx-0001.zip` 这样的一个分卷：用户要的是它所属的那份数据，
+    /// 不是某个分卷；找不到归属（比如散文件目录）时返回 nil。
+    public static func dataset(containingVolume volume: URL, in datasets: [TileDataset]) -> TileDataset? {
+        let path = volume.canonicalFilePath
+        return datasets.first { dataset in
+            guard let info = dataset.zipInfo else { return false }
+            return info.parts.values.contains { volumes in
+                volumes.contains { $0.url.canonicalFilePath == path }
+            }
+        }
+    }
+
+    /// 拖进来一个分卷文件时，推出它所属的那份数据的根目录。
+    ///
+    /// 分卷通常躺在 `z12/`（或 `12/`）这样的层级目录里 —— 那就再看上一层本身是不是一份数据：
+    /// 认得出就用上一层，于是打开的是**整份**数据，而不是只剩 z12 这一层的残缺数据集；
+    /// 认不出（分卷直接堆在自己的根目录里）就仍用分卷所在目录。
+    ///
+    /// 判定要列一次目录、读一次 manifest，因此只在「拖进来一个分卷」这条路上用。
+    public static func datasetRoot(containing volume: URL) -> URL {
+        let parent = volume.deletingLastPathComponent()
+        guard isZoomLevelDirectoryName(parent.lastPathComponent) else { return canonicalURL(parent) }
+        let higher = parent.deletingLastPathComponent()
+        return canonicalURL(makeDataset(at: higher) != nil ? higher : parent)
+    }
+
+    /// 目录名是不是「层级目录」：`12`、`z12`、`Z12` 都算，`z12副本`、`福建省瓦片` 不算。
+    public static func isZoomLevelDirectoryName(_ name: String) -> Bool {
+        var digits = Substring(name)
+        if let first = digits.first, first == "z" || first == "Z" { digits = digits.dropFirst() }
+        return !digits.isEmpty && digits.allSatisfy { $0.isNumber }
+    }
+
+    /// 去掉目录 URL 末尾的 `/`（数据集的 `id` / `rootURL` 都走它）。
+    ///
+    /// `deletingLastPathComponent()` 出来的目录 URL 带尾斜杠，面板 / 拖放给的又常常不带；
+    /// 而数据集的身份就是这段路径字符串，两种写法会让同一份数据变成两个 id。
+    public static func canonicalURL(_ url: URL) -> URL {
+        let canonical = url.canonicalFilePath
+        guard canonical != url.path(percentEncoded: false) else { return url }
+        // `isDirectory: false` 很关键：默认构造会对**已存在的目录**把尾斜杠加回来。
+        return URL(fileURLWithPath: canonical, isDirectory: false)
+    }
+
     /// 若目录自身就是数据集则返回描述，否则返回 nil。
     public static func makeDataset(at url: URL) -> TileDataset? {
         // zip 分卷包优先：它自带覆盖范围，描述比「扫一遍目录猜出来的」更准。
@@ -104,9 +177,9 @@ public enum DatasetLocator {
         guard let layout = detectLayout(at: url, levels: levels) else { return nil }
         let name = url.lastPathComponent
         return TileDataset(
-            id: url.path(percentEncoded: false),
+            id: url.canonicalFilePath,
             name: name,
-            rootURL: url,
+            rootURL: canonicalURL(url),
             layout: layout,
             zoomRange: minZoom...maxZoom
         )

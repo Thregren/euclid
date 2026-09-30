@@ -341,6 +341,62 @@ enum DebugLayerScript {
     }
 }
 
+/// 开发调试用的「叠加打开」核对脚本。
+///
+/// `EUCLID_DEBUG_OPEN_STACK="<路径>|<路径>|…"` 时按顺序把它们打开：走的是真实的
+/// 「打开」分岔口（`openForDebugging` → `openWithoutRemembering`），只是不写「最近打开」偏好。
+/// 每打开一份就打印一次图层、当前数据、视野与测量条数 —— 用来核对
+/// 「已经开着数据时再打开一份，是**叠成新图层**，而不是把老图层顶掉」：
+/// 图层数应当递增、第一份仍在、基准层不变、视野与测量条数不该被改动。
+///
+/// `EUCLID_DEBUG_OPEN_STACK_WAIT=<秒>` 可覆盖每步的等待（默认 16 秒：大目录扫范围要时间）。
+@MainActor
+enum DebugOpenStackScript {
+    static func runIfRequested(model: AppModel) {
+        guard let raw = ProcessInfo.processInfo.environment["EUCLID_DEBUG_OPEN_STACK"] else { return }
+        let paths = raw.split(separator: "|", omittingEmptySubsequences: true)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        guard !paths.isEmpty else { return }
+        let environment = ProcessInfo.processInfo.environment
+        let wait = Double(environment["EUCLID_DEBUG_OPEN_STACK_WAIT"] ?? "") ?? 16
+
+        Task { @MainActor in
+            for (index, path) in paths.enumerated() {
+                try? await Task.sleep(for: .seconds(wait))
+                model.openForDebugging(URL(fileURLWithPath: path))
+                try? await Task.sleep(for: .seconds(wait))
+                log("第 \(index + 1) 份「\(path)」打开之后：", model)
+                // 第一份铺好之后随手落两个点：后面每打开一份都要证明这两条还在。
+                if index == 0, model.measurements.measurements.isEmpty {
+                    model.dropPointAtCursor()
+                    model.dropPointAtCursor()
+                    log("（落两个点当哨兵）", model)
+                }
+            }
+            model.canvas.snapshot(index: 95)
+        }
+    }
+
+    private static func log(_ label: String, _ model: AppModel) {
+        let layers = model.layers
+            .map { "\($0.name)<\($0.kind.rawValue)\($0.isAnchor ? "·基准" : "")>" }
+            .joined(separator: " | ")
+        let center = model.viewport.center
+        let lines = [
+            "图层 \(model.layers.count) 层：\(layers)",
+            "当前数据：\(model.selectedSourceName ?? "无")｜已发现 数据集 \(model.datasets.count) 份 / 影像 \(model.rasters.count) 幅",
+            String(format: "视野：中心 %.5f,%.5f  z%.2f  地面比例 %.4f 米/点  可见瓦片 %d",
+                   center.longitude, center.latitude, model.viewport.zoomLevel,
+                   model.viewport.metersPerPoint, model.viewport.visibleTiles),
+            "测量：\(model.measurements.measurements.count) 条"
+        ]
+        for line in lines {
+            FileHandle.standardError.write(Data(("[stack] " + label + " " + line + "\n").utf8))
+        }
+    }
+}
+
 /// 开发调试用的窗口截图脚本。
 ///
 /// `EUCLID_DEBUG_WINDOW_SNAPSHOT=<路径>` 时启动若干秒后把**整个窗口内容**渲染成 PNG。

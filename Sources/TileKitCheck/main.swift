@@ -569,6 +569,103 @@ if let dataset = DatasetLocator.makeDataset(at: syntheticRoot) {
     expect(false, "应能识别出构造的数据集")
 }
 
+// MARK: - 又打开一份数据：已打开列表的合并与分卷归属
+
+section("打开数据：已打开列表的合并与分卷归属")
+
+func fakeDataset(id: String, name: String, zipParts: [Int: [ZipVolume]]? = nil) -> TileDataset {
+    TileDataset(
+        id: id,
+        name: name,
+        rootURL: URL(fileURLWithPath: id),
+        layout: .webODM,
+        zoomRange: 12...18,
+        zipInfo: zipParts.map { ZipDatasetInfo(parts: $0) }
+    )
+}
+
+let firstDataset = fakeDataset(id: "/tmp/甲", name: "甲")
+let secondDataset = fakeDataset(id: "/tmp/乙", name: "乙")
+
+// 「已经开着甲，再打开乙」：老的那份必须还在 —— 这是「别把老图层顶掉」的根子。
+let mergedOnce = DatasetLocator.merging([firstDataset], with: [secondDataset])
+expect(mergedOnce.count == 2, "打开第二份之后列表里应有两份（实际 \(mergedOnce.count)）")
+expect(mergedOnce.first?.id == secondDataset.id, "新打开的应排在前面")
+expect(mergedOnce.contains { $0.id == firstDataset.id }, "老的那份不该被顶掉")
+
+// 重复打开同一份：只留一份，且留的是新扫到的那份描述。
+let rescannedFirst = fakeDataset(id: firstDataset.id, name: "甲（重扫）")
+let mergedAgain = DatasetLocator.merging([firstDataset, secondDataset], with: [rescannedFirst])
+expect(mergedAgain.count == 2, "重复打开同一份不该加出第三份（实际 \(mergedAgain.count)）")
+expect(mergedAgain.first?.name == "甲（重扫）", "同 id 时应留新扫到的那份")
+expect(mergedAgain.filter { $0.id == firstDataset.id }.count == 1, "同 id 只应出现一次")
+
+// 扫到空目录：现有列表原样保留。
+expect(
+    DatasetLocator.merging([firstDataset, secondDataset], with: []).map(\.id)
+        == [firstDataset.id, secondDataset.id],
+    "扫到空目录时不该动已有列表"
+)
+
+// 分卷归属：拖进来一个分卷时，要认出它属于哪一份数据。
+let volumeA = ZipVolume(url: URL(fileURLWithPath: "/tmp/甲/z12/甲-0001.zip"), rowRange: 0...1023)
+let volumeB = ZipVolume(url: URL(fileURLWithPath: "/tmp/乙/z12/乙-0001.zip"), rowRange: 0...1023)
+let archiveA = fakeDataset(id: "/tmp/甲", name: "甲", zipParts: [12: [volumeA]])
+let archiveB = fakeDataset(id: "/tmp/乙", name: "乙", zipParts: [12: [volumeB]])
+expect(
+    DatasetLocator.dataset(containingVolume: volumeB.url, in: [archiveA, archiveB])?.id == archiveB.id,
+    "应认出分卷属于乙那份数据"
+)
+expect(
+    DatasetLocator.dataset(containingVolume: URL(fileURLWithPath: "/tmp/丙/z12/丙-0001.zip"), in: [archiveA, archiveB]) == nil,
+    "认不出归属的分卷应返回 nil"
+)
+expect(
+    DatasetLocator.dataset(containingVolume: volumeA.url, in: [firstDataset]) == nil,
+    "散文件目录里没有分卷，应返回 nil"
+)
+
+// 分卷所在目录是「层级目录」时，要认出**整份**数据的根目录（而不是只有 z12 那一层的残缺数据集）。
+expect(DatasetLocator.isZoomLevelDirectoryName("12"), "「12」应认成层级目录")
+expect(DatasetLocator.isZoomLevelDirectoryName("z12"), "「z12」应认成层级目录")
+expect(DatasetLocator.isZoomLevelDirectoryName("Z07"), "「Z07」应认成层级目录")
+expect(!DatasetLocator.isZoomLevelDirectoryName("福建省瓦片"), "数据集名不该认成层级目录")
+expect(!DatasetLocator.isZoomLevelDirectoryName("z12副本"), "带后缀的目录名不该认成层级目录")
+expect(
+    DatasetLocator.datasetRoot(containing: syntheticRoot.appending(path: "2/瓦片-0001.zip"))
+        .canonicalFilePath == syntheticRoot.canonicalFilePath,
+    "分卷躺在层级目录里时，根目录应是数据集根"
+)
+expect(
+    DatasetLocator.datasetRoot(containing: URL(fileURLWithPath: "/tmp/散装/z12/vol-0001.zip"))
+        .canonicalFilePath == "/tmp/散装/z12",
+    "上一层不是数据集时应退回分卷所在目录"
+)
+expect(
+    DatasetLocator.datasetRoot(containing: URL(fileURLWithPath: "/tmp/散装/vol-0001.zip"))
+        .canonicalFilePath == "/tmp/散装",
+    "分卷不在层级目录里时，根目录就是它所在目录"
+)
+
+// 拖放给的目录 URL 常常带尾斜杠：同一份数据不能因此变成两个 id（列表里两行、叠加时去重失灵）。
+expect(URL(fileURLWithPath: "/tmp/甲/").canonicalFilePath == "/tmp/甲", "规范路径应去掉尾斜杠")
+expect(URL(fileURLWithPath: "/tmp/甲//").canonicalFilePath == "/tmp/甲", "连续尾斜杠也应去掉")
+expect(URL(fileURLWithPath: "/").canonicalFilePath == "/", "根目录的斜杠要留着")
+let syntheticRootWithSlash = URL(fileURLWithPath: syntheticRoot.canonicalFilePath + "/")
+expect(
+    DatasetLocator.makeDataset(at: syntheticRoot)?.id == DatasetLocator.makeDataset(at: syntheticRootWithSlash)?.id,
+    "带不带尾斜杠扫出来的数据集应是同一份"
+)
+expect(
+    syntheticRootWithSlash.path(percentEncoded: false).hasSuffix("/"),
+    "前提：这个 URL 确实带尾斜杠（Foundation 对已存在的目录会保留它）"
+)
+expect(
+    DatasetLocator.canonicalURL(syntheticRootWithSlash).canonicalFilePath == syntheticRoot.canonicalFilePath
+        && !DatasetLocator.canonicalURL(syntheticRootWithSlash).path(percentEncoded: false).hasSuffix("/"),
+    "canonicalURL 对已存在的目录也要真的去掉尾斜杠"
+)
+
 // MARK: - 真实数据集（可选，传入目录时执行）
 let sampleMeasurement = GeoMeasurement(
     kind: .distance,
@@ -3102,6 +3199,18 @@ if let fujianRoot {
         expect(info.parts[17]?.count == 45, "z17 应有 45 个分卷（实际 \(info.parts[17]?.count ?? 0)）")
         expect(info.parts[12]?.first?.rowRange == 701...756,
                "z12 分卷的行范围应为 701…756（实际 \(String(describing: info.parts[12]?.first?.rowRange))）")
+
+        // 拖进「打开」的常常是某个分卷：要认成**整份**数据，而不是只剩 z12 那一层的残缺数据集。
+        if let volume = info.parts[12]?.first?.url {
+            expect(
+                DatasetLocator.datasetRoot(containing: volume).canonicalFilePath == fujianRoot.canonicalFilePath,
+                "拖入 z12 分卷应认出整份数据的根目录（实际 \(DatasetLocator.datasetRoot(containing: volume).canonicalFilePath)）"
+            )
+            expect(
+                DatasetLocator.dataset(containingVolume: volume, in: [dataset])?.id == dataset.id,
+                "拖入的 z12 分卷应归属到这份数据"
+            )
+        }
 
         if let bbox = info.boundingBox {
             expectClose(bbox.west, 115.84259, accuracy: 1e-6, "manifest bbox 西边界")

@@ -70,9 +70,9 @@ public enum ZipDatasetLocator {
         layout.rowOrigin = .north
         layout.tileSize = info.tileSize ?? 256
         return TileDataset(
-            id: url.path(percentEncoded: false),
+            id: url.canonicalFilePath,
             name: url.lastPathComponent,
-            rootURL: url,
+            rootURL: DatasetLocator.canonicalURL(url),
             layout: layout,
             zoomRange: minZoom...maxZoom,
             grid: grid,

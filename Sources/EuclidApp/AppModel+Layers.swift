@@ -209,8 +209,11 @@ extension AppModel {
         pushLayers()
     }
 
-    /// 直接加一层（侧栏「添加本地数据 / 添加在线底图」用）。
-    func addLayer(_ layer: MapLayer) {
+    /// 直接加一层（＋ 菜单的「添加本地数据 / 在线底图」与「打开时叠加」都用它）。
+    ///
+    /// - Parameter announce: 是否自己写状态栏。叠加那条路会说更贴切的话
+    ///   （「已叠加图层：…（原图层保留）」），由调用方写，因此传 `false`。
+    func addLayer(_ layer: MapLayer, announce: Bool = true) {
         var layer = layer
         // 本地数据加成一层时：实在没有基准层（比如只开了在线底图）才让它顺带当基准层，
         // 否则一律是普通图层 —— 否则会出现两个「基准」，点它也切不过去。
@@ -221,7 +224,7 @@ extension AppModel {
         selectedLayerID = layer.id
         normalizeAnchor()
         pushLayers()
-        setStatus("已添加图层：\(layer.name)", autoClearAfter: 5)
+        if announce { setStatus("已添加图层：\(layer.name)", autoClearAfter: 5) }
     }
 
     /// 把图层列表推给画布。
