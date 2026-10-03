@@ -48,6 +48,14 @@ public struct ZipDatasetInfo: Sendable, Hashable {
 
     /// 分卷总数。
     public var volumeCount: Int { parts.values.reduce(0) { $0 + $1.count } }
+
+    /// 磁盘上实际的**文件**个数。
+    ///
+    /// 一年合并成一个大包时，同一个文件会在每个层级各登记一条，`volumeCount` 于是等于层级数，
+    /// 界面上说「12 个包」会让人以为要去找 12 个文件。要报给使用者的数字用这个。
+    public var fileCount: Int {
+        Set(parts.values.flatMap { $0.map { $0.url.path(percentEncoded: false) } }).count
+    }
 }
 
 /// 从 zip 包里直接取瓦片（不用解压）。

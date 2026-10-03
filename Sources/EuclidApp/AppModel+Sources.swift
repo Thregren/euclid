@@ -519,7 +519,8 @@ extension AppModel {
             } else if let info = dataset.zipInfo {
                 // zip 分卷读起来和散文件没区别，交代一句让使用者知道没在偷偷解压。
                 setStatus(
-                    "zip 分卷 \(info.volumeCount) 个包 · \(dataset.grid.title) · 不解压直读",
+                    "\(info.fileCount == 1 ? "zip 整包" : "zip 分卷 \(info.fileCount) 个包")"
+                        + " · \(dataset.grid.title) · 不解压直读",
                     autoClearAfter: 8
                 )
             } else {

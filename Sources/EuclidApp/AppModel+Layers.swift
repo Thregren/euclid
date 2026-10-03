@@ -281,7 +281,10 @@ extension AppModel {
     /// 数据集在图层行 / 检查器里的副标题。
     static func detail(of dataset: TileDataset) -> String {
         var parts = ["z\(dataset.zoomRange.lowerBound)–z\(dataset.zoomRange.upperBound) · \(dataset.layout.tileSize)px"]
-        if dataset.isArchive { parts.append("zip 分卷") }
+        if let info = dataset.zipInfo {
+            // 一年合并成一个大包时磁盘上只有一个文件，写「分卷」会让人以为该有多个。
+            parts.append(info.fileCount == 1 ? "zip 整包" : "zip 分卷")
+        }
         if dataset.grid.kind != .webMercator { parts.append(dataset.grid.shortTitle) }
         return parts.joined(separator: " · ")
     }

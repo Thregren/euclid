@@ -122,7 +122,11 @@ struct InspectorView: View {
     /// 数据放在散文件目录里，还是打包成 zip 分卷（后者解压不用做在前面）。
     private func storageDescription(_ dataset: TileDataset) -> String {
         guard let info = dataset.zipInfo else { return "散文件目录" }
-        var text = "zip 分卷 · \(info.volumeCount) 个包（不解压直读）"
+        // 一年合并成一个大包时，一个文件会覆盖多个层级：报**文件数**，
+        // 报「分卷数」会变成「12 个包」，让人以为磁盘上该有 12 个文件。
+        var text = info.fileCount == 1
+            ? "zip 整包 · 1 个文件（不解压直读）"
+            : "zip 分卷 · \(info.fileCount) 个文件（不解压直读）"
         if dataset.zoomRange.count > 1 { text += " · 覆盖 z\(dataset.zoomRange.lowerBound)–z\(dataset.zoomRange.upperBound)" }
         return text
     }

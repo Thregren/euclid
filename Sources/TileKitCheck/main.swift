@@ -3077,6 +3077,120 @@ do {
     expect(noZoom == nil, "没有该层级时应当返回 nil")
 }
 
+// 轻量取样：只读中央目录开头的一小块（不是为了省事，是为了别为一个上 GB 的中央目录
+// 只量一次边长就把它整个扫掉）。它给的是「开头第一条读得出来的记录」。
+do {
+    let sampleURL = archiveRoot.appending(path: "sample-存储.zip")
+    func sampledEntry(_ url: URL, limit: Int = 8) -> ZipArchive.Entry? {
+        (try? ZipArchive.sampleEntry(at: url, limit: limit))?.entry
+    }
+    let sample = try? ZipArchive.sampleEntry(at: sampleURL)
+    expect(sample?.entry.name == zipEntries[0].name,
+           "轻量取样应给出包里第一条记录（实际 \(String(describing: sample?.entry.name))）")
+    expect(sample?.data == zipEntries[0].data, "轻量取样读出来的内容应与原数据一致")
+    expect(sampledEntry(truncatedURL) == nil, "截断的包取样应为 nil")
+    expect(sampledEntry(archiveRoot.appending(path: "garbage.zip")) == nil, "垃圾文件取样应为 nil")
+    expect(sampledEntry(archiveRoot.appending(path: "missing.zip")) == nil, "不存在的文件取样应为 nil")
+    expect(sampledEntry(sampleURL, limit: 0) == nil, "limit 为 0 时取样应为 nil")
+}
+
+// 整年合并成一个大包：manifest 逐卷记着层级与行范围，磁盘上却只有一个 `<年份>.zip`。
+// 这是下载器收尾合并之后的形状（历史影像那盘就是这样），包名里读不出层级。
+do {
+    let yearParent = archiveRoot.appending(path: "年度影像")
+    let mergedRoot = yearParent.appending(path: "2024")
+    try? FileManager.default.createDirectory(at: mergedRoot, withIntermediateDirectories: true)
+    let mergedEntries: [(name: String, data: Data)] = [
+        ("701/3375.jpg", fakeTile("年度z12", repeats: 512)),
+        ("1403/6751.jpg", fakeTile("年度z13", repeats: 512)),
+    ]
+    try? ZIP.stored(mergedEntries, compress: false).write(to: mergedRoot.appending(path: "2024.zip"))
+    let manifestJSON: [String: Any] = [
+        "service": "img_fj_2024",
+        "crs": "EPSG:4490",
+        "bbox": [115.84259, 23.483276, 120.4953, 28.322754],
+        "parts": [
+            "img_fj_2024_z12_r0000701-0000756.zip": [
+                "status": "done", "zoom": 12, "rows": [701, 756], "tiles": 1,
+            ],
+            "img_fj_2024_z13_r0001403-0001513.zip": [
+                "status": "done", "zoom": 13, "rows": [1403, 1513], "tiles": 1,
+            ],
+        ],
+    ]
+    try? JSONSerialization.data(withJSONObject: manifestJSON, options: [.prettyPrinted])
+        .write(to: mergedRoot.appending(path: "manifest.json"))
+
+    // 年份目录名（`2024`）正好长得像「层级目录」，这里同时守着「别被它带偏」。
+    let merged = DatasetLocator.makeDataset(at: mergedRoot)
+    expect(merged?.zoomRange == 12...13,
+           "年度合并包应认出 z12–z13（实际 \(String(describing: merged?.zoomRange))）")
+    expect(merged?.grid.kind == .geographic, "年度合并包应认成经纬度网格")
+    expect(merged?.layout.directoryAxis == .yFirst, "包内是 <行>/<列>，应识别为 y 在前")
+    expect(merged?.zipInfo?.parts[12]?.count == 1, "z12 应登记 1 个包")
+    expect(merged?.zipInfo?.parts[13]?.count == 1, "z13 应登记 1 个包")
+    expect(merged?.zipInfo?.parts[12]?.first?.rowRange == 701...756, "z12 的行范围应来自 manifest")
+    expect(merged?.zipInfo?.parts[13]?.first?.rowRange == 1403...1513, "z13 的行范围应来自 manifest")
+    expect(merged?.zipInfo?.parts[12]?.first?.url.lastPathComponent == "2024.zip",
+           "两个层级都应指向同一个包")
+    expect(merged?.zipInfo?.tileCount == 2,
+           "瓦片总数应取 manifest 的合计（实际 \(String(describing: merged?.zipInfo?.tileCount))）")
+    expect(merged?.zipInfo?.fileCount == 1, "合并包报给界面的文件数应为 1")
+    expect(merged?.zipInfo?.volumeCount == 2, "合并包按层级登记，登记条数等于层级数")
+    // `2024` 长得像「层级目录」，而 datasetRoot 对 `z12/….zip` 是会往上找一层整份数据的：
+    // 这里守着它别把年份目录当层级目录用（上一层并不是数据集，就该停在年份目录）。
+    expect(
+        DatasetLocator.datasetRoot(containing: mergedRoot.appending(path: "2024.zip")).canonicalFilePath
+            == mergedRoot.canonicalFilePath,
+        "拖入年度整包应认出年份目录本身，而不是往上多走一层"
+    )
+
+    if let source = merged?.source as? ZipTileSource {
+        expect(await source.data(for: SlippyTile(zoom: 12, x: 3375, y: 701)) == mergedEntries[0].data,
+               "年度合并包应能取到 z12 的瓦片")
+        expect(await source.data(for: SlippyTile(zoom: 13, x: 6751, y: 1403)) == mergedEntries[1].data,
+               "年度合并包应能取到 z13 的瓦片")
+        expect(await source.data(for: SlippyTile(zoom: 12, x: 3375, y: 1404)) == nil,
+               "行号不在该层级的范围里时应返回 nil")
+    } else {
+        expect(false, "年度合并包的数据来源应为 ZipTileSource")
+    }
+    // 覆盖范围直接取 manifest 的 bbox，不必去翻包。
+    if let merged, let extent = DatasetLocator.extent(of: merged) {
+        expect(extent.worldRect.width > 0 && extent.worldRect.height > 0, "年度合并包的覆盖范围不应退化")
+    } else {
+        expect(false, "年度合并包应能算出覆盖范围")
+    }
+    // 拖整个上一层目录（历史影像）时，要能逐年扫出来。
+    let foundYears = DatasetLocator.discover(at: yearParent)
+    expect(foundYears.count == 1 && foundYears[0].name == "2024",
+           "上一层目录里应扫到 2024 这一份（实际 \(foundYears.map(\.name))）")
+    // 合并包的 manifest 少了某一卷时，那一卷的行范围就不该被登记（宁缺勿错）。
+    let partialRoot = yearParent.appending(path: "2025")
+    try? FileManager.default.createDirectory(at: partialRoot, withIntermediateDirectories: true)
+    try? Data().write(to: partialRoot.appending(path: "2025.zip"))
+    try? Data(#"{"crs":"EPSG:4490","parts":{"a.zip":{"zoom":12,"rows":[701,756]},"b.zip":{"rows":[1,2]}}}"#.utf8)
+        .write(to: partialRoot.appending(path: "manifest.json"))
+    expect(DatasetLocator.makeDataset(at: partialRoot)?.zoomRange == 12...12,
+           "manifest 里读不出层级的卷应当被跳过，而不是把整份数据拖成非法层级")
+
+    // manifest 没写 bbox 时，覆盖范围仍要从包里探出来（这条路上会抽首尾行）。
+    let noBoxRoot = yearParent.appending(path: "2026")
+    try? FileManager.default.createDirectory(at: noBoxRoot, withIntermediateDirectories: true)
+    try? ZIP.stored(mergedEntries, compress: false).write(to: noBoxRoot.appending(path: "2026.zip"))
+    try? Data(#"{"crs":"EPSG:4490","parts":{"a.zip":{"zoom":12,"rows":[701,756]}}}"#.utf8)
+        .write(to: noBoxRoot.appending(path: "manifest.json"))
+    if let dataset = DatasetLocator.makeDataset(at: noBoxRoot),
+       let extent = DatasetLocator.extent(of: dataset) {
+        expect(extent.worldRect.width > 0 && extent.worldRect.height > 0,
+               "没有 bbox 的合并包也要能从包里探出覆盖范围")
+        expect(extent.worldRect.width < 1 && extent.worldRect.height < 1,
+               "探出来的范围不该退化成整个世界")
+    } else {
+        expect(false, "没有 bbox 的合并包应能算出覆盖范围")
+    }
+}
+
 // MARK: - 本地瓦片服务
 
 section("本地瓦片服务：路径解析、响应与异步启动")

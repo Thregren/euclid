@@ -92,6 +92,12 @@ public final class ZipArchive: @unchecked Sendable {
 
     /// 读出并校验一条记录的内容。
     public func data(for entry: Entry) throws -> Data {
+        try Self.read(entry: entry, handle: handle, fileSize: fileSize)
+    }
+
+    /// 读一条记录的内容。句柄与文件长度由调用方给：轻量取样（`sampleEntry`）没有索引，
+    /// 只有一个临时句柄，走的是同一段读法 —— 长度与 CRC 的校验口径也就只有一处。
+    static func read(entry: Entry, handle: FileHandle, fileSize: UInt64) throws -> Data {
         guard entry.method != 0xFFFF else {
             throw ZipError.unsupported("加密记录：\(entry.name)")
         }
@@ -104,7 +110,7 @@ public final class ZipArchive: @unchecked Sendable {
 
         // 本地文件头：长度字段可能与中央目录不同（数据描述符），
         // 所以**只**用它算数据的起点，长度与 CRC 一律以中央目录为准。
-        let header = read(at: entry.localHeaderOffset, count: 30)
+        let header = read(handle: handle, at: entry.localHeaderOffset, count: 30)
         guard header.count == 30, header.u32(0) == 0x0403_4B50 else {
             throw ZipError.corrupt("本地文件头签名不对：\(entry.name)")
         }
@@ -119,7 +125,7 @@ public final class ZipArchive: @unchecked Sendable {
             throw ZipError.corrupt("记录超出文件范围：\(entry.name)")
         }
 
-        let packed = read(at: dataOffset, count: Int(entry.compressedSize))
+        let packed = read(handle: handle, at: dataOffset, count: Int(entry.compressedSize))
         guard UInt64(packed.count) == entry.compressedSize else {
             throw ZipError.truncated("\(entry.name) 的数据不完整")
         }
@@ -145,6 +151,52 @@ public final class ZipArchive: @unchecked Sendable {
         return payload
     }
 
+    /// 轻量取样：只读中央目录**开头**的一小块，取一条读得出来的记录。
+    ///
+    /// 用于「只看一眼」的活，比如量一下瓦片边长。一个年度合并包的中央目录上 GB，
+    /// 为了量边长把它整个扫一遍纯属白读；而中央目录开头的几十条记录里随便一条都是真瓦片。
+    /// 返回 nil 表示开头这段没有读得出来的记录（截断、空包、畸形包），
+    /// 调用方该退回「老老实实建索引」那条路 —— 轻量取样只是省事，不改变判据。
+    public static func sampleEntry(
+        at url: URL,
+        limit: Int = 8
+    ) throws -> (entry: Entry, data: Data)? {
+        guard limit > 0 else { return nil }
+        let handle: FileHandle
+        do {
+            handle = try FileHandle(forReadingFrom: url)
+        } catch {
+            throw ZipError.notAZip
+        }
+        defer { try? handle.close() }
+        let size = try handle.seekToEnd()
+        let directory = try locateCentralDirectory(handle: handle, fileSize: size)
+        guard directory.size > 0 else { return nil }
+        // 一条记录连名字一般几十字节，64 KB 足够罩住开头一小把；不够就少取几条。
+        let budget = Int(min(UInt64(64 << 10), directory.size))
+        let head = read(handle: handle, at: directory.offset, count: budget)
+
+        var offset = 0
+        var taken = 0
+        while taken < limit, offset + 46 <= head.count, head.u32(offset) == 0x0201_4B50 {
+            let nameLength = Int(head.u16(offset + 28))
+            let extraLength = Int(head.u16(offset + 30))
+            let commentLength = Int(head.u16(offset + 32))
+            let recordLength = 46 + nameLength + extraLength + commentLength
+            guard recordLength >= 46, offset + recordLength <= head.count else { break }
+            let base = head.startIndex + offset
+            let name = String(decoding: head[(base + 46)..<(base + 46 + nameLength)], as: UTF8.self)
+            let extra = Data(head[(base + 46 + nameLength)..<(base + 46 + nameLength + extraLength)])
+            let entry = makeEntry(name: name, record: head, offset: offset, extra: extra)
+            offset += recordLength
+            taken += 1
+            if let data = try? read(entry: entry, handle: handle, fileSize: size) {
+                return (entry, data)
+            }
+        }
+        return nil
+    }
+
     /// 某一行的全部条目名（升序）。探测覆盖范围用。
     public func entryNames(inRow row: String) -> [String] {
         return table(forRow: row).keys.sorted()
@@ -159,6 +211,61 @@ public final class ZipArchive: @unchecked Sendable {
 
     // MARK: - 中央目录
 
+    /// 中央目录的落点：位置、长度、条目数，以及它是不是 ZIP64 记的。
+    struct CentralDirectory {
+        var offset: UInt64
+        var size: UInt64
+        var entries: UInt64
+        var isZip64: Bool
+    }
+
+    /// 从文件末尾的 EOCD（必要时再往前找 ZIP64 结束记录）读出中央目录的落点。
+    ///
+    /// 只读文件尾部的一小块，所以「只想看一眼」的取样不必建全量索引。
+    static func locateCentralDirectory(
+        handle: FileHandle,
+        fileSize size: UInt64
+    ) throws -> CentralDirectory {
+        guard size >= 22 else { throw ZipError.notAZip }
+        // 中央目录结束记录（EOCD）在文件末尾 22 字节 + 最多 65535 字节注释之内。
+        let tailLength = Int(min(size, 22 + 65_535))
+        let tail = read(handle: handle, at: size - UInt64(tailLength), count: tailLength)
+        guard let eocd = lastIndex(of: 0x0605_4B50, in: tail), tail.count >= eocd + 22 else {
+            throw ZipError.notAZip
+        }
+
+        var entries = UInt64(tail.u16(eocd + 10))
+        var directorySize = UInt64(tail.u32(eocd + 12))
+        var directoryOffset = UInt64(tail.u32(eocd + 16))
+        var isZip64 = false
+
+        // ZIP64：固定字段被填满（0xFFFF / 0xFFFFFFFF）时，真值放在 ZIP64 结束记录里，
+        // 它的位置由紧挨 EOCD 前面的定位器给出。
+        let needsZip64 = entries == 0xFFFF || directorySize == 0xFFFF_FFFF || directoryOffset == 0xFFFF_FFFF
+        if needsZip64 {
+            guard eocd >= 20, tail.u32(eocd - 20) == 0x0706_4B50 else {
+                throw ZipError.corrupt("缺少 ZIP64 定位器")
+            }
+            let record = read(handle: handle, at: tail.u64(eocd - 20 + 8), count: 56)
+            guard record.count == 56, record.u32(0) == 0x0606_4B50 else {
+                throw ZipError.corrupt("ZIP64 结束记录签名不对")
+            }
+            entries = record.u64(32)
+            directorySize = record.u64(40)
+            directoryOffset = record.u64(48)
+            isZip64 = true
+        }
+        guard directoryOffset <= size, directorySize <= size - directoryOffset else {
+            throw ZipError.truncated("中央目录越过了文件末尾")
+        }
+        return CentralDirectory(
+            offset: directoryOffset,
+            size: directorySize,
+            entries: entries,
+            isZip64: isZip64
+        )
+    }
+
     private func readCentralDirectory() throws {
         let size = try handle.seekToEnd()
         fileSize = size
@@ -172,39 +279,11 @@ public final class ZipArchive: @unchecked Sendable {
             isZip64 = cached.isZip64
             return
         }
-        // 中央目录结束记录（EOCD）在文件末尾 22 字节 + 最多 65535 字节注释之内。
-        let tailLength = Int(min(size, 22 + 65_535))
-        let tail = read(at: size - UInt64(tailLength), count: tailLength)
-        guard let eocd = Self.lastIndex(of: 0x0605_4B50, in: tail), tail.count >= eocd + 22 else {
-            throw ZipError.notAZip
-        }
-
-        var entries = UInt64(tail.u16(eocd + 10))
-        var directorySize = UInt64(tail.u32(eocd + 12))
-        var directoryOffset = UInt64(tail.u32(eocd + 16))
-
-        // ZIP64：固定字段被填满（0xFFFF / 0xFFFFFFFF）时，真值放在 ZIP64 结束记录里，
-        // 它的位置由紧挨 EOCD 前面的定位器给出。
-        let needsZip64 = entries == 0xFFFF || directorySize == 0xFFFF_FFFF || directoryOffset == 0xFFFF_FFFF
-        if needsZip64 {
-            guard eocd >= 20, tail.u32(eocd - 20) == 0x0706_4B50 else {
-                throw ZipError.corrupt("缺少 ZIP64 定位器")
-            }
-            let record = read(at: tail.u64(eocd - 20 + 8), count: 56)
-            guard record.count == 56, record.u32(0) == 0x0606_4B50 else {
-                throw ZipError.corrupt("ZIP64 结束记录签名不对")
-            }
-            entries = record.u64(32)
-            directorySize = record.u64(40)
-            directoryOffset = record.u64(48)
-            isZip64 = true
-        }
-        entryCount = Int(entries)
-        centralDirectorySize = directorySize
-        guard directoryOffset + directorySize <= size else {
-            throw ZipError.truncated("中央目录越过了文件末尾")
-        }
-        try indexRows(directoryOffset: directoryOffset, directorySize: directorySize)
+        let directory = try Self.locateCentralDirectory(handle: handle, fileSize: size)
+        entryCount = Int(directory.entries)
+        centralDirectorySize = directory.size
+        isZip64 = directory.isZip64
+        try indexRows(directoryOffset: directory.offset, directorySize: directory.size)
         // 扫完了就把索引存一份：下次打开同一份数据（同一路径、同一大小与修改时间）
         // 直接命中，不用再逐个分卷扫一遍中央目录。还在下载中的分卷大小会变，自然不会命中旧索引。
         ZipIndexCache.save(
@@ -378,6 +457,11 @@ public final class ZipArchive: @unchecked Sendable {
     /// 走 `pread`（不依赖句柄的读写位置）：这样多线程同时查同一个包的不同行时
     /// 不必互相排队，`lock` 也就只需要保护索引缓存，不再覆盖磁盘 IO。
     private func read(at offset: UInt64, count: Int) -> Data {
+        Self.read(handle: handle, at: offset, count: count)
+    }
+
+    /// 与上同，只是句柄由调用方给（轻量取样用临时句柄，没有索引可用）。
+    private static func read(handle: FileHandle, at offset: UInt64, count: Int) -> Data {
         guard count > 0, offset <= UInt64(Int64.max), offset <= UInt64(Int.max - count) else { return Data() }
         var data = Data(count: count)
         var total = 0
