@@ -9,7 +9,6 @@ if ! swift --version >/dev/null 2>&1; then
     if [ -d /Library/Developer/CommandLineTools ]; then
         export DEVELOPER_DIR=/Library/Developer/CommandLineTools
         echo "提示：当前工具链不可用（可能是 Xcode 许可未接受），已回退到 CommandLineTools。"
-        echo "      若想用 Xcode 工具链（可打通用二进制），先执行：sudo xcodebuild -license accept"
     else
         echo "错误：找不到可用的 Swift 工具链。" >&2
         exit 1
@@ -17,8 +16,6 @@ if ! swift --version >/dev/null 2>&1; then
 fi
 
 CONFIG="${CONFIG:-release}"
-# UNIVERSAL=1 时产出 arm64 + x86_64 通用二进制（需要 Xcode 工具链，编译时间约翻倍）
-UNIVERSAL="${UNIVERSAL:-0}"
 PRODUCT="Euclid"
 EXECUTABLE="Euclid"
 APP_NAME="尺规"
@@ -28,26 +25,32 @@ APP="$DIST/$APP_NAME.app"
 # 需要时可通过 SWIFT_BUILD_FLAGS 追加参数，例如 --disable-sandbox
 read -r -a EXTRA_FLAGS <<< "${SWIFT_BUILD_FLAGS:-}"
 
-BUILD_ARGS=(-c "$CONFIG" --product "$PRODUCT")
-ARCH_LABEL=""
-if [ "$UNIVERSAL" = "1" ]; then
-    BUILD_ARGS+=(--arch arm64 --arch x86_64)
-    ARCH_LABEL=", 通用二进制"
-fi
+BUILD_ARGS=(-c "$CONFIG" --product "$PRODUCT" --triple arm64-apple-macosx14.0)
 if [ "${#EXTRA_FLAGS[@]}" -gt 0 ]; then
     BUILD_ARGS+=("${EXTRA_FLAGS[@]}")
 fi
 
-echo "==> 编译（${CONFIG}${ARCH_LABEL}）"
+echo "==> 编译（${CONFIG}, ARM64）"
 swift build "${BUILD_ARGS[@]}"
+swift build -c "$CONFIG" --product tiletools --triple arm64-apple-macosx14.0 "${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"}"
 
 BIN_PATH="$(swift build "${BUILD_ARGS[@]}" --show-bin-path)"
+if [ "$(lipo -archs "$BIN_PATH/$PRODUCT")" != "arm64" ]; then
+    echo "错误：构建产物必须只含 arm64 架构。" >&2
+    exit 1
+fi
 
 echo "==> 组装 $APP"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN_PATH/$PRODUCT" "$APP/Contents/MacOS/$EXECUTABLE"
+cp "$BIN_PATH/tiletools" "$APP/Contents/MacOS/tiletools"
+cp "$BIN_PATH/tiletools" "$DIST/tiletools-arm64"
+strip -S "$APP/Contents/MacOS/tiletools" "$DIST/tiletools-arm64"
+codesign --force --sign - "$DIST/tiletools-arm64"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
+cp LICENSE "$APP/Contents/Resources/LICENSE"
+cp LICENSE "$DIST/LICENSE"
 if [ -f Resources/AppIcon.icns ]; then
     cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 fi
@@ -92,6 +95,9 @@ if [ "$signed" != "1" ]; then
     echo "        DIST=/tmp/euclid-dist ./Scripts/build-app.sh" >&2
     exit 1
 fi
+
+codesign --verify --deep --strict "$APP"
+codesign --verify --strict "$DIST/tiletools-arm64"
 
 touch "$APP"
 echo "==> 完成：$APP"

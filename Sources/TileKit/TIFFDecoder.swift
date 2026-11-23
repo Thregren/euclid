@@ -25,6 +25,8 @@ enum TIFFDecoder {
         destination: CGRect,
         stretch: TIFFStretch? = nil
     ) throws {
+        let interval = TilePerformance.begin("TIFF render")
+        defer { TilePerformance.end(interval) }
         guard level.planarConfiguration == 1 || level.planarConfiguration == 2 else {
             throw TIFFError.unsupported("暂不支持 PlanarConfiguration = \(level.planarConfiguration) 的 TIFF")
         }
@@ -108,6 +110,7 @@ enum TIFFDecoder {
         }
 
         for row in 0..<rows {
+            try Task.checkCancellation()
             let y = startY + row
             guard y >= 0, y < canvasHeight else { continue }
             let canvasRow = Double(y) + 0.5
@@ -174,6 +177,7 @@ enum TIFFDecoder {
         let color = store.rendersColor
 
         for row in 0..<rows {
+            try Task.checkCancellation()
             let y = startY + row
             guard y >= 0, y < canvasHeight else { continue }
             let canvasRow = Double(y) + 0.5
@@ -360,23 +364,16 @@ private final class ChunkStore {
     private func chunkPixels(_ index: Int) throws -> [UInt8] {
         // 跨瓦片缓存：这一块在别的瓦片 / 上一次缩放里已经解过就直接拿。
         let key = TIFFChunkCache.Key(path: path, level: level.offset, index: index)
-        if let cached = TIFFChunkCache.shared.pixels(for: key) { return cached }
-        let rows = level.rowsInChunk(indexInPlane: index)
-        var pixels: [UInt8]
-        if level.compression == .jpeg, let data = chunkData(globalIndex: index) {
-            pixels = try jpegPixels(data, rows: rows)
-        } else {
+        return try TIFFChunkCache.shared.loadPixels(for: key) {
+            let rows = level.rowsInChunk(indexInPlane: index)
+            if level.compression == .jpeg, let data = chunkData(globalIndex: index) {
+                return try jpegPixels(data, rows: rows)
+            }
             let raw = try TIFFRawChunks.bytes(
-                file: file,
-                level: level,
-                reader: reader,
-                chunkIndex: index,
-                plane: 0
+                file: file, level: level, reader: reader, chunkIndex: index, plane: 0
             )
-            pixels = TIFFCodec.rgba(from: raw, level: level, rows: rows, order: file.byteOrder)
+            return TIFFCodec.rgba(from: raw, level: level, rows: rows, order: file.byteOrder)
         }
-        TIFFChunkCache.shared.store(pixels: pixels, for: key)
-        return pixels
     }
 
     /// 取「平面内某一块」的原始样本字节（带本地小缓存 + 跨瓦片缓存）。
@@ -403,7 +400,7 @@ private final class ChunkStore {
     private func chunkData(globalIndex: Int) -> Data? {
         guard globalIndex >= 0, globalIndex < level.chunks.count else { return nil }
         let chunk = level.chunks[globalIndex]
-        guard chunk.byteCount > 0 else { return nil }
+        guard chunk.byteCount > 0, chunk.byteCount <= TIFFLimits.maximumChunkBytes else { return nil }
         return reader.read(offset: chunk.offset, count: chunk.byteCount)
     }
 
@@ -417,7 +414,12 @@ private final class ChunkStore {
             merged.append(payload)
             payload = merged
         }
+        try Task.checkCancellation()
         guard let source = CGImageSourceCreateWithData(payload as CFData, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let imageWidth = properties[kCGImagePropertyPixelWidth] as? Int,
+              let imageHeight = properties[kCGImagePropertyPixelHeight] as? Int,
+              TIFFLimits.chunkBytes(width: imageWidth, height: imageHeight, samples: 4, bits: 8) != nil,
               let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
             throw TIFFError.decodeFailed("JPEG 块解不开")
         }
@@ -444,7 +446,6 @@ private final class ChunkStore {
     }
 }
 
-/// 压缩与颜色转换的纯函数部分。
 /// 压缩与颜色转换的纯函数部分。
 ///
 /// `package` 是为了让同包的自检程序（`TileKitCheck`）能直接喂损坏数据进来 ——

@@ -25,6 +25,7 @@ public struct TileDataset: Identifiable, Hashable, Sendable {
     public let grid: TileGrid
     /// 非 nil 表示这是一份 **zip 分卷**数据集（不解压直接读）。
     public let zipInfo: ZipDatasetInfo?
+    public let mbtilesInfo: MBTilesInfo?
 
     public init(
         id: String,
@@ -33,7 +34,8 @@ public struct TileDataset: Identifiable, Hashable, Sendable {
         layout: TileLayout,
         zoomRange: ClosedRange<Int>,
         grid: TileGrid = .webMercator,
-        zipInfo: ZipDatasetInfo? = nil
+        zipInfo: ZipDatasetInfo? = nil,
+        mbtilesInfo: MBTilesInfo? = nil
     ) {
         self.id = id
         self.name = name
@@ -42,12 +44,14 @@ public struct TileDataset: Identifiable, Hashable, Sendable {
         self.zoomRange = zoomRange
         self.grid = grid
         self.zipInfo = zipInfo
+        self.mbtilesInfo = mbtilesInfo
     }
 
     /// 是不是 zip 分卷数据集。
     public var isArchive: Bool { zipInfo != nil }
 
     public var source: any TileImageSource {
+        if let mbtilesInfo, let source = try? MBTilesSource(url: rootURL, info: mbtilesInfo) { return source }
         if let zipInfo {
             return ZipTileSource(
                 rootURL: rootURL,
@@ -162,6 +166,13 @@ public enum DatasetLocator {
 
     /// 若目录自身就是数据集则返回描述，否则返回 nil。
     public static func makeDataset(at url: URL) -> TileDataset? {
+        if url.pathExtension.lowercased() == "mbtiles", let source = try? MBTilesSource(url: url) {
+            let info = source.info
+            var layout = TileLayout.webODM
+            layout.tileSize = info.tileSize
+            return TileDataset(id: url.canonicalFilePath, name: info.name, rootURL: url, layout: layout,
+                               zoomRange: info.zoomRange, mbtilesInfo: info)
+        }
         // zip 分卷包优先：它自带覆盖范围，描述比「扫一遍目录猜出来的」更准。
         if let archive = ZipDatasetLocator.makeDataset(at: url) { return archive }
         return makeDirectoryDataset(at: url)
@@ -257,6 +268,9 @@ public enum DatasetLocator {
     /// 为避免遍历几十万文件，选取一个规模适中的层级做统计；该范围对所有层级都成立。
     /// zip 分卷数据集不必扫盘：范围就记在 manifest / 分卷行范围里。
     public static func extent(of dataset: TileDataset, preferredMaxDirectories: Int = 400) -> DatasetExtent? {
+        if let info = dataset.mbtilesInfo {
+            return DatasetExtent(worldRect: info.worldRect, level: info.zoomRange.upperBound, tileCount: 0)
+        }
         if let info = dataset.zipInfo {
             return archiveExtent(of: dataset, info: info)
         }

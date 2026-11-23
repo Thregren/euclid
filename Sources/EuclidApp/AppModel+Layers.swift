@@ -114,11 +114,12 @@ extension AppModel {
         if swipePivotLayerID == id { swipePivotLayerID = nil }
         if selectedLayerID == id { selectedLayerID = layers.last?.id }
         if removed.isAnchor {
+            cancelAnalysis()
+            cancelSourceLoading()
+            changeMeasurementDocument(to: nil)
             selectedSourceID = nil
             appliedLocalDatasetID = nil
             extent = nil
-            measurements.clearAll()
-            canvas.refreshOverlay()
         }
         if removed.kind == .online, layers.last(where: { $0.kind == .online }) == nil {
             usesOnlineBasemap = false
@@ -130,6 +131,7 @@ extension AppModel {
             if !stillUsed { RasterCache.discard(fileURL: raster.fileURL) }
         }
         normalizeAnchor()
+        if removed.isAnchor { changeMeasurementDocument(to: measurementPath(for: selectedSourceID)) }
         pushLayers()
         releaseUnusedZipArchives()
     }
@@ -249,8 +251,10 @@ extension AppModel {
                 for volume in volumes { inUse.insert(volume.url.path(percentEncoded: false)) }
             }
         }
+        let rasterPaths = Set(layers.compactMap { ($0.source as? RasterTileSource)?.fileURL.canonicalFilePath })
         Task.detached(priority: .utility) {
             await ZipArchivePool.shared.forgetAll(except: inUse)
+            await RasterOverviewCache.shared.cancelGeneration(except: rasterPaths)
         }
     }
 

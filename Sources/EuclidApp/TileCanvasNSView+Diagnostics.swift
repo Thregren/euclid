@@ -1,3 +1,4 @@
+import TileRendering
 import AppKit
 import ImageIO
 import QuartzCore

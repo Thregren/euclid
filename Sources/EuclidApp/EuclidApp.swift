@@ -31,6 +31,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// 关掉最后一个窗口就退出：不留菜单栏与后台进程（关窗后点菜单栏什么都出不来，那种状态最费解）。
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        Task {
+            while let failure = await AppModel.shared.flushPersistentState() {
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = "尚有更改未能保存"
+                alert.informativeText = failure
+                alert.addButton(withTitle: "重试保存")
+                alert.addButton(withTitle: "取消退出")
+                alert.addButton(withTitle: "不保存并退出")
+                switch alert.runModal() {
+                case .alertFirstButtonReturn: continue
+                case .alertThirdButtonReturn:
+                    sender.reply(toApplicationShouldTerminate: true)
+                    return
+                default:
+                    sender.reply(toApplicationShouldTerminate: false)
+                    return
+                }
+            }
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
     }

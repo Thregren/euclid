@@ -5,7 +5,7 @@ import Foundation
 ///
 /// 两个坐标系：
 /// - 世界坐标：归一化 Web Mercator，x 向东、y 向南，范围 `0...1`。
-/// - 视图坐标：NSView 坐标，原点在左下角、y 向上（视图未翻转）。
+/// - 相机坐标：原点在左下角、y 向上。平台适配层负责转换输入坐标。
 ///
 /// 关于清晰度：`pixelsPerWorldUnit` 是「每个归一化世界单位占多少个视图点」，
 /// `displayScale` 是「一个视图点对应几个设备像素」（Retina 为 2）。
@@ -136,6 +136,20 @@ public struct MapCamera: Sendable, Equatable {
 
     public func layerPoint(for coordinate: GeoCoordinate) -> CGPoint {
         layerPoint(forWorldPoint: WebMercator.normalized(coordinate))
+    }
+
+    /// UIKit 等 y 向下的输入坐标 → 相机坐标。
+    public func viewPoint(forLayerPoint point: CGPoint) -> CGPoint {
+        CGPoint(x: point.x, y: viewportSize.height - point.y)
+    }
+
+    public func coordinate(forLayerPoint point: CGPoint) -> GeoCoordinate {
+        coordinate(forViewPoint: viewPoint(forLayerPoint: point))
+    }
+
+    /// 内容跟随 y 向下的触控位移移动。
+    public func translated(byLayerDelta delta: CGPoint) -> MapCamera {
+        translated(byViewDelta: CGPoint(x: delta.x, y: -delta.y))
     }
 
     /// 让指定的世界范围（含内边距）完整落入视图。

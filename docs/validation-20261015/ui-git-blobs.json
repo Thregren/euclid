@@ -1,0 +1,58 @@
+{
+  "Sources/EuclidApp/RootView.swift": {
+    "before": "fb8412671e734f9dd503e581c95387651ea8dcb7",
+    "after": "fb8412671e734f9dd503e581c95387651ea8dcb7"
+  },
+  "Sources/EuclidApp/InspectorView.swift": {
+    "before": "30057b71ebce5b504962ffd3a2e434daf0a2d6ea",
+    "after": "30057b71ebce5b504962ffd3a2e434daf0a2d6ea"
+  },
+  "Sources/EuclidApp/InspectorSections.swift": {
+    "before": "b8bd389054e109ed8198fe826da5e42a2b139746",
+    "after": "b8bd389054e109ed8198fe826da5e42a2b139746"
+  },
+  "Sources/EuclidApp/InterfaceStyle.swift": {
+    "before": "872cbb99746bbb00a4c162979e90f04cdf1cb810",
+    "after": "872cbb99746bbb00a4c162979e90f04cdf1cb810"
+  },
+  "Sources/EuclidApp/LayerPanel.swift": {
+    "before": "4064c998dfa5c3a05ce7e76ce7932a5510fd2386",
+    "after": "4064c998dfa5c3a05ce7e76ce7932a5510fd2386"
+  },
+  "Sources/EuclidApp/StatusBarView.swift": {
+    "before": "4844f2af7a95e744ab69eea2b9e9a757fd640f35",
+    "after": "4844f2af7a95e744ab69eea2b9e9a757fd640f35"
+  },
+  "Sources/EuclidApp/ViewBookmarks.swift": {
+    "before": "0f3cc676ca0c21a7a40f1118f0ccd71a5fd29f8f",
+    "after": "0f3cc676ca0c21a7a40f1118f0ccd71a5fd29f8f"
+  },
+  "Sources/EuclidApp/WorkspaceTabBar.swift": {
+    "before": "837bfcbff6fc0c0eb8ff12f499c46053e34afd62",
+    "after": "837bfcbff6fc0c0eb8ff12f499c46053e34afd62"
+  },
+  "Sources/EuclidApp/CommandPalette.swift": {
+    "before": "65012a62b30a1dfe38e6de5ab7dd769f516eaa7f",
+    "after": "65012a62b30a1dfe38e6de5ab7dd769f516eaa7f"
+  },
+  "Sources/EuclidApp/DownloadSheet.swift": {
+    "before": "f3f2b77a1122045befffd424c42d51d3abb62f72",
+    "after": "f3f2b77a1122045befffd424c42d51d3abb62f72"
+  },
+  "Sources/EuclidApp/TileExportSheet.swift": {
+    "before": "05d54e8f22833c978406df8eb21cde24f65352c2",
+    "after": "05d54e8f22833c978406df8eb21cde24f65352c2"
+  },
+  "Sources/EuclidApp/TileServerSheet.swift": {
+    "before": "d73cb0ef018ac6a3ed8dbf788690ecef8a890d64",
+    "after": "d73cb0ef018ac6a3ed8dbf788690ecef8a890d64"
+  },
+  "Sources/EuclidApp/RasterAnalysisSheet.swift": {
+    "before": "cfd2223ab3ee1742e61661c61c2edbb4a0df9cf0",
+    "after": "cfd2223ab3ee1742e61661c61c2edbb4a0df9cf0"
+  },
+  "Sources/EuclidApp/ScaleBarView.swift": {
+    "before": "288d5674c494a85e7b26492043af43d6353edcb4",
+    "after": "288d5674c494a85e7b26492043af43d6353edcb4"
+  }
+}

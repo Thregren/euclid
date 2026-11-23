@@ -1,3 +1,4 @@
+import TileRendering
 import AppKit
 import Observation
 import SwiftUI
@@ -390,16 +391,28 @@ final class AppModel {
     let analysis = RasterAnalysisModel()
     /// DEM 工具箱面板是否展开。
     var showAnalysisSheet = false
-    /// 指针处高程读数的单像素缓存：同一像素内移动不重复解码。
-    @ObservationIgnored var pointElevationCache: (column: Int, row: Int, value: Float?)?
+    /// Reading this revision observes asynchronous sample completion without changing the view API.
+    var elevationReadingRevision: UInt64 = 0
+    @ObservationIgnored let elevationSampler = PointElevationSampler()
+    @ObservationIgnored var elevationTask: Task<Void, Never>?
+    @ObservationIgnored var elevationTaskID: UUID?
+    @ObservationIgnored var elevationLatestRequest: PointElevationRequest?
+    @ObservationIgnored var elevationCompletedRequest: PointElevationRequest?
+    @ObservationIgnored var elevationCompletedValue: Float?
+    @ObservationIgnored var elevationCompletedAt: ContinuousClock.Instant?
     /// 分析读句柄的缓存（表头解析本身有缓存，这里省掉重复查找）。
-    @ObservationIgnored var analysisReaderCache: (url: URL, reader: RasterSampleReader)?
+    @ObservationIgnored var analysisReaderCache: (url: URL, identity: FileIdentity?, reader: RasterSampleReader?)?
+    @ObservationIgnored var analysisReaderLoadTask: Task<Void, Never>?
+    @ObservationIgnored var analysisReaderRequestID: UUID?
+    @ObservationIgnored var analysisReaderCheckedAt: ContinuousClock.Instant?
+    var analysisReaderRevision = 0
 
     /// 数据源代号：每次「扫描 / 打开影像 / 选中来源」都 +1，用来丢弃过期结果。
     ///
     /// 连点几个数据集、或者扫描还没回来就换了一份数据时，先发的那个慢任务回来得晚，
     /// 对不上代号就整段丢掉 —— 否则它会拿旧结果把用户刚选的东西覆盖掉。
     var sourceGeneration = 0
+    @ObservationIgnored var sourceTask: Task<Void, Never>?
     /// 已经装配到画布上的本地数据集与在线源，避免重复重装。
     var appliedLocalDatasetID: TileDataset.ID?
     var appliedOnlineSignature: String?
@@ -409,10 +422,23 @@ final class AppModel {
     var atlasTask: Task<Void, Never>?
     /// 上一次导出图集的目录（菜单里「在访达中显示」用）。
     var lastAtlasDirectory: URL?
-    /// 存档写入的防抖任务。
-    var archiveTask: Task<Void, Never>?
+    @ObservationIgnored let measurementPersistence = MeasurementPersistenceCoordinator()
+    @ObservationIgnored var measurementOwnerPath: String?
+    @ObservationIgnored var measurementSnapshots: [String: [GeoMeasurement]] = [:]
+    @ObservationIgnored var measurementLoadTasks: [String: Task<Void, Never>] = [:]
+    @ObservationIgnored var measurementEditedWhileLoading: Set<String> = []
+    @ObservationIgnored var measurementReplacedWhileLoading: Set<String> = []
+    @ObservationIgnored var measurementReader: @Sendable (String) async -> ([GeoMeasurement]?, String?) = { path in
+        let values = await MeasurementArchive.shared.measurementsIfPresent(for: path)
+        return (values, await MeasurementArchive.shared.takeNotice())
+    }
+    var persistenceFailure: String?
 
     /// 启动时待打开的数据集目录。真正的扫描延后到窗口出现之后，避免在 App 初始化阶段触发状态变化。
+    @ObservationIgnored var analysisTask: Task<Void, Never>?
+    @ObservationIgnored var analysisGeneration = 0
+    @ObservationIgnored var sessionTask: Task<Void, Never>?
+    @ObservationIgnored var isRestoringSession = false
     var initialURL: URL?
 
     /// 内存压力监听：系统发警告时把瓦片缓存压小（见 `installMemoryPressureMonitor`）。
@@ -432,6 +458,13 @@ final class AppModel {
         }
         measurements.onChange = { [weak self] in
             self?.scheduleArchiveSave()
+        }
+        measurements.onReplace = { [weak self] in
+            guard let self, let path = self.measurementOwnerPath, self.measurementLoadTasks[path] != nil else { return }
+            self.measurementReplacedWhileLoading.insert(path)
+        }
+        measurementPersistence.onFailure = { [weak self] message in
+            self?.reportPersistenceFailure(message)
         }
         // ⌫ / ⌦：图层面板开着、且没在画测量时，删掉选中的图层（画布那边统一监听键盘）。
         canvas.onDeleteLayer = { [weak self] in
@@ -471,6 +504,7 @@ final class AppModel {
             guard let self, let source = self.memoryPressureSource else { return }
             let critical = source.data.contains(.critical)
             self.canvas.trimTileCaches(toFraction: critical ? 0.25 : 0.5)
+            Task { await TileResourceManager.handleMemoryPressure(critical: critical) }
             self.setStatus(
                 critical ? "内存紧张：已清掉大部分瓦片缓存" : "内存偏紧：已清掉一部分瓦片缓存",
                 autoClearAfter: 6
@@ -505,22 +539,18 @@ final class AppModel {
 
     // MARK: - 测量存档
 
-    private func scheduleArchiveSave() {
+    func scheduleArchiveSave() {
         // 无人值守的调试 / 自检运行会真的落点、清空、再读回，**一律不写**用户的自动存档；
         // 演示样本（EUCLID_DEMO_MEASUREMENT）同理。这条守卫必须留在唯一的那条写盘入口上。
         guard !DebugFixtures.isEnabled, !Self.skipsArchiveWrites else { return }
-        guard let path = selectedSourcePath else { return }
+        guard let path = measurementOwnerPath else { return }
         let snapshot = measurements.measurements
-        archiveTask?.cancel()
-        archiveTask = Task {
-            try? await Task.sleep(for: .seconds(0.8))
-            guard !Task.isCancelled else { return }
-            // 编解码与写盘在存档 actor 上做（不在主线程）；失败时在状态栏说一句，
-            // 而不是像以前那样把错误吞掉 —— 自动存档失败等于用户的测量悄悄丢了。
-            if let failure = await MeasurementArchive.shared.save(snapshot, for: path) {
-                setStatus(failure, autoClearAfter: 10)
-            }
+        measurementSnapshots[path] = snapshot
+        if measurementLoadTasks[path] != nil {
+            measurementEditedWhileLoading.insert(path)
+            return
         }
+        measurementPersistence.record(snapshot, for: path)
     }
 
     /// 撤销 / 重做测量操作。
@@ -599,10 +629,13 @@ final class AppModel {
 
     /// 打开启动时记录的数据集（由界面在首个窗口出现后调用）。
     func activateInitialDataset() {
-        guard let url = initialURL else { return }
+        let fallback = initialURL
+        let initialGeneration = sourceGeneration
         initialURL = nil
-        // `open` 会分辨目录与文件：目录按瓦片数据集扫描，文件按单幅影像读。
-        open(url)
+        Task {
+            if !(await restoreWorkspaceSession()), let fallback, !hasLocalLayer, sourceGeneration == initialGeneration { open(fallback) }
+            startWorkspaceSession()
+        }
     }
 
 

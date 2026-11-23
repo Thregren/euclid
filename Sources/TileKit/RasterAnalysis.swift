@@ -18,7 +18,7 @@ public enum DEMAnalysis {
         public let rect: CGRect
         /// 采样步长（源像素）。
         public let step: Int
-        /// 相邻采样点的地面距离（米）。
+        /// 中央采样点的横向地面距离（米）；计算使用各位置的完整横纵地面向量。
         public let spacingMeters: Double
         /// 每点的坡度（度）；取不到的地方是 NaN。
         public let values: [Float]
@@ -39,7 +39,7 @@ public enum DEMAnalysis {
     /// 土方量结果。
     public struct VolumeResult: Sendable {
         public let baseElevation: Double
-        /// 每个采样格的地面面积（平方米）。
+        /// 有效采样格的平均地面面积（平方米）；积分使用每格的局部面积。
         public let cellArea: Double
         /// 参与计算的采样格数。
         public let sampledCells: Int
@@ -75,19 +75,26 @@ public enum DEMAnalysis {
         guard let grid = reader.grid(rect: area, band: band, maxDimension: maxDimension),
               grid.width >= 2, grid.height >= 2 else { return nil }
 
-        let ground = reader.groundPixelSize() ?? 1
-        let spacing = max(1e-6, ground * Double(grid.step))
-        var values = [Float](repeating: .nan, count: grid.width * grid.height)
-        for row in 0..<grid.height {
-            for column in 0..<grid.width {
-                guard let dzdx = derivativeX(grid, column: column, row: row, spacing: spacing),
-                      let dzdy = derivativeY(grid, column: column, row: row, spacing: spacing) else {
-                    continue
-                }
-                let radians = atan((dzdx * dzdx + dzdy * dzdy).squareRoot())
-                values[row * grid.width + column] = Float(radians * 180 / .pi)
-            }
+        let geometry = RasterGroundGeometry(reference: reader.georeference)
+        guard let centerMetric = geometry.metric(column: grid.rect.midX, row: grid.rect.midY) else { return nil }
+        let spacing = centerMetric.columnLength * Double(grid.step)
+        func metric(_ column: Int, _ row: Int) -> RasterGroundMetric? {
+            let point = grid.pixelPoint(column: column, row: row)
+            return geometry.metric(column: point.x, row: point.y)?.scaled(by: Double(grid.step))
         }
+        let values: [Float]?
+        if geometry.constantAlongRows {
+            var metrics: [RasterGroundMetric] = []
+            metrics.reserveCapacity(grid.height)
+            for row in 0..<grid.height {
+                guard !Task.isCancelled, let value = metric(0, row) else { return nil }
+                metrics.append(value)
+            }
+            values = RasterCompute.slope(values: grid.values, width: grid.width, height: grid.height, rowMetrics: metrics)
+        } else {
+            values = RasterCompute.slope(values: grid.values, width: grid.width, height: grid.height, metric: metric)
+        }
+        guard let values else { return nil }
         return SlopeGrid(
             width: grid.width,
             height: grid.height,
@@ -104,59 +111,13 @@ public enum DEMAnalysis {
         )
     }
 
-    /// 中心差分；边界或邻点缺失时退回单边差分，两边都缺就返回 nil。
-    private static func derivativeX(
-        _ grid: RasterSampleGrid,
-        column: Int,
-        row: Int,
-        spacing: Double
-    ) -> Double? {
-        let center = grid[column, row]
-        guard center.isFinite else { return nil }
-        let before = grid[column - 1, row]
-        let after = grid[column + 1, row]
-        if before.isFinite, after.isFinite {
-            return Double(after - before) / (2 * spacing)
-        }
-        if after.isFinite { return Double(after - center) / spacing }
-        if before.isFinite { return Double(center - before) / spacing }
-        return nil
-    }
-
-    private static func derivativeY(
-        _ grid: RasterSampleGrid,
-        column: Int,
-        row: Int,
-        spacing: Double
-    ) -> Double? {
-        let center = grid[column, row]
-        guard center.isFinite else { return nil }
-        let before = grid[column, row - 1]
-        let after = grid[column, row + 1]
-        if before.isFinite, after.isFinite {
-            return Double(after - before) / (2 * spacing)
-        }
-        if after.isFinite { return Double(after - center) / spacing }
-        if before.isFinite { return Double(center - before) / spacing }
-        return nil
-    }
-
     /// 把坡度网格着色成一张图（绿→黄→红，半透明叠加）。
     ///
     /// - Parameter maximum: 色标上限（度）；`nil` 时用数据自身最大值，全平则为 1。
     public static func image(of grid: SlopeGrid, maximum: Double? = nil) -> CGImage? {
         let stats = statistics(of: grid.values)
         let top = max(1e-3, maximum ?? (stats.isEmpty ? 1 : stats.maximum))
-        var canvas = [UInt8](repeating: 0, count: grid.width * grid.height * 4)
-        for index in 0..<grid.values.count {
-            let value = grid.values[index]
-            guard value.isFinite else { continue }
-            let t = min(max(Double(value) / top, 0), 1)
-            let color = terrainColor(t)
-            // 坡度越陡越不透明，平地几乎透出底图。
-            let alpha = UInt8(min(235, 60 + t * 175))
-            write(&canvas, at: index, color, alpha: alpha)
-        }
+        guard let canvas = RasterCompute.color(values: grid.values, scale: top, difference: false) else { return nil }
         return RasterTileSource.makeImage(canvas: canvas, width: grid.width, height: grid.height)
     }
 
@@ -177,7 +138,8 @@ public enum DEMAnalysis {
         maxDimension: Int = 2048,
         band: Int = 0
     ) -> VolumeResult? {
-        guard polygon.count >= 3, baseElevation.isFinite else { return nil }
+        guard polygon.count >= 3, baseElevation.isFinite,
+              polygon.allSatisfy({ $0.x.isFinite && $0.y.isFinite }) else { return nil }
         let full = CGRect(x: 0, y: 0, width: Double(reader.pixelWidth), height: Double(reader.pixelHeight))
         var bounds = CGRect(origin: polygon[0], size: .zero)
         for point in polygon.dropFirst() {
@@ -187,8 +149,9 @@ public enum DEMAnalysis {
         guard !area.isNull, area.width >= 1, area.height >= 1 else { return nil }
         guard let grid = reader.grid(rect: area, band: band, maxDimension: maxDimension) else { return nil }
 
-        let ground = reader.groundPixelSize() ?? 1
-        let cellArea = pow(max(1e-6, ground * Double(grid.step)), 2)
+        let geometry = RasterGroundGeometry(reference: reader.georeference)
+        guard geometry.metric(column: grid.rect.midX, row: grid.rect.midY) != nil else { return nil }
+        var sampledArea = 0.0
         var cut = 0.0
         var fill = 0.0
         var cells = 0
@@ -197,26 +160,38 @@ public enum DEMAnalysis {
         var sum = 0.0
         var count = 0
         for row in 0..<grid.height {
-            for column in 0..<grid.width {
-                let value = grid[column, row]
-                guard value.isFinite else { continue }
-                guard contains(polygon, point: grid.pixelPoint(column: column, row: row)) else { continue }
-                let height = Double(value)
-                cells += 1
-                sum += height
-                count += 1
-                lowest = min(lowest, height)
-                highest = max(highest, height)
-                let delta = height - baseElevation
-                if delta >= 0 { cut += delta * cellArea } else { fill += -delta * cellArea }
+            if Task.isCancelled { return nil }
+            let rowPoint = grid.pixelPoint(column: 0, row: row)
+            let rowMetric = geometry.constantAlongRows ? geometry.metric(column: rowPoint.x, row: rowPoint.y) : nil
+            for span in RasterPolygonScanlines.spans(polygon: polygon, grid: grid, row: row) {
+                for column in span {
+                    let value = grid[column, row]
+                    guard value.isFinite else { continue }
+                    let point = grid.pixelPoint(column: column, row: row)
+                    guard let metric = rowMetric ?? geometry.metric(column: point.x, row: point.y) else { return nil }
+                    // The last downsampled cell may cover fewer than step × step source pixels.
+                    let cellWidth = min(Double(grid.step), grid.rect.maxX - (grid.rect.minX + Double(column * grid.step)))
+                    let cellHeight = min(Double(grid.step), grid.rect.maxY - (grid.rect.minY + Double(row * grid.step)))
+                    let cellArea = metric.area * cellWidth * cellHeight
+                    guard cellArea.isFinite, cellArea > 0 else { return nil }
+                    sampledArea += cellArea
+                    let height = Double(value)
+                    cells += 1
+                    sum += height
+                    count += 1
+                    lowest = min(lowest, height)
+                    highest = max(highest, height)
+                    let delta = height - baseElevation
+                    if delta >= 0 { cut += delta * cellArea } else { fill += -delta * cellArea }
+                }
             }
         }
         guard cells > 0 else { return nil }
         return VolumeResult(
             baseElevation: baseElevation,
-            cellArea: cellArea,
+            cellArea: sampledArea / Double(cells),
             sampledCells: cells,
-            sampledArea: Double(cells) * cellArea,
+            sampledArea: sampledArea,
             cutVolume: cut,
             fillVolume: fill,
             elevation: Statistics(
@@ -249,26 +224,7 @@ public enum DEMAnalysis {
 
     /// 一组数值的统计（忽略 NaN / 无穷）。
     public static func statistics(of values: [Float]) -> Statistics {
-        var lowest = Double.greatestFiniteMagnitude
-        var highest = -Double.greatestFiniteMagnitude
-        var sum = 0.0
-        var count = 0
-        for value in values where value.isFinite {
-            let number = Double(value)
-            lowest = min(lowest, number)
-            highest = max(highest, number)
-            sum += number
-            count += 1
-        }
-        guard count > 0 else {
-            return Statistics(validCount: 0, minimum: .nan, maximum: .nan, mean: .nan)
-        }
-        return Statistics(
-            validCount: count,
-            minimum: lowest,
-            maximum: highest,
-            mean: sum / Double(count)
-        )
+        RasterStatistics.compute(values)
     }
 
     /// 源像素矩形 → 与「抽稀后的一格」对应的地理参考。
@@ -332,7 +288,7 @@ public enum DEMAnalysis {
 /// 两期影像的差异。
 ///
 /// 做法：先求两份影像的世界范围交集（只能比共同覆盖的那一块），
-/// 各自按同一输出尺寸抽稀采样，逐点相减 —— 第一份减第二份。
+/// 在同一地理网格的像素中心分别反投影采样，逐点相减 —— 第一份减第二份。
 /// 蓝色表示变低 / 变小，红色表示变高 / 变大，越接近 0 越透明。
 public enum RasterDifference {
     public struct Result: @unchecked Sendable {
@@ -356,6 +312,21 @@ public enum RasterDifference {
         band: Int = 0
     ) -> Result? {
         guard first.isGeoreferenced, second.isGeoreferenced else { return nil }
+        // Identical source grids already share a geographic coordinate system. Preserve
+        // their native cells instead of introducing interpolation or bounding-box corners.
+        if first.georeference == second.georeference {
+            let commonPixels = CGRect(x: 0, y: 0, width: min(first.pixelWidth, second.pixelWidth),
+                                      height: min(first.pixelHeight, second.pixelHeight))
+            guard let a = first.grid(rect: commonPixels, band: band, maxDimension: maxDimension),
+                  let b = second.grid(rect: commonPixels, band: band, maxDimension: maxDimension),
+                  a.width == b.width, a.height == b.height else { return nil }
+            let output = DEMAnalysis.subGeoreference(first.georeference, originColumn: 0, originRow: 0,
+                                                    step: Double(a.step))
+            return result(first: a.values, second: b.values, width: a.width, height: a.height,
+                          georeference: output,
+                          worldRect: first.georeference.worldRect(pixelWidth: Int(commonPixels.width),
+                                                                   pixelHeight: Int(commonPixels.height)))
+        }
         let worldA = first.georeference.worldRect(pixelWidth: first.pixelWidth, pixelHeight: first.pixelHeight)
         let worldB = second.georeference.worldRect(pixelWidth: second.pixelWidth, pixelHeight: second.pixelHeight)
         let common = worldA.intersection(worldB)
@@ -372,71 +343,48 @@ public enum RasterDifference {
         guard !rectA.isNull, !rectB.isNull, rectA.width >= 1, rectA.height >= 1,
               rectB.width >= 1, rectB.height >= 1 else { return nil }
 
-        guard let gridA = first.grid(rect: rectA, band: band, maxDimension: maxDimension),
-              let gridB = second.grid(rect: rectB, band: band, maxDimension: maxDimension),
-              gridA.width >= 1, gridA.height >= 1, gridB.width >= 1, gridB.height >= 1 else { return nil }
+        let limit = Double(max(2, min(4096, maxDimension)))
+        // Select a bounded output grid, no finer than the coarser source bounding rectangle.
+        let rawWidth = min(rectA.width, rectB.width)
+        let rawHeight = min(rectA.height, rectB.height)
+        let reduction = max(1, max(rawWidth, rawHeight) / limit)
+        let width = max(1, Int(ceil(rawWidth / reduction)))
+        let height = max(1, Int(ceil(rawHeight / reduction)))
+        let circumference = 2 * Double.pi * Projection.wgs84SemiMajorAxis
+        let georeference = RasterGeoreference(
+            placement: .georeferenced, crs: .webMercator,
+            originX: (common.minX - 0.5) * circumference,
+            originY: (0.5 - common.minY) * circumference,
+            pixelSizeX: common.width * circumference / Double(width),
+            pixelSizeY: -common.height * circumference / Double(height))
+        guard let samplesA = first.resampledValues(georeference: georeference, width: width, height: height, band: band),
+              let samplesB = second.resampledValues(georeference: georeference, width: width, height: height, band: band) else { return nil }
+        return result(first: samplesA, second: samplesB, width: width, height: height,
+                      georeference: georeference, worldRect: common)
+    }
 
-        let width = min(gridA.width, gridB.width)
-        let height = min(gridA.height, gridB.height)
-        guard width >= 1, height >= 1 else { return nil }
-
-        var differences = [Float](repeating: .nan, count: width * height)
-        var sum = 0.0
-        var count = 0
-        var lowest = Double.greatestFiniteMagnitude
-        var highest = -Double.greatestFiniteMagnitude
-        var absoluteMax = 0.0
-        for row in 0..<height {
-            let rowA = row * gridA.height / height
-            let rowB = row * gridB.height / height
-            for column in 0..<width {
-                let columnA = column * gridA.width / width
-                let columnB = column * gridB.width / width
-                let a = gridA[columnA, rowA]
-                let b = gridB[columnB, rowB]
-                guard a.isFinite, b.isFinite else { continue }
-                let difference = a - b
-                differences[row * width + column] = difference
-                let number = Double(difference)
-                sum += number
-                count += 1
-                lowest = min(lowest, number)
-                highest = max(highest, number)
-                absoluteMax = max(absoluteMax, abs(number))
-            }
-        }
+    private static func result(first: [Float], second: [Float], width: Int, height: Int,
+                               georeference: RasterGeoreference, worldRect: CGRect) -> Result? {
+        guard let differences = RasterCompute.differences(first: first, firstWidth: width, firstHeight: height,
+                                                          second: second, secondWidth: width, secondHeight: height,
+                                                          width: width, height: height) else { return nil }
+        let statistics = RasterStatistics.compute(differences)
+        let count = statistics.validCount
         guard count > 0 else { return nil }
-
-        var canvas = [UInt8](repeating: 0, count: width * height * 4)
-        let scale = absoluteMax > 0 ? absoluteMax : 1
-        for index in 0..<differences.count {
-            let value = differences[index]
-            guard value.isFinite else { continue }
-            let t = min(max(Double(value) / scale, -1), 1)
-            let magnitude = abs(t)
-            let color = t >= 0
-                ? (230.0, 74.0, 54.0)      // 变高 / 变大
-                : (46.0, 116.0, 230.0)     // 变低 / 变小
-            let alpha = UInt8(min(235, 40 + magnitude * 195))
-            DEMAnalysis.write(&canvas, at: index, color, alpha: alpha)
-        }
+        let lowest = statistics.minimum, highest = statistics.maximum
+        let absoluteMax = max(abs(lowest), abs(highest))
+        guard let canvas = RasterCompute.color(values: differences, scale: absoluteMax > 0 ? absoluteMax : 1, difference: true) else { return nil }
         guard let image = RasterTileSource.makeImage(canvas: canvas, width: width, height: height) else {
             return nil
         }
-        let georeference = DEMAnalysis.subGeoreference(
-            first.georeference,
-            originColumn: rectA.minX,
-            originRow: rectA.minY,
-            step: rectA.width / Double(width)
-        )
         return Result(
             image: image,
             georeference: georeference,
             width: width,
             height: height,
-            worldRect: common,
+            worldRect: worldRect,
             comparedSamples: count,
-            meanDifference: sum / Double(count),
+            meanDifference: statistics.mean,
             maximumDifference: highest,
             minimumDifference: lowest,
             absoluteMaximum: absoluteMax

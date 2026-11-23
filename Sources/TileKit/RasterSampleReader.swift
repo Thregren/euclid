@@ -34,8 +34,8 @@ public struct RasterSampleGrid: Sendable {
     /// 第 (column,row) 个采样点对应的源像素坐标（格中心）。
     public func pixelPoint(column: Int, row: Int) -> CGPoint {
         CGPoint(
-            x: rect.minX + Double(column * step) + Double(step) / 2,
-            y: rect.minY + Double(row * step) + Double(step) / 2
+            x: rect.minX + Double(column * step) + min(Double(step), max(0, rect.width - Double(column * step))) / 2,
+            y: rect.minY + Double(row * step) + min(Double(step), max(0, rect.height - Double(row * step))) / 2
         )
     }
 
@@ -75,8 +75,9 @@ public struct RasterSampleReader: Sendable {
     public let georeference: RasterGeoreference
 
     /// 解析文件头；读不出就返回 nil（不抛错，调用方按「这份数据不适合分析」处理）。
-    public static func open(url: URL) -> RasterSampleReader? {
-        guard let file = TIFFFileCache.shared.file(for: url) else { return nil }
+    public static func open(url: URL, forceReload: Bool = false) -> RasterSampleReader? {
+        // Force an identity check, not a cold decode: unchanged files keep their shared chunks.
+        guard let file = TIFFFileCache.shared.file(for: url, forceIdentityCheck: forceReload) else { return nil }
         let main = file.main
         guard main.width > 0, main.height > 0, main.chunkWidth > 0, main.chunkHeight > 0,
               !main.chunks.isEmpty, main.compression.isSupported,
@@ -103,22 +104,16 @@ public struct RasterSampleReader: Sendable {
         bandCount == 1 && (isFloat || sampleBits >= 16)
     }
 
-    /// 一个像素有多少米（用中点附近相邻 10 个像素的测地距离算）。
-    ///
-    /// 经纬度投影、UTM、Web 墨卡托都适用；算不出来（没有地理参考）返回 nil。
+    /// 中央像素横向的地面尺度。分析计算使用完整的局部地面向量和面积。
     public func groundPixelSize() -> Double? {
-        guard isGeoreferenced else { return nil }
-        let column = Double(pixelWidth) / 2
-        let row = Double(pixelHeight) / 2
-        guard let first = georeference.coordinate(column: column, row: row),
-              let second = georeference.coordinate(column: column + 10, row: row) else { return nil }
-        let distance = Geodesy.distance(from: first, to: second) / 10
-        return distance > 0 ? distance : nil
+        RasterGroundGeometry(reference: georeference)
+            .metric(column: Double(pixelWidth) / 2, row: Double(pixelHeight) / 2)?.columnLength
     }
 
     /// 单个样本值（最近邻）；越界或读不出返回 nil。
     public func value(column: Double, row: Double, band: Int = 0) -> Float? {
-        guard column.isFinite, row.isFinite else { return nil }
+        guard column.isFinite, row.isFinite, column >= 0, row >= 0,
+              column < Double(pixelWidth), row < Double(pixelHeight) else { return nil }
         let x = Int(column.rounded(.down))
         let y = Int(row.rounded(.down))
         guard x >= 0, y >= 0, x < pixelWidth, y < pixelHeight else { return nil }
@@ -142,12 +137,15 @@ public struct RasterSampleReader: Sendable {
     /// - Parameter maxDimension: 输出网格最长边的上限；超了就按整数步长抽稀。
     /// - Returns: 网格（`step > 1` 表示抽稀过），取不到返回 nil。
     public func grid(rect: CGRect, band: Int = 0, maxDimension: Int = 1024) -> RasterSampleGrid? {
-        guard rect.width.isFinite, rect.height.isFinite, rect.width > 0, rect.height > 0 else { return nil }
+        guard rect.origin.x.isFinite, rect.origin.y.isFinite, rect.width.isFinite, rect.height.isFinite,
+              rect.maxX.isFinite, rect.maxY.isFinite, rect.width > 0, rect.height > 0 else { return nil }
+        let clipped = rect.intersection(CGRect(x: 0, y: 0, width: Double(pixelWidth), height: Double(pixelHeight)))
+        guard !clipped.isNull, clipped.width > 0, clipped.height > 0 else { return nil }
         let limit = max(2, min(4096, maxDimension))
-        let x0 = max(0, Int(rect.minX.rounded(.down)))
-        let y0 = max(0, Int(rect.minY.rounded(.down)))
-        let x1 = min(pixelWidth, Int(rect.maxX.rounded(.up)))
-        let y1 = min(pixelHeight, Int(rect.maxY.rounded(.up)))
+        let x0 = max(0, Int(clipped.minX.rounded(.down)))
+        let y0 = max(0, Int(clipped.minY.rounded(.down)))
+        let x1 = min(pixelWidth, Int(clipped.maxX.rounded(.up)))
+        let y1 = min(pixelHeight, Int(clipped.maxY.rounded(.up)))
         guard x1 > x0, y1 > y0 else { return nil }
         let step = max(1, Int((Double(max(x1 - x0, y1 - y0)) / Double(limit)).rounded(.up)))
         let width = (x1 - x0 + step - 1) / step
@@ -164,29 +162,36 @@ public struct RasterSampleReader: Sendable {
             let bandIndex = level.planarConfiguration == 2 ? 0 : band
             var cachedRow = -1
             var rowChunks: [Int: [UInt8]] = [:]
+            var failedChunks: Set<Int> = []
             for outRow in 0..<height {
+                if Task.isCancelled { return nil }
                 let y = y0 + outRow * step
                 guard y < level.height else { break }
                 let chunkRow = y / chunkHeight
                 if chunkRow != cachedRow {
                     cachedRow = chunkRow
                     rowChunks.removeAll(keepingCapacity: true)
+                    failedChunks.removeAll(keepingCapacity: true)
                 }
+                var cachedColumn = -1
+                var cachedBytes: [UInt8]?
                 for outColumn in 0..<width {
                     let x = x0 + outColumn * step
                     guard x < level.width else { break }
                     let column = x / chunkWidth
-                    if rowChunks[column] == nil {
-                        let index = chunkRow * across + column
-                        rowChunks[column] = try? TIFFRawChunks.bytes(
-                            file: file,
-                            level: level,
-                            reader: lease.reader,
-                            chunkIndex: index,
-                            plane: plane
-                        )
+                    if column != cachedColumn {
+                        if rowChunks[column] == nil, !failedChunks.contains(column) {
+                            let index = chunkRow * across + column
+                            if let bytes = try? TIFFRawChunks.bytes(
+                                file: file, level: level, reader: lease.reader, chunkIndex: index, plane: plane
+                            ) {
+                                rowChunks[column] = bytes
+                            } else { failedChunks.insert(column) }
+                        }
+                        cachedColumn = column
+                        cachedBytes = rowChunks[column]
                     }
-                    guard let bytes = rowChunks[column],
+                    guard let bytes = cachedBytes,
                           let value = TIFFSampleAccess.value(
                               bytes: bytes,
                               level: level,
@@ -208,6 +213,81 @@ public struct RasterSampleReader: Sendable {
             step: step,
             values: values
         )
+    }
+
+    /// Samples a shared georeferenced output grid at pixel centres. Bilinear interpolation
+    /// uses source pixel centres too; a missing contributing sample remains missing.
+    package func resampledValues(georeference output: RasterGeoreference, width: Int, height: Int,
+                                 band: Int = 0) -> [Float]? {
+        guard isGeoreferenced, output.isGeoreferenced, width > 0, height > 0,
+              width <= 4096, height <= 4096, band >= 0, band < bandCount else { return nil }
+        return withLevel { file, level in
+            guard let lease = try? TIFFChunkCache.shared.acquireReader(url: fileURL) else { return nil }
+            let chunkWidth = max(1, level.chunkWidth), chunkHeight = max(1, level.chunkHeight)
+            let across = max(1, level.chunksAcross)
+            let plane = level.planarConfiguration == 2 ? band : 0
+            let bandIndex = level.planarConfiguration == 2 ? 0 : band
+            // A small local cache avoids taking the shared cache lock four times per pixel.
+            // It is byte bounded even when an oblique output row crosses many source chunks.
+            var chunks: [Int: [UInt8]] = [:]
+            var lastChunk: (index: Int, bytes: [UInt8])?
+            var cacheBytes = 0
+            var failed: Set<Int> = []
+            let localBudget = min(16 << 20, TileResourcePolicy.rasterChunkCacheBytes)
+            func value(_ x: Int, _ y: Int) -> Float? {
+                let index = (y / chunkHeight) * across + x / chunkWidth
+                if failed.contains(index) { return nil }
+                var bytes = lastChunk?.index == index ? lastChunk?.bytes : chunks[index]
+                if bytes == nil {
+                    bytes = try? TIFFRawChunks.bytes(file: file, level: level, reader: lease.reader,
+                                                    chunkIndex: index, plane: plane)
+                    guard let loaded = bytes else { failed.insert(index); return nil }
+                    if loaded.count <= localBudget {
+                        if cacheBytes + loaded.count > localBudget { chunks.removeAll(keepingCapacity: true); cacheBytes = 0 }
+                        chunks[index] = loaded
+                        cacheBytes += loaded.count
+                    }
+                }
+                guard let bytes else { return nil }
+                // Retain the current chunk even if it exceeds the small dictionary budget.
+                // Otherwise an uncached wide strip could be decompressed for every sample.
+                lastChunk = (index, bytes)
+                return TIFFSampleAccess.value(bytes: bytes, level: level, x: x % chunkWidth, y: y % chunkHeight,
+                                              band: bandIndex, order: file.byteOrder)
+            }
+            var values = [Float](repeating: .nan, count: width * height)
+            for row in 0..<height {
+                if Task.isCancelled { return nil }
+                failed.removeAll(keepingCapacity: true)
+                for column in 0..<width {
+                    let source: CGPoint?
+                    if output.crs == georeference.crs {
+                        let point = output.crsPoint(column: Double(column) + 0.5, row: Double(row) + 0.5)
+                        source = georeference.pixelPoint(x: point.x, y: point.y)
+                    } else if let coordinate = output.coordinate(column: Double(column) + 0.5, row: Double(row) + 0.5) {
+                        source = georeference.pixel(for: coordinate)
+                    } else { source = nil }
+                    guard let source, source.x.isFinite, source.y.isFinite,
+                          source.x >= 0, source.y >= 0,
+                          source.x < Double(level.width), source.y < Double(level.height) else { continue }
+                    let x = min(max(source.x - 0.5, 0), Double(level.width - 1))
+                    let y = min(max(source.y - 0.5, 0), Double(level.height - 1))
+                    let x0 = Int(x.rounded(.down)), y0 = Int(y.rounded(.down))
+                    let x1 = min(x0 + 1, level.width - 1), y1 = min(y0 + 1, level.height - 1)
+                    let dx = x - Double(x0), dy = y - Double(y0)
+                    let samples = [(x0, y0, (1 - dx) * (1 - dy)), (x1, y0, dx * (1 - dy)),
+                                   (x0, y1, (1 - dx) * dy), (x1, y1, dx * dy)]
+                    var total = 0.0
+                    var valid = true
+                    for (x, y, weight) in samples where weight > 1e-12 {
+                        guard let sample = value(x, y), sample.isFinite else { valid = false; break }
+                        total += Double(sample) * weight
+                    }
+                    if valid, total.isFinite { values[row * width + column] = Float(total) }
+                }
+            }
+            return values
+        }
     }
 
     /// 采样一条直线（剖面用）：从 `start` 到 `end` 均匀取 `count` 个点。
@@ -251,6 +331,7 @@ public struct RasterSampleReader: Sendable {
             output.reserveCapacity(samples)
             var segment = 0
             for index in 0..<samples {
+                if Task.isCancelled { return nil }
                 let t = Double(index) / Double(samples - 1)
                 let target = t * total
                 while segment < cumulative.count - 2, cumulative[segment + 1] < target {
@@ -263,7 +344,8 @@ public struct RasterSampleReader: Sendable {
                 let b = polyline[segment + 1]
                 let x = a.x + (b.x - a.x) * local
                 let y = a.y + (b.y - a.y) * local
-                guard x.isFinite, y.isFinite else { continue }
+                guard x.isFinite, y.isFinite, x >= 0, y >= 0,
+                      x < Double(level.width), y < Double(level.height) else { continue }
                 let xi = Int(x.rounded(.down))
                 let yi = Int(y.rounded(.down))
                 guard xi >= 0, yi >= 0, xi < level.width, yi < level.height else { continue }

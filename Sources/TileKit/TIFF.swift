@@ -204,6 +204,25 @@ package enum TIFFLimits {
     /// 合法的地理标签、分块表与色彩表都远小于这个数（最大的常见项是 16 位调色板，384 KB），
     /// 因此 64 MB 既宽松又足够把「声明出来的天文数字」挡在门外。
     package static let maximumEntryBytes = 64 << 20
+    package static let maximumSamplesPerPixel = 1024
+    package static let maximumImageSide = Int(Int32.max)
+    package static let maximumDirectories = 1024
+    #if os(iOS)
+    package static let maximumChunkBytes = 64 << 20
+    package static let maximumMetadataBytes = 64 << 20
+    #else
+    package static let maximumChunkBytes = 256 << 20
+    package static let maximumMetadataBytes = 256 << 20
+    #endif
+
+    package static func chunkBytes(width: Int, height: Int, samples: Int, bits: Int) -> Int? {
+        guard isSaneChunk(width: width, height: height), samples > 0,
+              samples <= maximumSamplesPerPixel, [1, 2, 4, 8, 16, 32, 64].contains(bits) else { return nil }
+        let bytesPerSample = max(1, bits / 8)
+        let pixels = width * height
+        guard samples <= maximumChunkBytes / pixels / bytesPerSample else { return nil }
+        return pixels * samples * bytesPerSample
+    }
 
     package static func isSaneChunk(width: Int, height: Int) -> Bool {
         guard width > 0, height > 0 else { return false }
@@ -221,10 +240,14 @@ package final class TIFFSourceFile: @unchecked Sendable {
     private var isClosed = false
     let byteCount: Int
 
-    init(url: URL) throws {
+    package init(url: URL) throws {
         handle = try FileHandle(forReadingFrom: url)
-        let size = (try? FileManager.default.attributesOfItem(atPath: url.path(percentEncoded: false))[.size]) as? Int
-        byteCount = size ?? 0
+        var status = stat()
+        guard fstat(handle.fileDescriptor, &status) == 0, let size = Int(exactly: status.st_size), size >= 0 else {
+            try? handle.close()
+            throw TIFFError.truncated
+        }
+        byteCount = size
     }
 
     /// 按偏移读一段字节；读不满或出错返回 nil。
@@ -233,13 +256,16 @@ package final class TIFFSourceFile: @unchecked Sendable {
     /// 而这里被多个解码线程同时用（拖动时一块几十 MB 的条带会把别的读全堵住）。
     /// `pread` 不依赖句柄状态，因此不需要加锁排队。
     package func read(offset: Int, count: Int) -> Data? {
-        guard offset >= 0, count > 0, offset <= Int.max - count else { return nil }
+        guard !Task.isCancelled, offset >= 0, count > 0, offset < byteCount,
+              count <= max(TIFFLimits.maximumEntryBytes, TIFFLimits.maximumChunkBytes) else { return nil }
+        // Bound the allocation before reading. Truncated image chunks may still be diagnosed downstream.
+        let count = min(count, byteCount - offset)
         var data = Data(count: count)
         var total = 0
         let descriptor = handle.fileDescriptor
         data.withUnsafeMutableBytes { raw in
             guard let base = raw.baseAddress else { return }
-            while total < count {
+            while total < count, !Task.isCancelled {
                 let read = pread(descriptor, base.advanced(by: total), count - total, off_t(offset + total))
                 if read <= 0 { break }
                 total += read
@@ -249,7 +275,7 @@ package final class TIFFSourceFile: @unchecked Sendable {
         return total == count ? data : data.prefix(total)
     }
 
-    func close() {
+    package func close() {
         // 只关一次：重复 `close` 会把文件描述符号还给系统，
         // 而那个号码可能已经被别的 `open` 拿去用了（等于关掉别人的文件）。
         closeLock.lock()
@@ -266,6 +292,7 @@ package final class TIFFSourceFile: @unchecked Sendable {
 public enum TIFFReader {
     /// 读取文件结构（不碰像素数据）。
     public static func parse(url: URL) throws -> TIFFFile {
+        try Task.checkCancellation()
         let reader = try TIFFSourceFile(url: url)
         defer { reader.close() }
         guard let header = reader.read(offset: 0, count: 16), header.count >= 8 else {
@@ -292,7 +319,8 @@ public enum TIFFReader {
             guard header.count >= 16, header.u16(at: 4, order: order) == 8 else {
                 throw TIFFError.unsupported("BigTIFF 的偏移宽度不是 8 字节")
             }
-            firstIFD = Int(header.u64(at: 8, order: order))
+            guard let offset = Int(exactly: header.u64(at: 8, order: order)) else { throw TIFFError.truncated }
+            firstIFD = offset
         default:
             throw TIFFError.notTIFF
         }
@@ -302,10 +330,16 @@ public enum TIFFReader {
         var overviews: [TIFFImageFileDirectory] = []
         var pending = [firstIFD]
         var visited = Set<Int>()
+        var metadataBudget = TIFFLimits.maximumMetadataBytes
         while let offset = pending.popLast() {
+            try Task.checkCancellation()
             guard offset > 0, !visited.contains(offset) else { continue }
+            guard visited.count < TIFFLimits.maximumDirectories else {
+                throw TIFFError.unsupported("TIFF 目录数量超过安全上限")
+            }
             visited.insert(offset)
-            let parsed = try parseIFD(reader: reader, order: order, isBigTIFF: isBigTIFF, offset: offset)
+            let parsed = try parseIFD(reader: reader, order: order, isBigTIFF: isBigTIFF,
+                                      offset: offset, metadataBudget: &metadataBudget)
             if main == nil {
                 main = parsed.directory
             } else if parsed.directory.width > 0 {
@@ -345,7 +379,8 @@ public enum TIFFReader {
         reader: TIFFSourceFile,
         order: TIFFByteOrder,
         isBigTIFF: Bool,
-        offset: Int
+        offset: Int,
+        metadataBudget: inout Int
     ) throws -> ParsedIFD {
         let countSize = isBigTIFF ? 8 : 2
         let entrySize = isBigTIFF ? 20 : 12
@@ -361,13 +396,16 @@ public enum TIFFReader {
             : UInt64(header.u16(at: 0, order: order))
         guard let entryCount = Int(exactly: rawEntryCount) else { throw TIFFError.truncated }
         guard entryCount > 0, entryCount < 4096 else { throw TIFFError.truncated }
-        guard let block = reader.read(offset: offset + countSize, count: entryCount * entrySize + (isBigTIFF ? 8 : 4)) else {
+        let blockSize = entryCount * entrySize + (isBigTIFF ? 8 : 4)
+        guard offset <= reader.byteCount - countSize,
+              let block = reader.read(offset: offset + countSize, count: blockSize), block.count == blockSize else {
             throw TIFFError.truncated
         }
 
         var entries: [Int: Entry] = [:]
         entries.reserveCapacity(entryCount)
         for index in 0..<entryCount {
+            if index % 128 == 0 { try Task.checkCancellation() }
             let base = index * entrySize
             let tag = Int(block.u16(at: base, order: order))
             let type = Int(block.u16(at: base + 2, order: order))
@@ -379,6 +417,10 @@ public enum TIFFReader {
             guard let byteSize = entryByteSize(type: type, count: count) else {
                 throw TIFFError.unsupported("目录项 \(tag) 声明了不可信的数据长度（\(count) 个元素）")
             }
+            // Include expanded numeric arrays in the cumulative budget, not just their on-disk bytes.
+            let cost = byteSize + count * 2 * MemoryLayout<Int>.stride
+            guard cost <= metadataBudget else { throw TIFFError.unsupported("TIFF 元数据超过安全预算") }
+            metadataBudget -= cost
             var inline: [UInt8] = []
             for i in 0..<inlineSize where valueStart + i < block.count {
                 inline.append(block[block.startIndex + valueStart + i])
@@ -386,8 +428,11 @@ public enum TIFFReader {
             let rawOffset = isBigTIFF
                 ? block.u64(at: valueStart, order: order)
                 : UInt64(block.u32(at: valueStart, order: order))
-            guard let offsetValue = Int(exactly: rawOffset) else {
-                throw TIFFError.unsupported("目录项 \(tag) 的数据偏移超出可表示范围")
+            var offsetValue = -1
+            if byteSize > inlineSize {
+                guard let value = Int(exactly: rawOffset), value >= 0, value <= reader.byteCount,
+                      byteSize <= reader.byteCount - value else { throw TIFFError.truncated }
+                offsetValue = value
             }
             entries[tag] = Entry(
                 tag: tag,
@@ -409,14 +454,26 @@ public enum TIFFReader {
         }
 
         func entry(_ tag: Int) -> Entry? { entries[tag] }
-        func ints(_ tag: Int) -> [Int] {
+        func ints(_ tag: Int) throws -> [Int] {
             guard let entry = entry(tag) else { return [] }
-            return values(of: entry, reader: reader, order: order).map { Int($0) }
+            return try integerValues(of: entry, reader: reader, order: order)
         }
-        func int(_ tag: Int) -> Int? { ints(tag).first }
-        func doubles(_ tag: Int) -> [Double]? {
+        func int(_ tag: Int) throws -> Int? {
+            guard entry(tag)?.count ?? 1 == 1 else { throw TIFFError.unsupported("TIFF 标量标签长度无效") }
+            return try ints(tag).first
+        }
+        func shorts(_ tag: Int) throws -> [UInt16]? {
+            guard entry(tag) != nil else { return nil }
+            return try ints(tag).map {
+                guard let value = UInt16(exactly: $0) else { throw TIFFError.unsupported("TIFF 短整数标签越界") }
+                return value
+            }
+        }
+        func doubles(_ tag: Int) throws -> [Double]? {
             guard let entry = entry(tag) else { return nil }
-            return values(of: entry, reader: reader, order: order)
+            let result = values(of: entry, reader: reader, order: order)
+            guard result.allSatisfy(\.isFinite) else { throw TIFFError.unsupported("TIFF 地理标签包含非有限数值") }
+            return result
         }
         func ascii(_ tag: Int) -> String? {
             guard let entry = entry(tag) else { return nil }
@@ -427,43 +484,50 @@ public enum TIFFReader {
 
         var directory = TIFFImageFileDirectory()
         directory.offset = offset
-        directory.width = int(256) ?? 0
-        directory.height = int(257) ?? 0
-        guard directory.width > 0, directory.height > 0 else { throw TIFFError.truncated }
-        directory.samplesPerPixel = max(1, int(277) ?? 1)
-        let bits = ints(258)
+        directory.width = try int(256) ?? 0
+        directory.height = try int(257) ?? 0
+        guard (1...TIFFLimits.maximumImageSide).contains(directory.width),
+              (1...TIFFLimits.maximumImageSide).contains(directory.height) else { throw TIFFError.truncated }
+        directory.samplesPerPixel = try int(277) ?? 1
+        guard (1...TIFFLimits.maximumSamplesPerPixel).contains(directory.samplesPerPixel) else {
+            throw TIFFError.unsupported("TIFF 通道数超过安全上限")
+        }
+        let bits = try ints(258)
+        guard bits.allSatisfy({ [1, 2, 4, 8, 16, 32, 64].contains($0) }) else {
+            throw TIFFError.unsupported("TIFF 样本位数无效")
+        }
         directory.bitsPerSample = bits.count == directory.samplesPerPixel
             ? bits
             : Array(repeating: bits.first ?? 8, count: directory.samplesPerPixel)
-        let formats = ints(339)
+        let formats = try ints(339)
         directory.sampleFormat = formats.count == directory.samplesPerPixel
             ? formats
             : Array(repeating: formats.first ?? 1, count: directory.samplesPerPixel)
-        directory.compression = TIFFCompression(code: int(259) ?? 1)
-        directory.photometric = TIFFPhotometricRaw(code: int(262) ?? 1)
-        directory.planarConfiguration = int(284) ?? 1
-        directory.predictor = int(317) ?? 1
-        directory.colorMap = entry(320).map { values(of: $0, reader: reader, order: order).map { UInt16($0) } }
-        directory.extraSamples = ints(338)
+        directory.compression = TIFFCompression(code: try int(259) ?? 1)
+        directory.photometric = TIFFPhotometricRaw(code: try int(262) ?? 1)
+        directory.planarConfiguration = try int(284) ?? 1
+        directory.predictor = try int(317) ?? 1
+        directory.colorMap = try shorts(320)
+        directory.extraSamples = try ints(338)
         if let tables = entry(347) {
             let bytes = rawBytes(of: tables, reader: reader)
             if !bytes.isEmpty { directory.jpegTables = Data(bytes) }
         }
         directory.geo = TIFFGeoTags(
-            pixelScale: doubles(33550),
-            tiePoints: doubles(33922),
-            transformation: doubles(34264),
-            keyDirectory: entry(34735).map { values(of: $0, reader: reader, order: order).map { UInt16($0) } },
-            doubleParameters: doubles(34736),
+            pixelScale: try doubles(33550),
+            tiePoints: try doubles(33922),
+            transformation: try doubles(34264),
+            keyDirectory: try shorts(34735),
+            doubleParameters: try doubles(34736),
             asciiParameters: ascii(34737),
             noData: ascii(42113)
         )
 
         // 分块（tiled）与横条（stripped）二选一。
-        let tileWidth = int(322)
-        let tileHeight = int(323)
-        let tileOffsets = ints(324)
-        let tileCounts = ints(325)
+        let tileWidth = try int(322)
+        let tileHeight = try int(323)
+        let tileOffsets = try ints(324)
+        let tileCounts = try ints(325)
         if let tileWidth, let tileHeight, !tileOffsets.isEmpty {
             // 分块尺寸先过一遍可信范围：后面解码会按它申请缓冲区（见 TIFFLimits）。
             guard TIFFLimits.isSaneChunk(width: tileWidth, height: tileHeight) else {
@@ -475,9 +539,9 @@ public enum TIFFReader {
             directory.chunks = zip(tileOffsets, tileCounts.isEmpty ? tileOffsets.map { _ in 0 } : tileCounts)
                 .map { TIFFChunk(offset: $0.0, byteCount: $0.1) }
         } else {
-            let stripOffsets = ints(273)
-            let stripCounts = ints(279)
-            let rowsPerStrip = int(278) ?? directory.height
+            let stripOffsets = try ints(273)
+            let stripCounts = try ints(279)
+            let rowsPerStrip = try int(278) ?? directory.height
             directory.isTiled = false
             directory.chunkWidth = directory.width
             // `RowsPerStrip` 常用 0xFFFFFFFF 表示「整幅一条」，也可能写成一个荒谬的大数：
@@ -491,10 +555,23 @@ public enum TIFFReader {
                 .map { TIFFChunk(offset: $0.0, byteCount: $0.1) }
         }
 
+        guard directory.planarConfiguration == 1 || directory.planarConfiguration == 2,
+              TIFFLimits.chunkBytes(width: directory.chunkWidth, height: directory.chunkHeight,
+                                    samples: directory.planarConfiguration == 2 ? 1 : directory.samplesPerPixel,
+                                    bits: directory.bitsPerSample.max() ?? 8) != nil,
+              TIFFLimits.chunkBytes(width: directory.chunkWidth, height: directory.chunkHeight, samples: 4, bits: 8) != nil else {
+            throw TIFFError.unsupported("TIFF 解码块超过安全内存预算")
+        }
+        for chunk in directory.chunks {
+            guard chunk.offset >= 0, chunk.byteCount >= 0, chunk.byteCount <= TIFFLimits.maximumChunkBytes,
+                  chunk.offset <= reader.byteCount, chunk.byteCount <= reader.byteCount - chunk.offset else {
+                throw TIFFError.truncated
+            }
+        }
         return ParsedIFD(
             directory: directory,
             next: next,
-            subDirectories: ints(330)
+            subDirectories: try ints(330)
         )
     }
 
@@ -517,6 +594,35 @@ public enum TIFFReader {
         let (bytes, overflow) = size(ofType: type).multipliedReportingOverflow(by: count)
         guard !overflow, bytes <= TIFFLimits.maximumEntryBytes else { return nil }
         return bytes
+    }
+
+    /// Integer tags retain their exact representation; routing offsets through Double loses precision.
+    private static func integerValues(of entry: Entry, reader: TIFFSourceFile, order: TIFFByteOrder) throws -> [Int] {
+        guard [1, 3, 4, 6, 8, 9, 13, 16, 17, 18].contains(entry.type) else {
+            throw TIFFError.unsupported("TIFF 整数标签 \(entry.tag) 的类型无效")
+        }
+        let bytes = rawBytes(of: entry, reader: reader)
+        guard bytes.count == entry.byteSize else { throw TIFFError.truncated }
+        let step = size(ofType: entry.type)
+        var result: [Int] = []
+        result.reserveCapacity(entry.count)
+        for offset in stride(from: 0, to: entry.byteSize, by: step) {
+            if offset % 16384 == 0 { try Task.checkCancellation() }
+            let value: Int?
+            switch entry.type {
+            case 1: value = Int(bytes[offset])
+            case 6: value = Int(Int8(bitPattern: bytes[offset]))
+            case 3: value = Int(bytes.u16(at: offset, order: order))
+            case 8: value = Int(Int16(bitPattern: bytes.u16(at: offset, order: order)))
+            case 4, 13: value = Int(bytes.u32(at: offset, order: order))
+            case 9: value = Int(Int32(bitPattern: bytes.u32(at: offset, order: order)))
+            case 16, 18: value = Int(exactly: bytes.u64(at: offset, order: order))
+            default: value = Int(exactly: Int64(bitPattern: bytes.u64(at: offset, order: order)))
+            }
+            guard let value else { throw TIFFError.unsupported("TIFF 整数标签超出可表示范围") }
+            result.append(value)
+        }
+        return result
     }
 
     /// 取出一个目录项的值（统一成 Double）。

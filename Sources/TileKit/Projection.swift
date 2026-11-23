@@ -6,7 +6,7 @@ import Foundation
 /// 只做「把文件里的平面坐标换算成 WGS84 经纬度」这一件事，
 /// 覆盖国内正射影像几乎全部的实际来源：经纬度（WGS84 / CGCS2000）、
 /// Web 墨卡托、UTM，以及 CGCS2000 的高斯克吕格分带。
-public enum RasterCRS: Hashable, Sendable {
+public enum RasterCRS: Hashable, Sendable, Codable {
     /// 经纬度十进制度。
     case geographic
     /// EPSG:3857 及其别名。
@@ -37,7 +37,7 @@ public enum RasterCRS: Hashable, Sendable {
 }
 
 /// 横轴墨卡托参数。
-public struct TransverseMercator: Hashable, Sendable {
+public struct TransverseMercator: Hashable, Sendable, Codable {
     public var name: String
     public var epsg: Int?
     /// 中央经线（度）。

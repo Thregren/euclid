@@ -27,12 +27,16 @@ public struct TileFetchResult: Sendable {
 public enum TileFetchError: Error, LocalizedError, Equatable {
     case httpStatus(Int)
     case emptyBody
+    case tooLarge
+    case invalidContent
     case transport(String)
 
     public var errorDescription: String? {
         switch self {
         case .httpStatus(let code): return "服务返回 HTTP \(code)"
         case .emptyBody: return "返回内容为空"
+        case .tooLarge: return "响应超过瓦片大小上限"
+        case .invalidContent: return "响应不是有效的瓦片图片"
         case .transport(let message): return "网络错误：\(message)"
         }
     }
@@ -50,6 +54,8 @@ public enum TileFetchError: Error, LocalizedError, Equatable {
             return code == 408 || code == 425 || code == 429 || (500...599).contains(code)
         case .emptyBody, .transport:
             return true
+        case .tooLarge, .invalidContent:
+            return false
         }
     }
 }
@@ -61,29 +67,70 @@ public protocol TileFetching: Sendable {
 
 /// 基于 URLSession 的默认取图通道。
 public struct URLSessionTileFetcher: TileFetching {
+    private static let networkLimiter = AsyncLimiter(limit: {
+        #if os(iOS)
+        return 4
+        #else
+        return 16
+        #endif
+    }())
     private let session: URLSession
     private let timeout: TimeInterval
+    private let maximumBytes: Int
 
-    public init(timeout: TimeInterval = 20, session: URLSession = .shared) {
+    public init(timeout: TimeInterval = 20, session: URLSession = .shared, maximumBytes: Int = 64 << 20) {
         self.timeout = timeout
         self.session = session
+        self.maximumBytes = max(1, min(maximumBytes, 64 << 20))
     }
 
     public func fetch(_ request: TileRequest) async throws -> TileFetchResult {
+        guard await Self.networkLimiter.acquire(priority: Task.currentPriority) else { throw CancellationError() }
+        do {
+            let result = try await fetchBounded(request)
+            await Self.networkLimiter.release()
+            return result
+        } catch {
+            await Self.networkLimiter.release()
+            throw error
+        }
+    }
+
+    private func fetchBounded(_ request: TileRequest) async throws -> TileFetchResult {
         var urlRequest = URLRequest(url: request.url)
         urlRequest.timeoutInterval = timeout
         for (field, value) in request.headers {
             urlRequest.setValue(value, forHTTPHeaderField: field)
         }
         do {
-            let (data, response) = try await session.data(for: urlRequest)
+            let (bytes, response) = try await session.bytes(for: urlRequest)
+            defer { bytes.task.cancel() }
             let status = (response as? HTTPURLResponse)?.statusCode ?? 200
             guard (200..<300).contains(status) else { throw TileFetchError.httpStatus(status) }
+            guard response.expectedContentLength <= Int64(maximumBytes) else { throw TileFetchError.tooLarge }
+            if let mime = response.mimeType?.lowercased(),
+               !["image/png", "image/jpeg", "image/jpg", "image/webp", "application/octet-stream"].contains(mime) {
+                throw TileFetchError.invalidContent
+            }
+            var data = Data()
+            var chunk = [UInt8](); chunk.reserveCapacity(16_384)
+            for try await byte in bytes {
+                guard data.count + chunk.count < maximumBytes else { throw TileFetchError.tooLarge }
+                chunk.append(byte)
+                if chunk.count == 16_384 {
+                    try Task.checkCancellation()
+                    data.append(contentsOf: chunk); chunk.removeAll(keepingCapacity: true)
+                }
+            }
+            data.append(contentsOf: chunk)
+            try Task.checkCancellation()
             guard !data.isEmpty else { throw TileFetchError.emptyBody }
+            guard ImageDecoder.fileExtension(for: data) != nil else { throw TileFetchError.invalidContent }
             return TileFetchResult(data: data, statusCode: status)
         } catch let error as TileFetchError {
             throw error
         } catch {
+            if Task.isCancelled { throw CancellationError() }
             throw TileFetchError.transport(error.localizedDescription)
         }
     }
@@ -509,6 +556,10 @@ public struct TileDownloader: Sendable {
             await pacer.waitForTurn()
             do {
                 let result = try await fetcher.fetch(TileRequest(url: url, headers: headers))
+                guard result.data.count <= 64 << 20 else { throw TileFetchError.tooLarge }
+                guard ImageDecoder.fileExtension(for: result.data) != nil,
+                      await TileDecodeScheduler.decode(result.data) != nil else { throw TileFetchError.invalidContent }
+                try Task.checkCancellation()
                 do {
                     try await directories.ensure(destination.deletingLastPathComponent())
                     // 一律原子落盘（先写临时文件再 rename）。这里刻意不为了省一次 rename 改成直接写：

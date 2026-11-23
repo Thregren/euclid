@@ -4,7 +4,7 @@ import TileKit
 /// 测量结果的本地存档。
 ///
 /// 按数据集目录分别保存，再次打开同一数据集时自动恢复；
-/// 数据量很小（每条测量不过几百字节），因此用一个 JSON 文件装下全部数据集。
+/// 每个数据集独立 JSON，原子写入并保留三代备份；旧版合并存档继续可读。
 ///
 /// 这里刻意做成 `actor`：自动存档是「读整份 → 合并 → 编码 → 写盘」，原先跑在主线程上，
 /// 十来条测量看不出来，几百上千条就是每次改完一下可感的顿挫。放到 actor 上以后
@@ -22,12 +22,8 @@ actor MeasurementArchive {
         var entries: [String: Entry] = [:]
     }
 
-    /// 最多保留的数据集数量，避免存档无限增长。
-    private static let maximumEntries = 30
-    /// 写盘失败只报一次：自动存档每 0.8 秒就会来一次，别把状态栏和日志刷满。
-    private var hasReportedWriteFailure = false
-    /// 有待告诉用户的提示（存档文件读不出来之类），由界面取走一次。
-    private var pendingNotice: String?
+    /// 每份数据独立保存，兼容读取旧版合并存档。
+    private let repository: MeasurementRepository? = fileURL.map { MeasurementRepository(legacyURL: $0) }
 
     /// 调试 / 自检把存档指到别处用的覆盖路径（`EUCLID_DEBUG_ARCHIVE_PATH=/tmp/...`）。
     ///
@@ -54,97 +50,25 @@ actor MeasurementArchive {
     /// 实际读写用的位置（不建目录：读的时候目录不存在就当没有存档）。
     nonisolated static var fileURL: URL? { overrideFileURL ?? userArchiveFileURL }
 
-    private func load() -> Contents {
-        guard let url = Self.fileURL, let data = try? Data(contentsOf: url) else { return Contents() }
-        if let contents = try? JSONDecoder().decode(Contents.self, from: data) { return contents }
-        // 文件在、但解不开：留一份现场再当作空存档，并在状态栏说明。
-        // 以前这里是「悄悄当成没有存档」，用户会以为自己的测量丢了。
-        if pendingNotice == nil {
-            let stamp = Self.timestamp()
-            let backup = url.deletingLastPathComponent().appending(path: "measurements.corrupt-\(stamp).json")
-            if (try? FileManager.default.copyItem(at: url, to: backup)) != nil {
-                pendingNotice = "自动存档读不出来，已备份成 \(backup.lastPathComponent)；本次按空存档启动"
-            } else {
-                pendingNotice = "自动存档读不出来（备份也没写成），本次按空存档启动"
-            }
-        }
-        return Contents()
+    func takeNotice() async -> String? { await repository?.takeNotice() }
+
+    func measurements(for datasetPath: String) async -> [GeoMeasurement] {
+        await repository?.measurements(for: datasetPath) ?? []
     }
 
-    /// 取走一次待显示的提示（没有就返回 nil）。
-    func takeNotice() -> String? {
-        defer { pendingNotice = nil }
-        return pendingNotice
+    func measurementsIfPresent(for datasetPath: String) async -> [GeoMeasurement]? {
+        await repository?.measurementsIfPresent(for: datasetPath)
     }
 
-    /// 时间戳日历（进程内共用一份）。
-    ///
-    /// 这里刻意不用 `DateFormatter`：它的创建是几十微秒到毫秒级，而存档文件名每次落盘都要取一次；
-    /// `Calendar` 是值类型、可安全跨线程共享，配上 `String(format:)` 既省事又稳。
-    private static let stampCalendar: Calendar = {
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.locale = Locale(identifier: "en_US_POSIX")
-        return calendar
-    }()
-
-    private static func timestamp() -> String {
-        let parts = stampCalendar.dateComponents(
-            [.year, .month, .day, .hour, .minute, .second],
-            from: Date()
-        )
-        return String(
-            format: "%04d%02d%02d-%02d%02d%02d",
-            parts.year ?? 0, parts.month ?? 0, parts.day ?? 0,
-            parts.hour ?? 0, parts.minute ?? 0, parts.second ?? 0
-        )
-    }
-
-    /// 写盘。失败时返回一句给人看的话（同一个会话里只说一次），成功返回 nil。
-    private static func write(_ contents: Contents) -> String? {
-        guard let fileURL else { return "找不到应用支持目录，自动存档没写成" }
+    @discardableResult
+    func save(_ measurements: [GeoMeasurement], for datasetPath: String) async -> String? {
+        guard let repository else { return "找不到应用支持目录，自动存档没写成" }
         do {
-            let data = try JSONEncoder().encode(contents)
-            try FileManager.default.createDirectory(
-                at: fileURL.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            try data.write(to: fileURL, options: .atomic)
+            try await repository.save(measurements, for: datasetPath)
             return nil
         } catch {
             return "自动存档写盘失败：\(error.localizedDescription)"
         }
-    }
-
-    func measurements(for datasetPath: String) -> [GeoMeasurement] {
-        load().entries[datasetPath]?.measurements ?? []
-    }
-
-    /// 存一份。返回 nil 表示成功；否则是给状态栏看的一句失败说明（同一次运行里只报一次）。
-    @discardableResult
-    func save(_ measurements: [GeoMeasurement], for datasetPath: String) -> String? {
-        var contents = load()
-        if measurements.isEmpty {
-            contents.entries.removeValue(forKey: datasetPath)
-        } else {
-            contents.entries[datasetPath] = Entry(updatedAt: Date(), measurements: measurements)
-        }
-        if contents.entries.count > Self.maximumEntries {
-            let excess = contents.entries
-                .sorted { $0.value.updatedAt > $1.value.updatedAt }
-                .dropFirst(Self.maximumEntries)
-            for (key, _) in excess {
-                contents.entries.removeValue(forKey: key)
-            }
-        }
-        guard let failure = Self.write(contents) else { return nil }
-        // 有「存档读不出来」这类提示时优先报它（写失败的那条下一次再说）。
-        if let notice = pendingNotice {
-            pendingNotice = nil
-            return notice
-        }
-        guard !hasReportedWriteFailure else { return nil }
-        hasReportedWriteFailure = true
-        return failure
     }
 
     // MARK: - 手工存档（另存为 / 从文件载入）
@@ -169,6 +93,17 @@ actor MeasurementArchive {
         return nil
     }
 
+    nonisolated static func readFile(_ url: URL) async -> [GeoMeasurement]? {
+        await runCancellableAppWork {
+            let limit = 64 * 1024 * 1024
+            guard let identity = FileIdentity(url: url), identity.bytes >= 0, identity.bytes <= limit,
+                  !Task.isCancelled, let file = try? FileHandle(forReadingFrom: url) else { return nil }
+            defer { try? file.close() }
+            guard let data = try? file.read(upToCount: limit + 1), data.count <= limit, !Task.isCancelled else { return nil }
+            return decode(data)
+        }
+    }
+
     /// 自动存档文件所在位置（「在访达中显示」用）。
-    nonisolated static var archiveFileURL: URL? { fileURL }
+    nonisolated static var archiveFileURL: URL? { fileURL?.deletingPathExtension().appendingPathExtension("datasets") }
 }

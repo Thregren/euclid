@@ -25,8 +25,9 @@ public actor RasterOverviewCache {
     private var memory: [String: CGImage] = [:]
     private var memoryOrder: [String] = []
     /// 正在生成 / 已失败的键，避免同一份影像被反复排队。
-    private var inFlight: Set<String> = []
-    private var failed: Set<String> = []
+    private var inFlight: [String: (id: UUID, task: Task<Void, Never>, url: URL)] = [:]
+    private let generationLimiter = AsyncLimiter(limit: 2)
+    private var failed: [String: Date] = [:]
     /// 概览生成好之后通知界面重铺（由 App 层注入；TileKit 不认识 UI）。
     public var onReady: (@Sendable (URL) -> Void)?
 
@@ -44,18 +45,18 @@ public actor RasterOverviewCache {
     /// 已经就绪的概览图（内存里有；没有就顺手读一次磁盘）。没有则 nil，**不阻塞**。
     ///
     /// 没就绪时把生成任务排到后台，生成完通过 `onReady` 通知。
-    public func readyImage(for dataset: RasterDataset) -> CGImage? {
-        readyImage(fileURL: dataset.fileURL, tileSize: dataset.tileSize)
+    public func readyImage(for dataset: RasterDataset) async -> CGImage? {
+        await readyImage(fileURL: dataset.fileURL, tileSize: dataset.tileSize)
     }
 
     /// 同上，直接给文件与瓦片边长（铺瓦片时手上只有这两个）。
-    public func readyImage(fileURL: URL, tileSize: Int) -> CGImage? {
+    public func readyImage(fileURL: URL, tileSize: Int) async -> CGImage? {
         let key = Self.key(fileURL: fileURL, tileSize: tileSize)
         if let cached = memory[key] {
             touch(key)
             return cached
         }
-        if let image = loadFromDisk(key: key) {
+        if let image = await Task.detached(priority: .utility, operation: { self.loadFromDisk(key: key) }).value {
             store(image, key: key)
             return image
         }
@@ -74,9 +75,9 @@ public actor RasterOverviewCache {
     }
 
     /// 排队生成概览（已经在做 / 已经有了 / 做过了就不重复排）。
-    public func scheduleGeneration(for dataset: RasterDataset) {
+    public func scheduleGeneration(for dataset: RasterDataset) async {
         guard Self.qualifies(dataset) else { return }
-        scheduleGeneration(fileURL: dataset.fileURL, tileSize: dataset.tileSize) {
+        await scheduleGeneration(fileURL: dataset.fileURL, tileSize: dataset.tileSize) {
             dataset.renderOverview(maxPixelSize: Self.maximumPixelSize)
         }
     }
@@ -86,27 +87,46 @@ public actor RasterOverviewCache {
         fileURL: URL,
         tileSize: Int,
         render: @escaping @Sendable () -> CGImage?
-    ) {
+    ) async {
         let key = Self.key(fileURL: fileURL, tileSize: tileSize)
-        guard memory[key] == nil, !inFlight.contains(key), !failed.contains(key) else { return }
-        if loadFromDisk(key: key) != nil { return }
-        inFlight.insert(key)
-        Task.detached(priority: .utility) {
-            // 生成在主线程之外做：这是几十秒级的解码，绝不能占着界面。
-            let image = render()
-            await RasterOverviewCache.shared.finishGeneration(image: image, key: key, url: fileURL)
+        guard memory[key] == nil, inFlight[key] == nil, !(failed[key].map { $0 > Date() } ?? false) else { return }
+        if await Task.detached(priority: .utility, operation: { self.loadFromDisk(key: key) }).value != nil { return }
+        guard inFlight[key] == nil, !Task.isCancelled else { return }
+        let id = UUID()
+        let limiter = generationLimiter
+        let task = Task.detached(priority: .utility) { [weak self] in
+            guard await limiter.acquire(priority: .utility) else { return }
+            let image = Task.isCancelled ? nil : TilePerformance.measure("Raster overview") { render() }
+            await limiter.release()
+            await self?.finishGeneration(image: image, key: key, url: fileURL, id: id, cancelled: Task.isCancelled)
+        }
+        inFlight[key] = (id, task, fileURL)
+    }
+
+    public func cancelGeneration(except keeping: Set<String> = []) {
+        for (key, entry) in inFlight where !keeping.contains(entry.url.canonicalFilePath) {
+            entry.task.cancel()
+            inFlight[key] = nil
         }
     }
 
-    private func finishGeneration(image: CGImage?, key: String, url: URL) {
-        inFlight.remove(key)
+    public func trimMemory() { memory.removeAll(); memoryOrder.removeAll() }
+
+    private func finishGeneration(image: CGImage?, key: String, url: URL, id: UUID, cancelled: Bool) async {
+        guard inFlight[key]?.id == id else { return }
+        inFlight[key] = nil
+        guard !cancelled, key == Self.key(fileURL: url, tileSize: Int(key.components(separatedBy: "|").last ?? "") ?? 512) else { return }
         guard let image else {
-            failed.insert(key)
+            if failed.count >= 256 { failed.removeAll() }
+            failed[key] = Date().addingTimeInterval(60)
             return
         }
+        failed[key] = nil
         store(image, key: key)
-        writeToDisk(image, key: key)
-        pruneDiskIfNeeded()
+        await Task.detached(priority: .utility) {
+            self.writeToDisk(image, key: key)
+            self.pruneDiskIfNeeded()
+        }.value
         onReady?(url)
     }
 
@@ -136,10 +156,7 @@ public actor RasterOverviewCache {
     // MARK: - 磁盘
 
     package static func key(fileURL: URL, tileSize: Int) -> String {
-        let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path(percentEncoded: false))
-        let size = (attributes?[.size] as? Int) ?? 0
-        let modified = (attributes?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
-        return "\(fileURL.path(percentEncoded: false))|\(size)|\(Int(modified))|\(tileSize)"
+        return "\(fileURL.canonicalFilePath)|\(FileIdentity(url: fileURL)?.cacheKey ?? "missing")|\(tileSize)"
     }
 
     /// 缓存键 → 文件名：路径太长也当不了文件名，这里压成一个定长的十六进制串。
@@ -152,60 +169,28 @@ public actor RasterOverviewCache {
         return String(format: "%016llx", hash)
     }
 
-    private func fileURL(for key: String) -> URL? {
+    private nonisolated func fileURL(for key: String) -> URL? {
         directory?.appending(path: "\(Self.fileName(for: key)).jpg")
     }
 
-    private func loadFromDisk(key: String) -> CGImage? {
+    private nonisolated func loadFromDisk(key: String) -> CGImage? {
         guard let url = fileURL(for: key), let data = try? Data(contentsOf: url, options: .mappedIfSafe),
-              let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
-        return CGImageSourceCreateImageAtIndex(source, 0, nil)
+              let image = ImageDecoder.decode(data) else { return nil }
+        return image
     }
 
-    private func writeToDisk(_ image: CGImage, key: String) {
+    private nonisolated func writeToDisk(_ image: CGImage, key: String) {
         guard let directory, let url = fileURL(for: key) else { return }
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        guard let destination = CGImageDestinationCreateWithURL(
-            url as CFURL, UTType.jpeg.identifier as CFString, 1, nil
-        ) else { return }
-        CGImageDestinationAddImage(
-            destination, image,
-            [kCGImageDestinationLossyCompressionQuality: 0.85] as CFDictionary
-        )
-        CGImageDestinationFinalize(destination)
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(data, UTType.jpeg.identifier as CFString, 1, nil) else { return }
+        CGImageDestinationAddImage(destination, image, [kCGImageDestinationLossyCompressionQuality: 0.85] as CFDictionary)
+        if CGImageDestinationFinalize(destination) { try? (data as Data).write(to: url, options: .atomic) }
     }
 
     /// 超过预算就按「最久没动过」清到预算以内。
-    private func pruneDiskIfNeeded() {
+    private nonisolated func pruneDiskIfNeeded() {
         guard let directory else { return }
-        let keys: [URLResourceKey] = [.contentModificationDateKey, .fileSizeKey, .isRegularFileKey]
-        guard let entries = try? FileManager.default.contentsOfDirectory(
-            at: directory, includingPropertiesForKeys: keys
-        ) else { return }
-        var files: [(url: URL, date: Date, size: Int)] = []
-        var total = 0
-        for entry in entries {
-            let values = try? entry.resourceValues(forKeys: Set(keys))
-            guard values?.isRegularFile == true else { continue }
-            let size = values?.fileSize ?? 0
-            total += size
-            files.append((entry, values?.contentModificationDate ?? .distantPast, size))
-        }
-        guard total > Self.diskBudgetBytes else { return }
-        for file in files.sorted(by: { $0.date < $1.date }) {
-            try? FileManager.default.removeItem(at: file.url)
-            total -= file.size
-            if total <= Self.diskBudgetBytes { break }
-        }
-    }
-
-    /// 自检用：把磁盘缓存清掉（不动用户的其它文件）。
-    public func clearDiskCache() {
-        guard let directory else { return }
-        let entries = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
-        for entry in entries { try? FileManager.default.removeItem(at: entry) }
-        memory.removeAll()
-        memoryOrder.removeAll()
-        failed.removeAll()
+        DiskCacheMaintenance.prune(directory: directory, suffix: "jpg", maximumBytes: Self.diskBudgetBytes)
     }
 }

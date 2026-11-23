@@ -124,6 +124,9 @@ public struct TileGrid: Hashable, Sendable, Codable {
         zoom: Int,
         worldRect rect: CGRect
     ) -> (columns: ClosedRange<Int>, rows: ClosedRange<Int>)? {
+        guard rect.minX.isFinite, rect.minY.isFinite, rect.maxX.isFinite, rect.maxY.isFinite else { return nil }
+        let rect = rect.intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
+        guard !rect.isNull, rect.width > 0, rect.height > 0 else { return nil }
         let n = tileCount(zoom: zoom)
         let maximum = n - 1
         let span = 360 / Double(n)

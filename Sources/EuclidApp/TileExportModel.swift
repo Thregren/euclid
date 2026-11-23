@@ -33,6 +33,11 @@ final class TileExportModel {
     var onStatus: ((String) -> Void)?
 
     private var task: Task<Void, Never>?
+    private(set) var sourceLoadTask: Task<Void, Never>?
+    @ObservationIgnored var sourceLoader: @Sendable (URL) async -> RasterDataset? = { url in
+        await runCancellableAppWork { try? RasterLoader.load(url: url) }
+    }
+    private var sourceLoadGeneration: UInt64 = 0
     /// 上一次按哪幅影像预填过参数：换影像时才重算层级与输出目录。
     private var preparedSourceID: String?
 
@@ -87,6 +92,9 @@ final class TileExportModel {
     /// 打开面板时按当前影像预填一次；换了一幅影像会重新预填。
     func prepare(source: RasterDataset?, outputDirectory currentOutput: URL?) {
         if let source, source.id != preparedSourceID {
+            sourceLoadTask?.cancel()
+            sourceLoadTask = nil
+            sourceLoadGeneration &+= 1
             preparedSourceID = source.id
             raster = source
             sourceURL = source.fileURL
@@ -101,12 +109,18 @@ final class TileExportModel {
 
     /// 换成另一幅影像。
     func loadSource(_ url: URL) {
+        sourceLoadTask?.cancel()
+        sourceLoadGeneration &+= 1
+        let generation = sourceLoadGeneration
         sourceURL = url
         sourceError = nil
-        Task {
-            let loaded = await Task.detached(priority: .userInitiated) {
-                try? RasterLoader.load(url: url)
-            }.value
+        raster = nil
+        preparedSourceID = nil
+        let loader = sourceLoader
+        sourceLoadTask = Task {
+            let loaded = await loader(url)
+            guard !Task.isCancelled, generation == sourceLoadGeneration, sourceURL == url else { return }
+            sourceLoadTask = nil
             guard let loaded else {
                 raster = nil
                 sourceError = "读不出这个影像（\(url.lastPathComponent)）"

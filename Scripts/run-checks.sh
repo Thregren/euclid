@@ -1,5 +1,5 @@
 #!/bin/bash
-# 运行 TileKit 自检（本机未安装 Xcode，没有 XCTest，因此使用自带断言程序）。
+# 运行核心库与共享渲染器的 ARM64 自检。
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -15,8 +15,8 @@ if ! swift --version >/dev/null 2>&1; then
 fi
 
 read -r -a EXTRA_FLAGS <<< "${SWIFT_BUILD_FLAGS:-}"
-swift build -c debug --product TileKitCheck "${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"}"
-BIN="$(swift build -c debug --product TileKitCheck --show-bin-path "${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"}")/TileKitCheck"
+swift build -c debug --product TileKitCheck --triple arm64-apple-macosx14.0 "${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"}"
+BIN="$(swift build -c debug --product TileKitCheck --triple arm64-apple-macosx14.0 --show-bin-path "${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"}")/TileKitCheck"
 
 if [ "$#" -ge 1 ] && [ -n "$1" ]; then
     exec "$BIN" "$1"

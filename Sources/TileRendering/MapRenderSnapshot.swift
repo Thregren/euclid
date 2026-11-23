@@ -1,4 +1,4 @@
-import AppKit
+import Foundation
 import CoreGraphics
 import TileKit
 
@@ -12,40 +12,64 @@ import TileKit
 /// - **内存安全**：快照里全是不可变的 `CGImage`，没有对视图 / 图层的引用，
 ///   后台任务不会碰正在被主线程改动的对象。
 ///
-/// 坐标一律是**视图点、y 向下**（与 AppKit 一致），转位图坐标只在 `makeImage` 里做一次。
+/// 坐标一律是**视图点、y 向下**（与平台无关），转位图坐标只在 `makeImage` 里做一次。
 /// `@unchecked Sendable`：里面的 `CGImage` / `CGColor` 都是**不可变**的 CoreGraphics 对象
 /// （CoreGraphics 全程只读、引用计数线程安全），Swift 目前没有给它们标 `Sendable`；
 /// 这个结构体自己又全是值类型字段，没有任何共享可变状态 —— 跨线程传它不会引入数据竞争。
-struct MapRenderSnapshot: @unchecked Sendable {
+public struct MapRenderSnapshot: @unchecked Sendable {
     /// 一张已经解码好的图，以及它铺在画布上的位置。
-    struct Placement {
-        var image: CGImage
+    public struct Placement {
+        public var image: CGImage
         /// 视图点坐标（y 向下）。
-        var frame: CGRect
+        public var frame: CGRect
         /// 叠加时的透明度（图层不透明度）。
-        var opacity: CGFloat
+        public var opacity: CGFloat
+
+        public init(image: CGImage, frame: CGRect, opacity: CGFloat) {
+            self.image = image
+            self.frame = frame
+            self.opacity = opacity
+        }
     }
 
     /// 画布尺寸（视图点）。
-    var size: CGSize
+    public var size: CGSize
     /// 设备像素比。
-    var scale: CGFloat
+    public var scale: CGFloat
     /// 画布底色（没有就留透明）。
-    var background: CGColor?
+    public var background: CGColor?
     /// 自下而上的图层。
-    var placements: [Placement]
+    public var placements: [Placement]
     /// 测量标注的位图（含透明通道，尺寸与 `size` 一致），`nil` 表示这张图不含标注。
-    var overlay: CGImage?
+    public var overlay: CGImage?
     /// 视图里的测量条数（信息栏用）。
-    var measurementCount: Int
+    public var measurementCount: Int
+
+    public init(size: CGSize, scale: CGFloat, background: CGColor?,
+                placements: [Placement], overlay: CGImage?, measurementCount: Int) {
+        self.size = size
+        self.scale = scale
+        self.background = background
+        self.placements = placements
+        self.overlay = overlay
+        self.measurementCount = measurementCount
+    }
 
     /// 合成成一张位图。
     ///
     /// 只用 `CGImage` 与 `CGContext`（都可安全在后台线程用），因此调用方可以放心
     /// 把它丢进 `Task.detached` —— 这是「出图不再卡界面」的关键。
-    func makeImage() -> CGImage? {
-        let pixelWidth = Int((size.width * scale).rounded())
-        let pixelHeight = Int((size.height * scale).rounded())
+    public func makeImage(maximumPixelCount: Int = TileResourcePolicy.maximumSnapshotPixelCount) -> CGImage? {
+        let interval = TilePerformance.begin("Map composition")
+        defer { TilePerformance.end(interval) }
+        let width = (size.width * scale).rounded()
+        let height = (size.height * scale).rounded()
+        guard scale.isFinite, scale > 0, maximumPixelCount > 0,
+              width.isFinite, height.isFinite, width > 0, height > 0,
+              width <= Double(maximumPixelCount), height <= Double(maximumPixelCount),
+              width * height <= Double(maximumPixelCount) else { return nil }
+        let pixelWidth = Int(width)
+        let pixelHeight = Int(height)
         guard pixelWidth > 0, pixelHeight > 0,
               let space = CGColorSpace(name: CGColorSpace.sRGB),
               let context = CGContext(

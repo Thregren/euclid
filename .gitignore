@@ -12,3 +12,5 @@ dist/
 # Xcode / SwiftPM
 *.xcuserstate
 .swiftpm/
+# Original cloud placeholders retained during verified source recovery.
+/recovery-20261015-cloud-originals/

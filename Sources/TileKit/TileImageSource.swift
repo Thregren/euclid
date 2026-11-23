@@ -14,22 +14,72 @@ public protocol TileImageSource: Sendable {
     /// 实现要自己保证不阻塞调用方的执行器：目录来源把阻塞读取放到后台，
     /// 在线来源走异步网络请求。
     func data(for tile: SlippyTile) async -> Data?
+    /// nil means confirmed absence. I/O, corruption and cancellation must remain errors for exports.
+    func readData(for tile: SlippyTile) async throws -> Data?
 
     /// 取瓦片图片。默认实现是「先取字节再解码」；
     /// 像单幅影像这种「按区域现解」的来源覆盖它，省掉一次编码往返。
     func image(for tile: SlippyTile) async -> CGImage?
+    func loadTile(_ tile: SlippyTile) async -> TileLoadResult
+}
+
+/// A temporary I/O failure must not become a permanent hole in the map.
+public enum TileLoadResult: @unchecked Sendable {
+    case image(CGImage)
+    case missing
+    case retry
+    public var image: CGImage? { if case .image(let image) = self { return image }; return nil }
 }
 
 public extension TileImageSource {
+    func readData(for tile: SlippyTile) async throws -> Data? {
+        try Task.checkCancellation()
+        guard availableZoomRange.contains(tile.zoom) else { return nil }
+        guard let bytes = await data(for: tile) else {
+            try Task.checkCancellation()
+            throw TileReadError.unavailable
+        }
+        return bytes
+    }
+    func loadTile(_ tile: SlippyTile) async -> TileLoadResult {
+        guard availableZoomRange.contains(tile.zoom) else { return .missing }
+        guard let image = await image(for: tile) else { return .retry }
+        return .image(image)
+    }
     func image(for tile: SlippyTile) async -> CGImage? {
         guard let data = await data(for: tile) else { return nil }
-        return ImageDecoder.decode(data)
+        return await TileDecodeScheduler.decode(data)
+    }
+}
+
+public enum TileReadError: Error, LocalizedError, Sendable {
+    case unavailable, invalidImage, tooLarge
+    public var errorDescription: String? {
+        switch self {
+        case .unavailable: return "瓦片读取失败，不能视为缺片"
+        case .invalidImage: return "瓦片不是有效的受支持图片"
+        case .tooLarge: return "瓦片超过允许的字节上限"
+        }
+    }
+}
+
+/// Network waits and retry backoff never occupy CPU decoding capacity.
+package enum TileDecodeScheduler {
+    private static let limiter = AsyncLimiter(limit: TileResourcePolicy.concurrentDecodes)
+    package static func perform(_ operation: @Sendable () async -> CGImage?) async -> CGImage? {
+        guard await limiter.acquire(priority: Task.currentPriority) else { return nil }
+        let image = Task.isCancelled ? nil : await operation()
+        await limiter.release()
+        return Task.isCancelled ? nil : image
+    }
+    package static func decode(_ data: Data) async -> CGImage? {
+        await perform { ImageDecoder.decode(data) }
     }
 }
 
 /// 取图请求的公共默认参数。
 public enum TileRequestDefaults {
-    public static let userAgent = "Euclid/1.3 (local tile viewer)"
+    public static let userAgent = "Euclid (ARM64 tile viewer)"
 
     /// 默认请求头：带一个可辨认的 UA，方便对方识别流量来源。
     public static func headers(_ extra: [String: String] = [:]) -> [String: String] {

@@ -64,10 +64,10 @@ extension TIFFImageFileDirectory {
     /// 连续存放时块表就是「按行优先」；分离存放时块表是「平面优先」。
     func chunkIndex(plane: Int, indexInPlane: Int) -> Int? {
         guard plane >= 0, plane < planeCount, indexInPlane >= 0 else { return nil }
-        let index = planarConfiguration == 2
-            ? plane * chunksPerPlane + indexInPlane
-            : indexInPlane
-        guard index < chunks.count else { return nil }
+        guard indexInPlane < chunksPerPlane else { return nil }
+        let (base, multiplicationOverflow) = (planarConfiguration == 2 ? plane : 0).multipliedReportingOverflow(by: chunksPerPlane)
+        let (index, additionOverflow) = base.addingReportingOverflow(indexInPlane)
+        guard !multiplicationOverflow, !additionOverflow, index >= 0, index < chunks.count else { return nil }
         return index
     }
 
@@ -89,12 +89,16 @@ extension TIFFImageFileDirectory {
     /// 最后一列 / 最后一行的块在编码时仍按整块大小补齐（libtiff 就是这么写的），
     /// 所以解压缓冲区要按整块申请，否则压缩流比预期长会被判成损坏。
     var chunkCapacityBytes: Int {
-        max(0, chunkHeight) * samplesPerChunkRow * bytesPerSample
+        TIFFLimits.chunkBytes(width: chunkWidth, height: chunkHeight,
+                              samples: planarConfiguration == 2 ? 1 : samplesPerPixel,
+                              bits: bitsPerSample.first ?? 8) ?? 0
     }
 
     /// 某个块里「有图像内容」的字节数（最后一行可能不满）。
     func visibleCapacityBytes(indexInPlane: Int) -> Int {
-        max(0, rowsInChunk(indexInPlane: indexInPlane)) * samplesPerChunkRow * bytesPerSample
+        TIFFLimits.chunkBytes(width: chunkWidth, height: rowsInChunk(indexInPlane: indexInPlane),
+                              samples: planarConfiguration == 2 ? 1 : samplesPerPixel,
+                              bits: bitsPerSample.first ?? 8) ?? 0
     }
 }
 
@@ -124,10 +128,9 @@ enum TIFFRawChunks {
             index: globalIndex,
             payload: .samples
         )
-        if let cached = TIFFChunkCache.shared.pixels(for: key) { return cached }
-        let decoded = try decode(file: file, level: level, reader: reader, chunkIndex: chunkIndex, plane: plane)
-        TIFFChunkCache.shared.store(pixels: decoded, for: key)
-        return decoded
+        return try TIFFChunkCache.shared.loadPixels(for: key) {
+            try decode(file: file, level: level, reader: reader, chunkIndex: chunkIndex, plane: plane)
+        }
     }
 
     /// 真正解一块（无缓存）。
@@ -142,12 +145,17 @@ enum TIFFRawChunks {
         let bytesPerSample = level.bytesPerSample
         // 按「整块」申请：最后一列 / 最后一行在文件里也是按整块补齐的。
         let capacity = level.chunkCapacityBytes
-        guard capacity > 0 else { return [] }
-        let transparent = [UInt8](repeating: 0, count: capacity)
-        guard let globalIndex = level.chunkIndex(plane: plane, indexInPlane: chunkIndex) else { return transparent }
+        try Task.checkCancellation()
+        guard capacity > 0 else { throw TIFFError.unsupported("TIFF 解码块超过安全内存预算") }
+        guard let globalIndex = level.chunkIndex(plane: plane, indexInPlane: chunkIndex) else {
+            return [UInt8](repeating: 0, count: capacity)
+        }
         let chunk = level.chunks[globalIndex]
+        guard chunk.byteCount <= TIFFLimits.maximumChunkBytes else {
+            throw TIFFError.unsupported("TIFF 压缩块超过安全内存预算")
+        }
         guard chunk.byteCount > 0, let data = reader.read(offset: chunk.offset, count: chunk.byteCount) else {
-            return transparent
+            return [UInt8](repeating: 0, count: capacity)
         }
         let reported = "\(chunkIndex)（平面 \(plane)）"
 

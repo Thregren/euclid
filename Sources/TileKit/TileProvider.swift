@@ -1,112 +1,13 @@
 import CoreGraphics
 import Foundation
 
-/// 并发闸门，限制同时进行的解码数量。
-///
-/// 排队期间被取消（切数据集、图层被移除）要真的走人：既不再占名额，也不去取图。
-/// 取消与放行都会 resume 等待者，所以等待者用一个小盒子记住「这次到底是哪种」，
-/// 调用方据此决定要不要 `release` —— 多算一次少算一次都会把名额算歪。
-actor AsyncLimiter {
-    private final class Waiter: @unchecked Sendable {
-        private let lock = NSLock()
-        private var continuation: CheckedContinuation<Void, Never>?
-        private var cancelled = false
-        private var granted = false
-
-        /// 入队。若在此之前就被取消，直接放行（名额不归它，`release` 那边会自己退回去）。
-        func install(_ continuation: CheckedContinuation<Void, Never>) {
-            lock.lock()
-            if cancelled {
-                lock.unlock()
-                continuation.resume()
-                return
-            }
-            self.continuation = continuation
-            lock.unlock()
-        }
-
-        func markCancelled() {
-            lock.lock()
-            cancelled = true
-            let continuation = self.continuation
-            self.continuation = nil
-            lock.unlock()
-            continuation?.resume()
-        }
-
-        /// 把名额交给这个等待者；返回 false 表示它已被取消（名额还得留给别人）。
-        func grant() -> Bool {
-            lock.lock()
-            if cancelled {
-                lock.unlock()
-                return false
-            }
-            granted = true
-            let continuation = self.continuation
-            self.continuation = nil
-            lock.unlock()
-            continuation?.resume()
-            return continuation != nil
-        }
-
-        var isGranted: Bool {
-            lock.lock()
-            defer { lock.unlock() }
-            return granted
-        }
-    }
-
-    private let limit: Int
-    private var active = 0
-    private var waiters: [Waiter] = []
-
-    init(limit: Int) {
-        self.limit = max(1, limit)
-    }
-
-    /// 等一个名额。返回 false 表示等待期间被取消：**没有**占住名额，不要再调 `release`。
-    func acquire() async -> Bool {
-        if Task.isCancelled { return false }
-        if active < limit {
-            active += 1
-            return true
-        }
-        let waiter = Waiter()
-        await withTaskCancellationHandler {
-            await withCheckedContinuation { continuation in
-                waiters.append(waiter)
-                waiter.install(continuation)
-            }
-        } onCancel: {
-            Task { await self.cancel(waiter) }
-        }
-        return waiter.isGranted
-    }
-
-    func release() {
-        // 被取消的等待者可能还留在队列里（入队与取消的先后顺序不定），
-        // 跳过它们，把名额交给下一个真正在等的人。
-        while !waiters.isEmpty {
-            if waiters.removeFirst().grant() { return }
-        }
-        active = max(0, active - 1)
-    }
-
-    private func cancel(_ waiter: Waiter) {
-        if let index = waiters.firstIndex(where: { $0 === waiter }) {
-            waiters.remove(at: index)
-        }
-        waiter.markCancelled()
-    }
-}
-
 /// 瓦片图片供应者：LRU 内存缓存 + 并发取图/解码 + 缺片负缓存。
 ///
 /// 来源可以是本地目录，也可以是在线服务（见 `TileImageSource`）；
 /// 对上层来说只有「拿到图 / 这片没有」两种结果。
 public actor TileProvider {
     private let source: any TileImageSource
-    private let memoryLimitBytes: Int
+    private var memoryLimitBytes: Int
     private let limiter: AsyncLimiter
 
     private var cache: [SlippyTile: CGImage] = [:]
@@ -115,18 +16,29 @@ public actor TileProvider {
     private var lastUse: [SlippyTile: UInt64] = [:]
     private var clock: UInt64 = 0
     private var cachedBytes = 0
-    private var inFlight: [SlippyTile: Task<CGImage?, Never>] = [:]
-    private var missingTiles: Set<SlippyTile> = []
+    private struct Flight: Sendable {
+        let id: UInt64
+        let task: Task<CGImage?, Never>
+        var consumers: Set<UUID>
+    }
+    private var inFlight: [SlippyTile: Flight] = [:]
+    private var nextFlightID: UInt64 = 0
+    private var missingTiles: [SlippyTile: Date] = [:]
+    private let retryDelay: TimeInterval
+    private let missingDelay: TimeInterval
     /// 每次 `invalidate` 加一：用来丢掉「invalidate 之前发出、之后才回来」的取图结果。
     private var generation = 0
 
     public init(
         source: any TileImageSource,
-        memoryLimitBytes: Int = 512 * 1024 * 1024,
-        maxConcurrentDecodes: Int = 8
+        memoryLimitBytes: Int = TileResourcePolicy.defaultTileCacheBytes,
+        maxConcurrentDecodes: Int = TileResourcePolicy.concurrentDecodes,
+        retryDelay: TimeInterval = 1, missingDelay: TimeInterval = 30
     ) {
         self.source = source
-        self.memoryLimitBytes = memoryLimitBytes
+        self.retryDelay = max(0, retryDelay)
+        self.missingDelay = max(0, missingDelay)
+        self.memoryLimitBytes = max(0, memoryLimitBytes)
         self.limiter = AsyncLimiter(limit: maxConcurrentDecodes)
     }
 
@@ -138,6 +50,9 @@ public actor TileProvider {
 
     /// 当前内存缓存占用的字节数与瓦片数（内存压力与调试输出用）。
     public var cacheStats: (tiles: Int, bytes: Int) { (cache.count, cachedBytes) }
+    package var requestStats: (flights: Int, consumers: Int) {
+        (inFlight.count, inFlight.values.reduce(0) { $0 + $1.consumers.count })
+    }
 
     /// 把缓存压到给定字节以内：从最久没用到的开始丢（内存压力下由界面调用）。
     ///
@@ -146,43 +61,78 @@ public actor TileProvider {
         evict(downTo: max(0, limit))
     }
 
+    public func setMemoryLimitBytes(_ limit: Int) {
+        memoryLimitBytes = max(0, limit)
+        evict(downTo: memoryLimitBytes)
+    }
+
     /// 取瓦片图片；不存在时返回 nil。
-    public func image(for tile: SlippyTile) async -> CGImage? {
+    public func image(for tile: SlippyTile, priority: TaskPriority = .userInitiated) async -> CGImage? {
+        guard !Task.isCancelled else { return nil }
         if let image = cache[tile] {
             touch(tile)
             return image
         }
-        if missingTiles.contains(tile) { return nil }
-        if let task = inFlight[tile] { return await task.value }
+        if let until = missingTiles[tile], until > Date() { return nil }
+        missingTiles[tile] = nil
 
-        let source = self.source
-        let limiter = self.limiter
-        let generation = self.generation
-        let task = Task.detached(priority: .userInitiated) { () -> CGImage? in
-            guard await limiter.acquire() else { return nil }
-            // 排到队时可能已经被取消（切数据集 / 图层被移除）：放回名额就走，别白解一张。
-            if Task.isCancelled {
+        let consumer = UUID()
+        let flight: Flight
+        if var existing = inFlight[tile] {
+            existing.consumers.insert(consumer)
+            inFlight[tile] = existing
+            flight = existing
+        } else {
+            nextFlightID &+= 1
+            let id = nextFlightID
+            let source = self.source
+            let limiter = self.limiter
+            let generation = self.generation
+            let task = Task.detached(priority: priority) { () -> CGImage? in
+                guard await limiter.acquire(priority: priority) else {
+                    return await self.finish(tile: tile, id: id, generation: generation, image: nil, cancelled: true)
+                }
+                let result: TileLoadResult = Task.isCancelled ? .retry : await source.loadTile(tile)
                 await limiter.release()
-                return nil
+                return await self.finish(tile: tile, id: id, generation: generation,
+                                         image: result.image, cancelled: Task.isCancelled, confirmedMissing: { if case .missing = result { return true }; return false }())
             }
-            let image = await source.image(for: tile)
-            await limiter.release()
-            return image
+            flight = Flight(id: id, task: task, consumers: [consumer])
+            inFlight[tile] = flight
         }
-        inFlight[tile] = task
 
-        let image = await task.value
+        let image = await withTaskCancellationHandler {
+            await flight.task.value
+        } onCancel: {
+            Task { await self.cancelConsumer(consumer, tile: tile, id: flight.id) }
+        }
+        return Task.isCancelled ? nil : image
+    }
+
+    /// 老请求结束时不能移除 invalidate 后同一瓦片的新请求，也不能写入新缓存。
+    private func finish(tile: SlippyTile, id: UInt64, generation: Int,
+                        image: CGImage?, cancelled: Bool, confirmedMissing: Bool = false) -> CGImage? {
+        guard generation == self.generation, inFlight[tile]?.id == id else { return nil }
         inFlight[tile] = nil
-        // 期间被 invalidate（换了数据集、文件被外部改过）时，这一张属于上一份数据，
-        // 不能写进新缓存 —— 否则新数据集的画面上会冒出旧数据集的瓦片。
-        guard generation == self.generation else { return nil }
+        guard !cancelled else { return nil }
         if let image {
             store(image, for: tile)
         } else {
-            if missingTiles.count > 50_000 { missingTiles.removeAll(keepingCapacity: true) }
-            missingTiles.insert(tile)
+            if missingTiles.count >= 50_000 { missingTiles.removeAll(keepingCapacity: true) }
+            missingTiles[tile] = Date().addingTimeInterval(confirmedMissing ? missingDelay : retryDelay)
         }
         return image
+    }
+
+    private func cancelConsumer(_ consumer: UUID, tile: SlippyTile, id: UInt64) {
+        guard var flight = inFlight[tile], flight.id == id else { return }
+        flight.consumers.remove(consumer)
+        if flight.consumers.isEmpty {
+            inFlight[tile] = nil
+            flight.task.cancel()
+        } else {
+            inFlight[tile] = flight
+        }
     }
 
     /// 预取一批瓦片（通常是当前视野外面一圈），填进内存缓存让接下来的平移更顺。
@@ -191,8 +141,8 @@ public actor TileProvider {
     public func prefetch(_ tiles: [SlippyTile]) async {
         for tile in tiles {
             if Task.isCancelled { return }
-            if cache[tile] != nil || missingTiles.contains(tile) { continue }
-            _ = await image(for: tile)
+            if cache[tile] != nil || (missingTiles[tile].map { $0 > Date() } ?? false) { continue }
+            _ = await image(for: tile, priority: .utility)
         }
     }
 
@@ -201,13 +151,15 @@ public actor TileProvider {
         generation &+= 1
         // 在途任务要真的取消：只丢引用的话它们还会跑完，
         // 既白占并发名额，也需要靠上面的 generation 兜住结果。
-        for task in inFlight.values { task.cancel() }
+        for flight in inFlight.values { flight.task.cancel() }
         cache.removeAll()
         lastUse.removeAll()
         cachedBytes = 0
         missingTiles.removeAll()
         inFlight.removeAll()
     }
+
+    public func retryDate(for tile: SlippyTile) -> Date? { missingTiles[tile] }
 
     // MARK: - 缓存
 

@@ -20,6 +20,8 @@ final class TileServerModel {
 
     private let server = LocalTileServer()
     private var pollTask: Task<Void, Never>?
+    private var startTask: Task<UInt16, Error>?
+    private var startGeneration = 0
 
     var urlTemplate: String {
         isRunning ? server.urlTemplate : "http://127.0.0.1:\(port)/{z}/{x}/{y}.png"
@@ -34,7 +36,7 @@ final class TileServerModel {
 
     func chooseRoot() {
         let panel = NSOpenPanel()
-        panel.canChooseFiles = false
+        panel.canChooseFiles = true
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
         panel.message = "选择要对外提供的瓦片目录（`<z>/<x>/<y>` 结构）"
@@ -45,7 +47,7 @@ final class TileServerModel {
     }
 
     func toggle() async {
-        if isRunning {
+        if isRunning || startTask != nil {
             stop()
         } else {
             await start()
@@ -57,23 +59,37 @@ final class TileServerModel {
     /// 等监听器就绪的那几秒挂在 `await` 上：这个方法是 `@MainActor`，
     /// 同步等就等于整个界面冻三秒（点「启动服务」时尤其明显）。
     func start() async {
+        stop()
         guard let rootURL else {
             errorMessage = "请先选择要提供的瓦片目录"
             return
         }
         errorMessage = nil
         isRunning = false
+        let generation = startGeneration
+        let server = self.server
+        let port = UInt16(clamping: port)
+        let task = Task { try await server.startAsync(rootURL: rootURL, port: port) }
+        startTask = task
         do {
-            actualPort = Int(try await server.startAsync(rootURL: rootURL, port: UInt16(clamping: port)))
+            let boundPort = try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
+            guard generation == startGeneration, !Task.isCancelled else { return }
+            startTask = nil
+            actualPort = Int(boundPort)
             isRunning = true
             startPolling()
         } catch {
+            guard generation == startGeneration else { return }
+            startTask = nil
             isRunning = false
-            errorMessage = (error as? TileServerError)?.description ?? error.localizedDescription
+            if !(error is CancellationError) { errorMessage = (error as? TileServerError)?.description ?? error.localizedDescription }
         }
     }
 
     func stop() {
+        startGeneration &+= 1
+        startTask?.cancel()
+        startTask = nil
         pollTask?.cancel()
         pollTask = nil
         server.stop()

@@ -130,35 +130,13 @@ extension AppModel {
             ?? selectedRaster?.fileURL.path(percentEncoded: false)
     }
 
-    /// 恢复某份数据自己的测量存档。
-    ///
-    /// 读盘是文件 IO，放到后台去：切换数据源（以及启动时自动打开上次的目录）不该为了读一个
-    /// JSON 文件卡住一下。存档 actor 是串行的，因此也不会和正在进行的自动存档打架。
-    /// 期间用户又切走了，或者已经动手量了新东西，就丢弃这份结果。
-    private func restoreMeasurements(for archivePath: String, sourceID: String) {
-        guard !DebugFixtures.isEnabled else { return }
-        Task {
-            let saved = await MeasurementArchive.shared.measurements(for: archivePath)
-            if let notice = await MeasurementArchive.shared.takeNotice() {
-                setStatus(notice, autoClearAfter: 12)
-            }
-            guard selectedSourceID == sourceID else { return }
-            guard measurements.measurements.isEmpty, measurements.draft.isEmpty else { return }
-            guard !saved.isEmpty else { return }
-            measurements.restore(saved)
-            canvas.refreshOverlay()
-        }
-    }
-
-
-
     // MARK: - 打开与扫描
 
     // MARK: - 打开
 
     func promptForFolder() {
         let panel = NSOpenPanel()
-        panel.canChooseFiles = false
+        panel.canChooseFiles = true
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
         panel.prompt = "打开"
@@ -212,7 +190,7 @@ extension AppModel {
                 setStatus("找不到这个路径：\(url.lastPathComponent)", autoClearAfter: 6)
                 continue
             }
-            if isDirectory.boolValue {
+            if isDirectory.boolValue || url.pathExtension.lowercased() == "mbtiles" {
                 addDatasetLayer(at: url)
             } else if url.pathExtension.lowercased() == "zip" {
                 addDatasetLayer(at: DatasetLocator.datasetRoot(containing: url), preferring: url)
@@ -352,6 +330,11 @@ extension AppModel {
     private func openWithoutRemembering(_ url: URL, isDirectory: Bool) {
         let stacking = hasLocalLayer
         if !isDirectory {
+            if url.pathExtension.lowercased() == "mbtiles" {
+                if stacking { addDatasetLayer(at: url) }
+                else { rootFolder = DatasetLocator.canonicalURL(url); scan(url) }
+                return
+            }
             // 拖进来一个 zip 分卷：当成「打开它所在的那份数据」。
             if url.pathExtension.lowercased() == "zip" {
                 let root = DatasetLocator.datasetRoot(containing: url)
@@ -414,14 +397,15 @@ extension AppModel {
 
     /// 读单幅影像：只读文件头（IFD），因此再大的图也是秒开。
     func openRaster(_ url: URL) {
-        sourceGeneration += 1
+        cancelAnalysis()
+        cancelSourceLoading()
         let generation = sourceGeneration
         isResolvingExtent = true
         setStatus("正在读取影像…", autoClearAfter: 0)
-        Task {
-            let result: Result<RasterDataset, Error> = await Task.detached(priority: .userInitiated) {
+        sourceTask = Task {
+            let result: Result<RasterDataset, Error> = await runCancellableAppWork {
                 do { return .success(try RasterLoader.load(url: url)) } catch { return .failure(error) }
-            }.value
+            }
             // 这中间用户又打开了别的数据：这份结果已经过期，直接丢掉（连状态栏都不改）。
             guard generation == self.sourceGeneration else { return }
             isResolvingExtent = false
@@ -438,15 +422,16 @@ extension AppModel {
     }
 
     private func scan(_ url: URL, preferring preferred: URL? = nil) {
-        sourceGeneration += 1
+        cancelAnalysis()
+        cancelSourceLoading()
         let generation = sourceGeneration
         AppModel.trace("scan start \(url.path(percentEncoded: false))")
         isScanning = true
         setStatus("正在扫描目录…", autoClearAfter: 0)
-        Task {
-            let found = await Task.detached(priority: .userInitiated) {
+        sourceTask = Task {
+            let found = await runCancellableAppWork {
                 DatasetLocator.discover(at: url)
-            }.value
+            }
             AppModel.trace("scan finished datasets=\(found.count)")
             guard generation == self.sourceGeneration else { return }
             isScanning = false
@@ -464,9 +449,11 @@ extension AppModel {
 
     /// 选中一个本地来源：瓦片数据集或单幅影像。
     func selectSource(_ id: String?) {
-        sourceGeneration += 1
+        cancelAnalysis()
+        cancelSourceLoading()
         let generation = sourceGeneration
         AppModel.trace("select \(id ?? "nil")")
+        changeMeasurementDocument(to: measurementPath(for: id))
         selectedSourceID = id
         extent = nil
 
@@ -476,7 +463,6 @@ extension AppModel {
             extent = raster.extent
             applyLocalLayer(force: true)
             applyOnlineLayer()
-            restoreMeasurements(for: raster.id, sourceID: raster.id)
             reportRaster(raster)
             if DebugFixtures.isEnabled {
                 DebugFixtures.populateMeasurements(in: raster.extent, store: measurements)
@@ -497,14 +483,13 @@ extension AppModel {
         // 选数据集就重装本地图层；在线底图是否叠加由 `usesOnlineBasemap` 决定，互不影响。
         applyLocalLayer(force: true)
         applyOnlineLayer()
-        restoreMeasurements(for: dataset.id, sourceID: dataset.id)
         // 数据范围要扫完目录才知道，这期间画布先不铺图（在错误位置铺一屏空占位只会闪）。
         setStatus("正在读取数据范围…", autoClearAfter: 0)
         isResolvingExtent = true
-        Task {
-            let result = await Task.detached(priority: .userInitiated) {
+        sourceTask = Task {
+            let result = await runCancellableAppWork {
                 DatasetLocator.extent(of: dataset)
-            }.value
+            }
             // 代号与选中项都对得上才落地：少一个都可能把旧范围盖到新选的数据上。
             guard generation == self.sourceGeneration, selectedSourceID == dataset.id else { return }
             isResolvingExtent = false

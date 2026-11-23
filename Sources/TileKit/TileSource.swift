@@ -66,7 +66,7 @@ public struct GeoBounds: Hashable, Sendable, Codable {
 /// 模板支持 `{z}` `{x}` `{y}`，另有 `{-y}`（TMS 行号）、`{s}`（子域轮转）、`{key}`（密钥）。
 /// 因此 XYZ 直连、`{z}/{y}/{x}` 顺序的服务、以及 WMTS KVP 风格（把 `TILEMATRIX={z}&TILEROW={y}&TILECOL={x}` 写进模板）
 /// 都能用同一个模板表达。
-public struct TileSourceTemplate: Hashable, Sendable, Identifiable {
+public struct TileSourceTemplate: Hashable, Sendable, Identifiable, Codable {
     public var id: String
     public var name: String
     public var urlTemplate: String

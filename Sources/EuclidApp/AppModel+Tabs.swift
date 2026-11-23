@@ -29,6 +29,9 @@ struct WorkspaceTab: Identifiable {
     /// 切走时的视点；没动过视图就是 nil（切回来按数据范围适配）。
     var viewpoint: (center: GeoCoordinate, zoomLevel: Double)?
     var measurements: [GeoMeasurement] = []
+    var measurementSourcePath: String?
+    /// Only restored sessions need reconciliation; in-process tab snapshots already share revisions.
+    var recoverMeasurementArchive = false
 
     init(id: UUID = UUID(), title: String = "空标签页") {
         self.id = id
@@ -88,10 +91,13 @@ extension AppModel {
         workspaceTabs[index].appliedOnlineSignature = appliedOnlineSignature
         workspaceTabs[index].viewpoint = canvas.viewpoint
         workspaceTabs[index].measurements = measurements.measurements
+        workspaceTabs[index].measurementSourcePath = measurementOwnerPath
     }
 
     /// 把某一页的状态装回模型，并让画布跟上。
-    private func applyWorkspaceTab(_ tab: WorkspaceTab) {
+    func applyWorkspaceTab(_ tab: WorkspaceTab) {
+        cancelAnalysis()
+        cancelSourceLoading()
         isSwitchingWorkspaceTab = true
         defer { isSwitchingWorkspaceTab = false }
 
@@ -100,6 +106,7 @@ extension AppModel {
         selectedSourceID = tab.selectedSourceID
         rootFolder = tab.rootFolder
         extent = tab.extent
+        restoreOnlineConfiguration(from: tab.layers)
         selectedLayerID = tab.selectedLayerID
 
         // 在线底图开关会顺带重装在线层；放在图层列表之前，随后的整体赋值说了算。
@@ -114,8 +121,7 @@ extension AppModel {
         pushLayers()
 
         // 测量不走 onChange：切页不该把这一页的测量写进另一页的自动存档。
-        measurements.restore(tab.measurements)
-        canvas.refreshOverlay()
+        changeMeasurementDocument(to: tab.measurementSourcePath ?? measurementPath(for: tab.selectedSourceID), initial: tab.measurements, recoverArchive: tab.recoverMeasurementArchive)
 
         // 视角：记过就跳回去，没记过就按数据范围适配。
         if let viewpoint = tab.viewpoint {
@@ -123,6 +129,22 @@ extension AppModel {
         } else if let rect = anchorLayer?.fitRect {
             canvas.fit(to: rect)
         }
+    }
+
+    private func restoreOnlineConfiguration(from layers: [MapLayer]) {
+        guard let layer = layers.first(where: { $0.kind == .online }), let online = layer.source as? RemoteTileSource else { return }
+        let callback = download.onSourceChanged
+        download.onSourceChanged = nil
+        defer { download.onSourceChanged = callback }
+        download.sourceID = online.template.id
+        download.template = online.template.urlTemplate
+        download.sourceName = online.template.name
+        download.subdomains = online.template.subdomains
+        download.fileExtension = online.template.fileExtension
+        download.attribution = online.template.attribution
+        download.terms = online.template.terms
+        download.key = online.key ?? ""
+        download.datum = Datum(rawValue: layer.sourceKey.components(separatedBy: "|").last ?? "") ?? .wgs84
     }
 
     /// 切到指定标签页。

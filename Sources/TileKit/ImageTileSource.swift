@@ -54,6 +54,12 @@ public struct ImageTileSource: TileImageSource {
 
     public func data(for tile: SlippyTile) async -> Data? { nil }
 
+    public func loadTile(_ tile: SlippyTile) async -> TileLoadResult {
+        guard !Task.isCancelled else { return .retry }
+        guard tile.worldRect.intersects(worldRect) else { return .missing }
+        return await TileDecodeScheduler.perform { await image(for: tile) }.map(TileLoadResult.image) ?? .retry
+    }
+
     public func image(for tile: SlippyTile) async -> CGImage? {
         let tileWorld = tile.worldRect
         guard tileWorld.intersects(worldRect),

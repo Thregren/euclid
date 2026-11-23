@@ -1,3 +1,4 @@
+import TileRendering
 import AppKit
 import ImageIO
 import QuartzCore
@@ -39,25 +40,26 @@ final class TileCanvasNSView: NSView {
     /// 图层栈：按 `MapLayer.id` 存放，显示顺序由模型给的图层列表决定（列表末尾在最上层）。
     var stacks: [String: TileLayerStack] = [:]
     /// 每一层已经装配过的来源签名：只有来源真的变了才重配（改不透明度、调顺序都不重取图）。
-    private var stackSignatures: [String: String] = [:]
+    var stackSignatures: [String: String] = [:]
     /// 当前图层列表（下 → 上）。
     /// （卷帘对比在另一个文件里要用到它，故不加 `private`。）
     var layers: [MapLayer] = []
 
     /// 基准层：测量、存档、相机尺度都以它为准。
-    private var anchorLayer: MapLayer? { layers.first { $0.isAnchor } ?? layers.last }
+    var anchorLayer: MapLayer? { layers.first { $0.isAnchor } ?? layers.last }
     /// 当前主图层（用来定瓦片边长与层级范围）：优先基准层，否则最上面那层。
-    private var primaryStack: TileLayerStack? {
+    var primaryStack: TileLayerStack? {
         if let anchor = anchorLayer, let stack = stacks[anchor.id], stack.isActive { return stack }
         return orderedStacks.last { $0.isActive }
     }
     /// 模型顺序（下 → 上）的栈。
-    private var orderedStacks: [TileLayerStack] {
+    var orderedStacks: [TileLayerStack] {
         layers.compactMap { stacks[$0.id] }
     }
 
-    private func makeStack() -> TileLayerStack {
+    func makeStack() -> TileLayerStack {
         let stack = TileLayerStack()
+        stack.reducesMotion = InterfaceStyle.reducesMotion
         stack.needsSync = { [weak self] in self?.syncLayers() }
         stack.refreshGridAppearance(stroke: gridStrokeColor)
         return stack
@@ -65,18 +67,18 @@ final class TileCanvasNSView: NSView {
     /// 适配窗口用的默认范围（数据范围算出来之前 / 在线底图）。
     /// 在线底图的适配范围（没有本地数据时用它对齐窗口）。
     /// 数据集已就位但数据范围还在算：这段时间不铺图（见 `setLocal`）。
-    private var awaitingExtent = false
-    private var extentRect: CGRect?
+    var awaitingExtent = false
+    var extentRect: CGRect?
     var zoomBounds: ClosedRange<Double> = 0...30
     /// 「按适配算出来」的缩放下限（不含铺图预算那一道收紧）。
     ///
     /// 视口尺寸一变就要重算缩放下限，而重算得拿这个「原始下限」当基准 ——
     /// 直接拿收紧后的 `zoomBounds.lowerBound` 重算的话，窗口缩回去下限也松不回来。
-    private var zoomLowerBoundFromFit: Double = 0
-    private var trackingArea: NSTrackingArea?
+    var zoomLowerBoundFromFit: Double = 0
+    var trackingArea: NSTrackingArea?
     /// 相机是否已经被放到过一个有意义的视野（用户平移缩放、或按数据范围适配过）。
     /// 用它区分「首次打开的内容」与「用户自己调好的视野」：前者可以自动适配，后者一律不许动。
-    private var viewWasPositioned = false
+    var viewWasPositioned = false
 
     enum DragTarget {
         case pan
@@ -138,11 +140,11 @@ final class TileCanvasNSView: NSView {
     /// 当前指针悬停的顶点，用于高亮提示可拖动。
     var hoveredVertex: (measurementID: UUID?, index: Int)?
     /// 回车结束测量的键盘监视器（见 `installFinishMonitor`）。
-    private var finishMonitor: Any?
+    var finishMonitor: Any?
     /// 退格 / 前向删除时问一句「要删图层吗」（由 AppModel 注入，返回是否删掉了）。
     var onDeleteLayer: (() -> Bool)?
     /// 窗口失焦的订阅（见 `viewDidMoveToWindow`）。
-    private var resignObserver: (any NSObjectProtocol)?
+    var resignObserver: (any NSObjectProtocol)?
     /// 平移手势累计但尚未提交的位移（视图点，y 向上）。
     ///
     /// 手势期间只把已有图层整体位移（GPU 合成，不重算瓦片），等位移攒够、手势结束或停顿一下
@@ -171,7 +173,7 @@ final class TileCanvasNSView: NSView {
     }
 
     /// `EUCLID_PAN_NO_TILES=1` 时回到「手势期间一片都不取」的老口径（只用于对照测量）。
-    private static let loadsTilesDuringGesture =
+    static let loadsTilesDuringGesture =
         ProcessInfo.processInfo.environment["EUCLID_PAN_NO_TILES"] == nil
 
     /// `EUCLID_PAN_DIRECT=1` 时走「每个滚轮事件都重铺瓦片」的老路径（只用于对照测量）。
@@ -332,12 +334,12 @@ final class TileCanvasNSView: NSView {
     ///
     /// 不做这一步的话，用户拖到一半切走应用，画布会停在一个「只有图层变换」的状态里 ——
     /// 看上去画面偏着，而且那部分瓦片一直不会被取回来。
-    private func handleWindowResignKey() {
+    func handleWindowResignKey() {
         commitPan(finished: true)
         finishPanTrace()
     }
 
-    private func removeFinishMonitor() {
+    func removeFinishMonitor() {
         if let finishMonitor { NSEvent.removeMonitor(finishMonitor) }
         finishMonitor = nil
     }
@@ -349,7 +351,7 @@ final class TileCanvasNSView: NSView {
     ///
     /// 监视器装在事件派发之前，只在这几种情况下接管：本窗口的草稿非空、工具不是浏览、
     /// 当前第一响应者不是文本输入（输入框里回车是「确认输入」，不能抢）。
-    private func installFinishMonitor() {
+    func installFinishMonitor() {
         guard finishMonitor == nil else { return }
         finishMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self, event.window === self.window else { return event }
@@ -389,7 +391,7 @@ final class TileCanvasNSView: NSView {
     }
 
     /// 当前第一响应者是不是文本输入（文本框里回车不能被我方截走）。
-    private static func isTypingText(in window: NSWindow?) -> Bool {
+    static func isTypingText(in window: NSWindow?) -> Bool {
         guard let responder = window?.firstResponder else { return false }
         if responder is NSTextView || responder is NSTextField { return true }
         // SwiftUI 的 TextField 背后是 NSTextView（字段编辑器），统一在上一层判断。
@@ -400,7 +402,7 @@ final class TileCanvasNSView: NSView {
     ///
     /// 这些控件上方向键有自己的含义（调滑杆、换选项、走列表），不能抢：
     /// 抢了就会变成「拖不透明度滑杆时按到 ←，地图跑了」。
-    private static func wantsArrowKeys(in window: NSWindow?) -> Bool {
+    static func wantsArrowKeys(in window: NSWindow?) -> Bool {
         guard let responder = window?.firstResponder else { return false }
         if responder is NSTextView || responder is NSTextField { return true }
         if responder is NSSlider || responder is NSStepper { return true }
@@ -424,17 +426,17 @@ final class TileCanvasNSView: NSView {
     ///
     /// 语义色要按当前有效外观解析：`NSColor.cgColor` 只看「当前绘制外观」，
     /// 在绘制上下文之外拿到的永远是系统外观的那一套，深色模式下画布会留在浅色。
-    private var canvasBackgroundColor: CGColor {
+    var canvasBackgroundColor: CGColor {
         NSColor.underPageBackgroundColor.resolvedCGColor(in: effectiveAppearance)
     }
 
     /// 瓦片网格线的颜色：同样按当前有效外观解析。
-    private var gridStrokeColor: CGColor {
+    var gridStrokeColor: CGColor {
         NSColor.labelColor.withAlphaComponent(0.32).resolvedCGColor(in: effectiveAppearance)
     }
 
     /// 语义色在每次外观变化时重新取一遍，避免深浅色切换后颜色残留。
-    private func applyAppearanceColors() {
+    func applyAppearanceColors() {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         backgroundLayer.backgroundColor = canvasBackgroundColor
@@ -473,7 +475,7 @@ final class TileCanvasNSView: NSView {
     }
 
     /// 当前该显示的指针样式（框选模式下忽略工具，一律十字）。
-    private var pickCursor: NSCursor {
+    var pickCursor: NSCursor {
         // 卷帘对比开着、且指针正贴在分隔线上：给「左右拖」的指针，提示这里可以抓。
         if let point = lastPointerPoint, swipeHitTest(point) { return .resizeLeftRight }
         return boundsPicker != nil ? .crosshair : (tool == .browse ? .openHand : .crosshair)
@@ -508,14 +510,14 @@ final class TileCanvasNSView: NSView {
         pickLayer.isHidden = true
     }
 
-    private func updatePickLayer() {
+    func updatePickLayer() {
         guard let anchor = pickAnchor, let current = pickCurrent else { return }
         pickLayer.frame = bounds
         pickLayer.path = CGPath(rect: Self.rect(from: anchor, to: current), transform: nil)
         pickLayer.isHidden = false
     }
 
-    private static func rect(from a: CGPoint, to b: CGPoint) -> CGRect {
+    static func rect(from a: CGPoint, to b: CGPoint) -> CGRect {
         CGRect(
             x: min(a.x, b.x),
             y: min(a.y, b.y),
@@ -543,7 +545,7 @@ final class TileCanvasNSView: NSView {
     ///
     /// 注意 y 的起点：墨卡托裁掉两极后的范围是 `0.1217…0.8783`，
     /// 从 0 起算会让「适配整个世界」把视角整体推到北半球（以前打开在线底图看到的是北纬五十几度）。
-    private static let worldRect = CGRect(
+    static let worldRect = CGRect(
         x: 0,
         y: WebMercator.normalizedY(latitude: WebMercator.maxLatitude),
         width: 1,
@@ -556,75 +558,7 @@ final class TileCanvasNSView: NSView {
     ///
     /// - Parameter focus: 需要「适配窗口」的范围；只有第一次出现内容时才会用它自动适配，
     ///   之后一律保持用户当前的视野（开关图层不该改变视口）。
-    func setLayers(_ newLayers: [MapLayer], focus: CGRect?) {
-        let hadContent = !stacks.isEmpty
-        let previousScale = camera.groundMetersPerPoint
-        if Self.tracesLayers {
-            let names = newLayers.map { "\($0.id.prefix(6))/\($0.sourceKey.prefix(24))" }
-            traceGeometryEvent("setLayers 层数=\(newLayers.count) [\(names.joined(separator: " "))]")
-        }
-        layers = newLayers
 
-        // 删掉不再需要的层
-        for (id, stack) in stacks where !newLayers.contains(where: { $0.id == id }) {
-            stack.clear()
-            stack.hostLayer.removeFromSuperlayer()
-            stacks[id] = nil
-            stackSignatures[id] = nil
-        }
-
-        // 装配或更新每一层
-        for layer in newLayers {
-            let stack = stacks[layer.id] ?? makeStack()
-            if stacks[layer.id] == nil {
-                stacks[layer.id] = stack
-                layer_hostAdd(stack)
-            }
-            if stackSignatures[layer.id] != layer.sourceKey {
-                stack.configure(
-                    source: layer.source,
-                    name: layer.name,
-                    tileSize: layer.tileSize,
-                    zoomRange: layer.zoomRange,
-                    grid: layer.grid,
-                    followsDisplayScale: layer.followsDisplayScale,
-                    maximumDataZoom: layer.maximumDataZoom,
-                    memoryLimitBytes: layer.memoryLimitBytes,
-                    maxConcurrentRequests: layer.maxConcurrentRequests
-                )
-                stackSignatures[layer.id] = layer.sourceKey
-            }
-            stack.opacity = layer.isVisible ? layer.opacity : 0
-            stack.hostLayer.isHidden = !layer.isVisible
-        }
-
-        // 层序：按列表重新挂一遍（下 → 上），始终在测量标注之下
-        for layer in newLayers {
-            guard let stack = stacks[layer.id] else { continue }
-            stack.hostLayer.removeFromSuperlayer()
-            layer_hostAdd(stack)
-        }
-        syncHostLayerFrames()
-
-        // 基准数据集的范围还没算出来时先不铺图：此时相机只能停在数据之外，
-        // 铺出来只会是一屏空占位并白读磁盘（范围一到画面还要整体跳一次）。
-        // 只认基准层：叠加进来的数据集在算自己那份范围时，当前视野与它无关，
-        // 不该把已经在看的画面一起停掉。
-        awaitingExtent = layers.contains { $0.isAnchor && $0.kind == .dataset && $0.fitRect == nil }
-
-        updateAccessibilityLabel()
-        let focusRect = focus ?? anchorLayer?.fitRect
-        if hadContent {
-            // 已经有内容在看：保持当前视野，只把图层换了。
-            refreshCamera(fitRect: nil, defaultZoomLevel: nil)
-            restoreGroundScale(previousScale, when: true)
-        } else {
-            refreshCamera(fitRect: focusRect, defaultZoomLevel: focusRect == nil ? 2 : nil)
-        }
-        // 图层增删改序之后遮罩对象可能对不上了，重刷一遍（未开启对比时是空操作）。
-        if swipeIsActive || !swipeMasks.isEmpty { applySwipe() }
-        syncLayers()
-    }
 
     /// 相机是否已经被放到过一个有意义的视野（用户平移缩放、或按范围适配过）。
     /// 用它区分「首次出现的内容」与「用户调好的视野」：前者可以自动适配，后者一律不许动。
@@ -632,15 +566,10 @@ final class TileCanvasNSView: NSView {
     func markViewPositioned() { viewWasPositioned = true }
 
     /// 重配图层之后把地面比例套回去（`condition` 为假时不动，让首次适配生效）。
-    private func restoreGroundScale(_ scale: Double, when condition: Bool) {
-        guard condition, scale > 0, scale.isFinite else { return }
-        camera = camera.settingGroundMetersPerPoint(scale).clamped(zoomLevelRange: zoomBounds)
-    }
+
 
     /// 把图层栈插到测量标注之下。
-    private func layer_hostAdd(_ stack: TileLayerStack) {
-        layer?.insertSublayer(stack.hostLayer, below: overlay.hostLayer)
-    }
+
 
     /// 让底色层与各瓦片栈的宿主图层都跟画布等大。
     ///
@@ -651,65 +580,10 @@ final class TileCanvasNSView: NSView {
     /// 画面却只剩底色，看着就是「打开了却是全灰」。
     ///
     /// 因此每帧同步前都兜一次底，代价只是几次 frame 比较。
-    private func syncHostLayerFrames() {
-        let needsWork = backgroundLayer.frame != bounds
-            || stacks.values.contains { $0.hostLayer.frame != bounds }
-        guard needsWork else { return }
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        backgroundLayer.frame = bounds
-        pickLayer.frame = bounds
-        swipeDividerLayer.frame = bounds
-        for stack in stacks.values { stack.hostLayer.frame = bounds }
-        CATransaction.commit()
-    }
+
 
     /// 依据当前激活的图层重配相机（瓦片边长、缩放上下限，以及可选的窗口适配）。
-    private func refreshCamera(fitRect: CGRect?, defaultZoomLevel: Double?) {
-        camera.displayScale = displayScale
-        camera.viewportSize = bounds.size
-        // 相机里的瓦片边长跟着主图层走：本地影像按设备像素 1:1，在线才按地图约定。
-        let primary = primaryStack
-        camera.tilePixelSize = primary.map { $0.cameraTileSize(displayScale: displayScale) } ?? 512
 
-        let rect = fitRect ?? (primaryStack != nil ? layers.first(where: { $0.isAnchor })?.fitRect : nil)
-        let fitCamera = rect.map {
-            MapCamera.fitting(
-                $0,
-                viewportSize: bounds.size,
-                padding: 28,
-                tilePixelSize: camera.tilePixelSize,
-                displayScale: camera.displayScale
-            )
-        } ?? camera.settingZoomLevel(defaultZoomLevel ?? camera.zoomLevel)
-
-        // 上下限取两层（多图层后是全部图层）的并集：更深的源决定能放多大，浅的那层靠祖先贴图兜底。
-        // 没有图层时给一个宽松范围，免得算成空区间（`ClosedRange` 会直接崩）。
-        var upper = 26.0
-        var hasActive = false
-        for stack in stacks.values where stack.isActive {
-            upper = hasActive ? max(upper, stack.zoomLevelRange.upperBound) : stack.zoomLevelRange.upperBound
-            hasActive = true
-        }
-        // 只有「真的要重新适配视野」时才按适配层级算下限；否则沿用原下限（否则每开关一次底图，
-        // 能缩小的范围就被当前相机重新收紧一次，看起来就像视野被改动了）。
-        var lower = rect == nil
-            ? min(zoomBounds.lowerBound, upper - 0.001)
-            : min(max(-2, fitCamera.zoomLevel - 1.2), upper - 0.001)
-        zoomLowerBoundFromFit = lower
-        // 主图层的最低数据层级比适配层级“深”很多时（整省 z12 之类的数据在「适应窗口」下就是这样），
-        // 再往外缩一屏就要铺几千片，安全阀会把画布清空 —— 看着像数据没打开。
-        // 把「一屏还铺得出来」的最低层级也算进缩放下限，宁可少看一点，也不留一屏空白。
-        if rect != nil, let primary {
-            lower = max(lower, primary.affordableCameraZoom(
-                viewportSize: bounds.size, displayScale: displayScale
-            ))
-        }
-        // 下限顶到上限会让 `ClosedRange` 直接崩，夹一道。
-        lower = min(lower, upper - 0.001)
-        zoomBounds = lower...upper
-        camera = fitCamera.clamped(zoomLevelRange: zoomBounds)
-    }
 
     /// 视口尺寸变了（进全屏、拉大窗口、从「适应窗口」回来）就按新视口重算缩放下限。
     ///
@@ -721,88 +595,31 @@ final class TileCanvasNSView: NSView {
     ///
     /// 所以每次视口尺寸变化都重算一遍，把相机夹回「一屏还铺得出来」的范围。窗口缩回去
     /// 时限界也跟着松回来（`zoomLowerBoundFromFit` 那一步就是为此留的）。
-    private func adoptZoomBoundsToViewport() {
-        guard let primary = primaryStack else { return }
-        let affordable = primary.affordableCameraZoom(
-            viewportSize: bounds.size, displayScale: displayScale
-        )
-        let lower = min(max(zoomLowerBoundFromFit, affordable), zoomBounds.upperBound - 0.001)
-        guard abs(lower - zoomBounds.lowerBound) > 0.0005 else { return }
-        zoomBounds = lower...zoomBounds.upperBound
-        camera = camera.clamped(zoomLevelRange: zoomBounds)
-    }
+
 
     /// 画布是自绘的，给读屏一个可读的名字与当前层级。
-    private func updateAccessibilityLabel() {
-        let name = anchorLayer?.name ?? orderedStacks.last?.name ?? ""
-        let layerCount = orderedStacks.filter(\.isActive).count
-        guard !name.isEmpty else {
-            setAccessibilityLabel("地图画布，暂无内容")
-            writeAccessibilityZoom(nil)
-            return
-        }
-        setAccessibilityLabel("地图画布：\(name)" + (layerCount > 1 ? "（\(layerCount) 个图层）" : ""))
-        writeAccessibilityZoom(currentDataZoom)
-    }
+
 
     /// 上次写进无障碍值的层级。
-    private var lastAccessibilityZoom: Int?
+    var lastAccessibilityZoom: Int?
 
     /// 只在层级真的变了才写无障碍值。
     ///
     /// `sync` 在瓦片到位、手势提交时都会跑，每次都 `setAccessibilityValue("z…")` 等于
     /// 每秒给辅助功能栈发几十次同样的通知 —— 值没变就别惊动它。
-    private func writeAccessibilityZoom(_ zoom: Int?) {
-        guard zoom != lastAccessibilityZoom else { return }
-        lastAccessibilityZoom = zoom
-        setAccessibilityValue(zoom.map { "z\($0)" })
-    }
+
 
     /// 本地数据范围算好之后对齐窗口（只影响本地层，不打断已经铺好的其他层）。
-    func setExtent(_ extent: DatasetExtent?) {
-        guard layers.contains(where: { $0.kind == .dataset }) else { return }
-        awaitingExtent = false
-        extentRect = extent?.worldRect
-        // 范围算失败（nil）也要同步一次，让画面退回默认视图，而不是一直空着。
-        guard let extent else {
-            syncLayers()
-            return
-        }
-        markViewPositioned()
-        refreshCamera(fitRect: extent.worldRect, defaultZoomLevel: nil)
-        syncLayers()
-    }
+
 
     /// 适配窗口：优先本地数据范围，其次在线底图范围。
-    func fitToData() {
-        markViewPositioned()
-        guard orderedStacks.contains(where: { $0.isActive }) else { return }
-        guard !awaitingExtent || extentRect != nil else { return }
-        let rect = anchorLayer?.fitRect ?? extentRect ?? layers.last(where: { $0.fitRect != nil })?.fitRect ?? Self.worldRect
-        camera = MapCamera.fitting(
-            rect,
-            viewportSize: bounds.size,
-            padding: 28,
-            tilePixelSize: camera.tilePixelSize,
-            displayScale: camera.displayScale
-        ).clamped(zoomLevelRange: zoomBounds)
-        syncLayers()
-    }
+
 
     /// 缩放到指定的世界范围。
-    func fitToWorldRect(_ rect: CGRect, padding: Double = 56) {
-        markViewPositioned()
-        camera = camera.fitting(rect, padding: padding).clamped(zoomLevelRange: zoomBounds)
-        syncLayers()
-    }
+
 
     /// 把相机移动到指定地理坐标（保持当前层级）。
-    func goTo(_ coordinate: GeoCoordinate) {
-        markViewPositioned()
-        camera.center = WebMercator.normalized(coordinate)
-        camera = camera.clamped(zoomLevelRange: zoomBounds)
-        syncLayers()
-    }
+
 
     /// 跳到指定视点（中心 + 缩放层级），书签与「巡检图集」用。
     func goTo(_ coordinate: GeoCoordinate, zoomLevel: Double?) {
@@ -901,9 +718,9 @@ final class TileCanvasNSView: NSView {
     }
 
     /// 当前屏幕的设备像素比。
-    private var displayScale: Double { Double(window?.backingScaleFactor ?? 2) }
+    var displayScale: Double { Double(window?.backingScaleFactor ?? 2) }
 
-    private func updateContentsScale() {
+    func updateContentsScale() {
         let scale = displayScale
         // 设备像素比参与缩放层级换算：换到 Retina / 外接屏时瓦片仍是 1:1 对应设备像素。
         let previous = camera.tilePixelSize
@@ -958,7 +775,10 @@ final class TileCanvasNSView: NSView {
         adoptZoomBoundsToViewport()
         // 新建的图层栈可能还没被 `layout()` 量过尺寸（拖放 / 切数据都不会再触发它）。
         syncHostLayerFrames()
-        for stack in stacks.values { stack.updateSortCenter(camera.center) }
+        for stack in stacks.values {
+            stack.updateSortCenter(camera.center)
+            stack.reducesMotion = InterfaceStyle.reducesMotion
+        }
         // 拖窗口期间先不做预取这类后台活；拖动视图时反过来要预取，边上才有图。
         for stack in stacks.values {
             stack.defersBackgroundWork = defersTileWork
@@ -1014,7 +834,7 @@ final class TileCanvasNSView: NSView {
     }
 
     /// 瓦片读数是给状态栏看的，手势期间它本来也没在变，别白刷一次界面。
-    private func reportTileStats(loadedTiles: Int, missingTiles: Int, loadsTiles: Bool) {
+    func reportTileStats(loadedTiles: Int, missingTiles: Int, loadsTiles: Bool) {
         guard loadsTiles else { return }
         onTileStatsChanged?(loadedTiles, missingTiles)
     }

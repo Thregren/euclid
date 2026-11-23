@@ -37,27 +37,45 @@ public struct RemoteTileSource: TileImageSource {
     }
 
     public func data(for tile: SlippyTile) async -> Data? {
-        guard availableZoomRange.contains(tile.zoom) else { return nil }
-        guard let url = try? TileURLTemplate.url(
-            for: tile,
-            template: template.urlTemplate,
-            subdomains: template.subdomains,
-            key: key
-        ) else { return nil }
+        let result = await fetchTile(tile)
+        if case .success(let data) = result { return data }
+        return nil
+    }
 
-        var attempt = 0
-        while true {
-            if Task.isCancelled { return nil }
-            do {
-                let result = try await fetcher.fetch(TileRequest(url: url, headers: headers))
-                return result.data
-            } catch let error as TileFetchError where error.isRetryable && attempt < retryLimit {
-                attempt += 1
-                try? await Task.sleep(for: .seconds(TileDownloader.backoff(attempt: attempt)))
-            } catch {
-                // 404 与其它失败一律当作「这一格没有」，由渲染层显示为空。
-                return nil
-            }
+    public func loadTile(_ tile: SlippyTile) async -> TileLoadResult {
+        switch await fetchTile(tile) {
+        case .success(let data):
+            return await TileDecodeScheduler.decode(data).map(TileLoadResult.image) ?? .retry
+        case .failure(let error): return error.isMissing ? .missing : .retry
         }
+    }
+
+    public func readData(for tile: SlippyTile) async throws -> Data? {
+        let result = await fetchTile(tile)
+        try Task.checkCancellation()
+        switch result {
+        case .success(let data): return data
+        case .failure(let error) where error.isMissing: return nil
+        case .failure(let error): throw error
+        }
+    }
+
+    private func fetchTile(_ tile: SlippyTile) async -> Result<Data, TileFetchError> {
+        guard availableZoomRange.contains(tile.zoom),
+              let url = try? TileURLTemplate.url(for: tile, template: template.urlTemplate,
+                                                subdomains: template.subdomains, key: key) else {
+            return .failure(.httpStatus(404))
+        }
+        var attempt = 0
+        while !Task.isCancelled {
+            do { return .success(try await fetcher.fetch(TileRequest(url: url, headers: headers)).data) }
+            catch let error as TileFetchError {
+                guard error.isRetryable, attempt < retryLimit else { return .failure(error) }
+                attempt += 1
+                do { try await Task.sleep(for: .seconds(TileDownloader.backoff(attempt: attempt))) }
+                catch { return .failure(.transport("cancelled")) }
+            } catch { return .failure(.transport(error.localizedDescription)) }
+        }
+        return .failure(.transport("cancelled"))
     }
 }

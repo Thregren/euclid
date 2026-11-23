@@ -259,12 +259,20 @@ extension AppModel {
 
     /// 从具体文件追加测量；返回读到的条数，失败返回 nil。
     @discardableResult
-    func loadMeasurements(from url: URL) async -> Int? {
+    func loadMeasurements(
+        from url: URL,
+        reader: @escaping @Sendable (URL) async -> [GeoMeasurement]? = MeasurementArchive.readFile
+    ) async -> Int? {
+        let targetTab = activeWorkspaceTabID
+        let targetOwner = measurementOwnerPath
+        let targetGeneration = sourceGeneration
         // 读盘 + 解码同样放后台（文件可能几 MB）。
-        let loaded: [GeoMeasurement]? = await Task.detached(priority: .userInitiated) {
-            guard let data = try? Data(contentsOf: url) else { return nil }
-            return MeasurementArchive.decode(data)
-        }.value
+        let loaded = await reader(url)
+        guard !Task.isCancelled, activeWorkspaceTabID == targetTab,
+              measurementOwnerPath == targetOwner, sourceGeneration == targetGeneration else {
+            setStatus("导入已取消：原标签页或数据源已切换", autoClearAfter: 6)
+            return nil
+        }
         guard let loaded else {
             setStatus("这个文件里没有可识别的测量", autoClearAfter: 6)
             return nil
@@ -510,40 +518,50 @@ extension AppModel {
         panel.prompt = "导入"
         guard panel.runModal() == .OK, !panel.urls.isEmpty else { return }
         let urls = panel.urls
-        setStatus("正在导入矢量…", autoClearAfter: 0)
-        Task {
-            var imported: [GeoMeasurement] = []
-            var failures: [String] = []
-            for url in urls {
-                let result: Result<[GeoMeasurement], Error> = await Task.detached(priority: .userInitiated) {
-                    do {
-                        return .success(try VectorImporter.measurements(from: url))
-                    } catch {
-                        return .failure(error)
-                    }
-                }.value
-                switch result {
-                case .success(let measurements): imported.append(contentsOf: measurements)
-                case .failure(let error):
-                    let reason = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-                    failures.append("\(url.lastPathComponent)：\(reason)")
-                }
-            }
-            guard !imported.isEmpty else {
-                setStatus("导入失败：\(failures.first ?? "没有可识别的图形")", autoClearAfter: 8)
-                return
-            }
-            measurements.merge(imported)
-            canvas.refreshOverlay()
-            // 导入完顺手看全它们（不然图形可能落在视野外，像是「什么都没发生」）。
-            if let rect = measurements.measurements.map(\.worldRect).compactMap({ $0 }).reduce(nil, { partial, rect in
-                partial.map { $0.union(rect) } ?? rect
-            }) {
-                canvas.fit(to: rect)
-            }
-            var message = "已导入 \(imported.count) 个图形"
-            if !failures.isEmpty { message += "（\(failures.count) 个文件失败：\(failures[0])）" }
-            setStatus(message, autoClearAfter: 8)
+        Task { await importVectorOverlays(from: urls) }
+    }
+
+    @discardableResult
+    func importVectorOverlays(
+        from urls: [URL],
+        reader: @escaping @Sendable (URL) async -> Result<[GeoMeasurement], Error> = { url in
+            await runCancellableAppWork { Result { try VectorImporter.measurements(from: url) } }
         }
+    ) async -> Int? {
+        let targetTab = activeWorkspaceTabID
+        let targetOwner = measurementOwnerPath
+        let targetGeneration = sourceGeneration
+        setStatus("正在导入矢量…", autoClearAfter: 0)
+        var imported: [GeoMeasurement] = []
+        var failures: [String] = []
+        for url in urls {
+            let result = await reader(url)
+            guard !Task.isCancelled, activeWorkspaceTabID == targetTab,
+                  measurementOwnerPath == targetOwner, sourceGeneration == targetGeneration else {
+                setStatus("导入已取消：原标签页或数据源已切换", autoClearAfter: 6)
+                return nil
+            }
+            switch result {
+            case .success(let measurements): imported.append(contentsOf: measurements)
+            case .failure(let error):
+                let reason = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                failures.append("\(url.lastPathComponent)：\(reason)")
+            }
+        }
+        guard !imported.isEmpty else {
+            setStatus("导入失败：\(failures.first ?? "没有可识别的图形")", autoClearAfter: 8)
+            return nil
+        }
+        measurements.merge(imported)
+        canvas.refreshOverlay()
+        if let rect = measurements.measurements.map(\.worldRect).compactMap({ $0 }).reduce(nil, { partial, rect in
+            partial.map { $0.union(rect) } ?? rect
+        }) {
+            canvas.fit(to: rect)
+        }
+        var message = "已导入 \(imported.count) 个图形"
+        if !failures.isEmpty { message += "（\(failures.count) 个文件失败：\(failures[0])）" }
+        setStatus(message, autoClearAfter: 8)
+        return imported.count
     }
 }

@@ -31,9 +31,15 @@ import Foundation
 /// 没有 manifest 也能用：层级与行范围从文件名里读，瓦片边长与覆盖范围
 /// 由最低层级的那一两个分卷现场探出来（中央目录顺带建好索引，后面取图直接复用）。
 public enum ZipDatasetLocator {
+    #if os(iOS)
+    private static let maximumManifestBytes = 8 << 20
+    #else
+    private static let maximumManifestBytes = 32 << 20
+    #endif
 
     /// 认出一个 zip 数据集；这个目录里没有 zip 分卷时返回 nil。
     public static func makeDataset(at url: URL) -> TileDataset? {
+        guard !Task.isCancelled else { return nil }
         let candidates = zipFiles(in: url)
         guard !candidates.isEmpty else { return nil }
         let manifest = readManifest(at: url)
@@ -43,6 +49,7 @@ public enum ZipDatasetLocator {
         var orphans: [ZipFile] = []
         var attached: Set<String> = []
         for candidate in candidates {
+            guard !Task.isCancelled else { return nil }
             // 行范围与层级以 manifest 为准（它是收尾时才写的，比文件名更可信）。
             let declared = manifest?.parts?[candidate.name]
             guard let zoom = declared?.zoom ?? candidate.zoom, (0...30).contains(zoom) else {
@@ -53,10 +60,10 @@ public enum ZipDatasetLocator {
             }
             let rows = declared?.rows ?? candidate.rows
             parts[zoom, default: []].append(
-                ZipVolume(url: candidate.url, rowRange: rows.flatMap(rowRange))
+                ZipVolume(url: candidate.url, rowRange: rows.flatMap { rowRange($0, zoom: zoom) })
             )
             attached.insert(candidate.name)
-            if let tiles = declared?.tiles { declaredTiles += tiles }
+            if let tiles = declared?.tiles { declaredTiles = addingTileCount(declaredTiles, tiles) }
         }
 
         // 合并包：manifest 逐卷记着层级与行范围，磁盘上却只有一整个 `<年份>.zip`。
@@ -65,7 +72,7 @@ public enum ZipDatasetLocator {
             for (zoom, volumes) in merged.parts {
                 parts[zoom, default: []].append(contentsOf: volumes)
             }
-            declaredTiles += merged.tiles
+            declaredTiles = addingTileCount(declaredTiles, merged.tiles)
         }
 
         guard !parts.isEmpty,
@@ -190,9 +197,17 @@ public enum ZipDatasetLocator {
         return (zoom, rows)
     }
 
-    static func rowRange(_ rows: [Int]) -> ClosedRange<Int>? {
-        guard rows.count == 2, let first = rows.first, let last = rows.last else { return nil }
+    static func rowRange(_ rows: [Int], zoom: Int = 30) -> ClosedRange<Int>? {
+        guard (0...30).contains(zoom), rows.count == 2, let first = rows.first, let last = rows.last,
+              first >= 0, last >= 0, first < 1 << zoom, last < 1 << zoom else { return nil }
         return min(first, last)...max(first, last)
+    }
+
+    /// Invalid counts stay unknown across the whole aggregation instead of overflowing or becoming a partial total.
+    private static func addingTileCount(_ lhs: Int, _ rhs: Int) -> Int {
+        guard lhs >= 0, rhs >= 0 else { return -1 }
+        let (total, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? -1 : total
     }
 
     // MARK: - 合并包
@@ -215,8 +230,9 @@ public enum ZipDatasetLocator {
         var ranges: [Int: ClosedRange<Int>] = [:]
         var tiles: [Int: Int] = [:]
         for (name, part) in declared {
+            guard !Task.isCancelled else { return nil }
             guard let zoom = part.zoom, (0...30).contains(zoom),
-                  let range = part.rows.flatMap(rowRange) else { continue }
+                  let range = part.rows.flatMap({ rowRange($0, zoom: zoom) }) else { continue }
             if let existing = ranges[zoom] {
                 let lower = min(existing.lowerBound, range.lowerBound)
                 let upper = max(existing.upperBound, range.upperBound)
@@ -225,7 +241,7 @@ public enum ZipDatasetLocator {
                 ranges[zoom] = range
             }
             // 已经在磁盘上找到对应文件的那些卷不重复计数。
-            if !attached.contains(name) { tiles[zoom, default: 0] += max(0, part.tiles ?? 0) }
+            if !attached.contains(name) { tiles[zoom] = addingTileCount(tiles[zoom] ?? 0, part.tiles ?? 0) }
         }
         guard !ranges.isEmpty else { return nil }
 
@@ -233,7 +249,7 @@ public enum ZipDatasetLocator {
         for (zoom, range) in ranges {
             parts[zoom] = orphans.map { ZipVolume(url: $0.url, rowRange: range) }
         }
-        return (parts, tiles.values.reduce(0, +))
+        return (parts, tiles.values.reduce(0, addingTileCount))
     }
 
     // MARK: - manifest
@@ -251,6 +267,7 @@ public enum ZipDatasetLocator {
         /// manifest 里的 bbox（GeoJSON 顺序：西、南、东、北）。
         var bounds: GeoBounds? {
             guard let bbox, bbox.count == 4, bbox.allSatisfy(\.isFinite),
+                  bbox[0] >= -180, bbox[2] <= 180, bbox[1] >= -90, bbox[3] <= 90,
                   bbox[2] > bbox[0], bbox[3] > bbox[1] else { return nil }
             return GeoBounds(west: bbox[0], south: bbox[1], east: bbox[2], north: bbox[3])
         }
@@ -260,9 +277,16 @@ public enum ZipDatasetLocator {
     static func readManifest(at url: URL) -> Manifest? {
         for name in ["manifest.json", "_state.json"] {
             let file = url.appending(path: name)
-            guard let data = try? Data(contentsOf: file, options: .mappedIfSafe) else { continue }
+            guard !Task.isCancelled else { return nil }
+            guard let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+                  values.isRegularFile == true,
+                  let size = values.fileSize, size <= maximumManifestBytes,
+                  let handle = try? FileHandle(forReadingFrom: file) else { continue }
+            defer { try? handle.close() }
+            guard let data = try? handle.read(upToCount: maximumManifestBytes + 1),
+                  data.count <= maximumManifestBytes else { continue }
             if let manifest = try? JSONDecoder().decode(Manifest.self, from: data),
-               manifest.parts != nil {
+               let parts = manifest.parts, parts.count <= 262_144 {
                 return manifest
             }
         }

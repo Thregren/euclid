@@ -2,225 +2,6 @@ import CoreGraphics
 import Foundation
 import ImageIO
 
-/// 单幅影像的地理参考：像素坐标 ↔ 影像坐标 ↔ WGS84。
-///
-/// 变换是仿射的：
-/// `x = originX + 列 * pixelSizeX + 行 * rotationX`
-/// `y = originY + 列 * rotationY + 行 * pixelSizeY`
-/// 北朝上的正射影像里 `pixelSizeY` 为负（行号向南增大）。
-public struct RasterGeoreference: Hashable, Sendable {
-    /// 摆放方式。
-    public enum Placement: Hashable, Sendable {
-        /// 有地理参考，能算经纬度。
-        case georeferenced
-        /// 没有可用的地理参考：按「1 像素 = 1 米、中心落在本初子午线与赤道交点」摆着看。
-        case unreferenced(reason: String)
-    }
-
-    public var placement: Placement
-    public var crs: RasterCRS
-    public var originX: Double
-    public var originY: Double
-    public var pixelSizeX: Double
-    public var pixelSizeY: Double
-    public var rotationX: Double
-    public var rotationY: Double
-
-    /// 手工构造一份地理参考（自检里要用「把某块已知影像摆在某处」的场景）。
-    ///
-    /// 正式路径上的地理参考都从文件标签算出来（见 `RasterLoader`），因此这条口子按
-    /// 1.15 的约定只开到 `package`：自检与同包模块够得到，不扩大公开 API。
-    package init(
-        placement: Placement,
-        crs: RasterCRS,
-        originX: Double,
-        originY: Double,
-        pixelSizeX: Double,
-        pixelSizeY: Double,
-        rotationX: Double = 0,
-        rotationY: Double = 0
-    ) {
-        self.placement = placement
-        self.crs = crs
-        self.originX = originX
-        self.originY = originY
-        self.pixelSizeX = pixelSizeX
-        self.pixelSizeY = pixelSizeY
-        self.rotationX = rotationX
-        self.rotationY = rotationY
-    }
-
-    public var isGeoreferenced: Bool { placement == .georeferenced }
-
-    /// 没有地理参考时用的占位参考（1 像素 = 1 米，中心在原点）。
-    public static func unreferenced(reason: String, pixelWidth: Int, pixelHeight: Int) -> RasterGeoreference {
-        RasterGeoreference(
-            placement: .unreferenced(reason: reason),
-            crs: .webMercator,
-            originX: -Double(pixelWidth) / 2,
-            originY: Double(pixelHeight) / 2,
-            pixelSizeX: 1,
-            pixelSizeY: -1,
-            rotationX: 0,
-            rotationY: 0
-        )
-    }
-
-    /// 像素坐标 → 影像坐标。
-    public func crsPoint(column: Double, row: Double) -> CGPoint {
-        CGPoint(
-            x: originX + column * pixelSizeX + row * rotationX,
-            y: originY + column * rotationY + row * pixelSizeY
-        )
-    }
-
-    /// 影像坐标 → 像素坐标。
-    public func pixelPoint(x: Double, y: Double) -> CGPoint? {
-        let determinant = pixelSizeX * pixelSizeY - rotationX * rotationY
-        guard abs(determinant) > .ulpOfOne else { return nil }
-        let dx = x - originX
-        let dy = y - originY
-        return CGPoint(
-            x: (dx * pixelSizeY - dy * rotationX) / determinant,
-            y: (dy * pixelSizeX - dx * rotationY) / determinant
-        )
-    }
-
-    /// 像素坐标 → WGS84；认不出投影时返回 nil。
-    public func coordinate(column: Double, row: Double) -> GeoCoordinate? {
-        let point = crsPoint(column: column, row: row)
-        return Projection.toWGS84(x: point.x, y: point.y, crs: crs)
-    }
-
-    /// WGS84 → 像素坐标。
-    public func pixel(for coordinate: GeoCoordinate) -> CGPoint? {
-        guard let point = Projection.fromWGS84(coordinate, crs: crs) else { return nil }
-        return pixelPoint(x: point.x, y: point.y)
-    }
-
-    /// 影像覆盖的归一化世界矩形（四角变换后取包围盒）。
-    public func worldRect(pixelWidth: Int, pixelHeight: Int) -> CGRect {
-        let corners = [
-            (0.0, 0.0),
-            (Double(pixelWidth), 0.0),
-            (Double(pixelWidth), Double(pixelHeight)),
-            (0.0, Double(pixelHeight)),
-        ]
-        var rect: CGRect?
-        for (column, row) in corners {
-            guard let coordinate = coordinate(column: column, row: row) else { continue }
-            let point = WebMercator.normalized(coordinate)
-            rect = rect.map { $0.union(CGRect(origin: point, size: .zero)) }
-                ?? CGRect(origin: point, size: .zero)
-        }
-        return rect ?? CGRect(x: 0.25, y: 0.25, width: 0.5, height: 0.5)
-    }
-
-    /// 归一化世界矩形 → 像素矩形（四角都换算一遍，取轴对齐包围盒）。
-    ///
-    /// 只回答「大概要哪些像素」，不管这些像素在屏幕上怎么摆：影像平面坐标与铺图网格之间
-    /// 有旋转时，包围盒会把旋转吞掉。数值分析（视野 / 框选算坡度、两期影像求差）只要一个
-    /// 够大的范围，因此用它；铺图不能用它，得用 `RasterTileSource.mapping(ofTileWorld:georeference:tileSize:)`，
-    /// 否则相邻瓦片的接缝会错开几个像素。
-    public func pixelRect(ofWorldRect rect: CGRect) -> CGRect? {
-        let west = WebMercator.longitude(normalizedX: rect.minX)
-        let east = WebMercator.longitude(normalizedX: rect.maxX)
-        let north = WebMercator.latitude(normalizedY: rect.minY)
-        let south = WebMercator.latitude(normalizedY: rect.maxY)
-        let corners = [
-            GeoCoordinate(longitude: west, latitude: north),
-            GeoCoordinate(longitude: east, latitude: north),
-            GeoCoordinate(longitude: east, latitude: south),
-            GeoCoordinate(longitude: west, latitude: south),
-        ]
-        var box: CGRect?
-        for corner in corners {
-            guard let pixel = pixel(for: corner) else { return nil }
-            box = box.map { $0.union(CGRect(origin: pixel, size: .zero)) }
-                ?? CGRect(origin: pixel, size: .zero)
-        }
-        return box
-    }
-
-    /// 由 GeoTIFF 标签建地理参考。
-    static func from(geo: TIFFGeoTags, pixelWidth: Int, pixelHeight: Int) -> RasterGeoreference {
-        let crs = crsFromKeys(geo)
-        // 优先用完整的仿射矩阵；否则用「像素尺度 + 定位点」。
-        if let matrix = geo.transformation, matrix.count >= 8 {
-            let reference = RasterGeoreference(
-                placement: crs.isKnown ? .georeferenced : .unreferenced(reason: crs.displayName),
-                crs: crs,
-                originX: matrix[3],
-                originY: matrix[7],
-                pixelSizeX: matrix[0],
-                pixelSizeY: matrix[5],
-                rotationX: matrix[1],
-                rotationY: matrix[4]
-            )
-            if crs.isKnown { return reference }
-        }
-        if let scale = geo.pixelScale, let tiePoints = geo.tiePoints, tiePoints.count >= 6 {
-            let column = tiePoints[0], row = tiePoints[1]
-            let x = tiePoints[3], y = tiePoints[4]
-            let pixelSizeX = scale[0]
-            let pixelSizeY = scale.count > 1 ? scale[1] : scale[0]
-            // 定位点可能不落在 (0,0)，按它把原点推算回去。
-            let reference = RasterGeoreference(
-                placement: crs.isKnown ? .georeferenced : .unreferenced(reason: crs.displayName),
-                crs: crs,
-                originX: x - column * pixelSizeX,
-                originY: y + row * pixelSizeY,
-                pixelSizeX: pixelSizeX,
-                pixelSizeY: -pixelSizeY,
-                rotationX: 0,
-                rotationY: 0
-            )
-            if crs.isKnown { return reference }
-        }
-        let reason = geo.isEmpty
-            ? "文件里没有地理标签"
-            : (crs.isKnown ? "文件里没有可用的定位信息" : crs.displayName)
-        return .unreferenced(reason: reason, pixelWidth: pixelWidth, pixelHeight: pixelHeight)
-    }
-
-    /// 从 GeoKeyDirectory 里认出投影与参数。
-    static func crsFromKeys(_ geo: TIFFGeoTags) -> RasterCRS {
-        guard let keys = geo.keyDirectory, keys.count >= 4 else { return .unknown(code: nil) }
-        let count = Int(keys[3])
-        var values: [Int: Int] = [:]
-        for index in 0..<count {
-            let base = 4 + index * 4
-            guard base + 3 < keys.count else { break }
-            values[Int(keys[base])] = Int(keys[base + 3])
-        }
-        let doubles = geo.doubleParameters ?? []
-        func doubleValue(_ key: Int) -> Double? {
-            guard let index = values[key], index >= 0, index < doubles.count else { return nil }
-            return doubles[index]
-        }
-        let parameters = Projection.ProjectionParameters(
-            centralMeridian: doubleValue(3080) ?? doubleValue(3084),
-            latitudeOfOrigin: doubleValue(3081),
-            scaleFactor: doubleValue(3092),
-            falseEasting: doubleValue(3082),
-            falseNorthing: doubleValue(3083),
-            semiMajorAxis: doubleValue(3073),
-            flattening: nil
-        )
-        return Projection.crs(
-            modelType: values[1024],
-            projectedCode: values[3072],
-            geographicCode: values[2048],
-            coordinateTransformation: values[3075],
-            parameters: parameters
-        )
-    }
-}
-
-/// 单幅影像（GeoTIFF / TIFF，或 ImageIO 能读的普通图片）。
-///
-/// 与瓦片数据集并列：都是「一块有地理范围的影像」，只是瓦片数据集按 `<z>/<x>/<y>` 存，
-/// 单幅影像是一张大图，取图时按需解出屏幕需要的那一块。
 public struct RasterDataset: Identifiable, Hashable, Sendable {
     public let id: String
     public let name: String
@@ -300,7 +81,8 @@ public enum RasterLoader {
         let fileSize = (attributes?[.size] as? Int) ?? 0
         let name = url.deletingPathExtension().lastPathComponent
 
-        if let file = try? TIFFReader.parse(url: url) {
+        do {
+            let file = try TIFFReader.parse(url: url)
             return makeDataset(
                 url: url,
                 name: name,
@@ -318,6 +100,9 @@ public enum RasterLoader {
                 hasOverviews: !file.overviews.isEmpty,
                 tileSize: tileSize
             )
+        } catch TIFFError.notTIFF {
+            // Only a genuinely different format may use ImageIO. TIFF safety or format
+            // errors must remain errors instead of bypassing the bounded TIFF parser.
         }
 
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
@@ -545,7 +330,17 @@ public struct RasterTileSource: TileImageSource {
     public func data(for tile: SlippyTile) async -> Data? { nil }
 
     /// 解码一个瓦片：换算区域 → 选层级 → 采样到瓦片画布。
+    public func loadTile(_ tile: SlippyTile) async -> TileLoadResult {
+        guard !Task.isCancelled else { return .retry }
+        guard tile.worldRect.intersects(worldRect) else { return .missing }
+        return await image(for: tile).map(TileLoadResult.image) ?? .retry
+    }
+
     public func image(for tile: SlippyTile) async -> CGImage? {
+        await TileDecodeScheduler.perform { await renderImage(for: tile) }
+    }
+
+    private func renderImage(for tile: SlippyTile) async -> CGImage? {
         guard let file = TIFFFileCache.shared.file(for: fileURL) else { return nil }
         let tileWorld = tile.worldRect
         guard tileWorld.intersects(worldRect) else { return nil }
@@ -574,10 +369,11 @@ public struct RasterTileSource: TileImageSource {
 
         // 没有内建概览的大图：先看持久化概览缓存有没有现成的，有就直接用它铺 ——
         // 比逐块解原图快一两个数量级（这正是「无概览大图」最卡的那条路）。
-        if file.overviews.isEmpty {
-            let sourcePixelsPerPoint = mapping.sourcePixelsPerCanvasPixel
+        let sourcePixelsPerPoint = mapping.sourcePixelsPerCanvasPixel
+        if file.overviews.isEmpty, sourcePixelsPerPoint > 1.05,
+           RasterOverviewCache.qualifiesLargeImage(pixelWidth: pixelWidth, pixelHeight: pixelHeight) {
             let overview = await RasterOverviewCache.shared.readyImage(fileURL: fileURL, tileSize: tileSize)
-            if let overview, sourcePixelsPerPoint > 1.05 {
+            if let overview {
                 let columnScale = Double(overview.width) / Double(max(1, pixelWidth))
                 let rowScale = Double(overview.height) / Double(max(1, pixelHeight))
                 // 概览的像素够用才拿它铺；不够就老实解原图（宁慢不错）。
@@ -591,7 +387,7 @@ public struct RasterTileSource: TileImageSource {
                    ) {
                     return image
                 }
-            } else if overview == nil, RasterOverviewCache.qualifiesLargeImage(pixelWidth: pixelWidth, pixelHeight: pixelHeight) {
+            } else {
                 // 还没做好：把生成任务排到后台，这一屏继续走原路（下次打开就是现成的了）。
                 Self.scheduleOverviewGeneration(fileURL: fileURL, tileSize: tileSize)
             }
@@ -637,6 +433,7 @@ public struct RasterTileSource: TileImageSource {
                 )
                 return true
             } catch {
+                if error is CancellationError { return false }
                 TIFFDiagnostics.record(error: error, tile: tile, file: fileURL)
                 return false
             }
@@ -807,6 +604,8 @@ public struct RasterTileSource: TileImageSource {
     static func scheduleOverviewGeneration(fileURL: URL, tileSize: Int) {
         Task {
             await RasterOverviewCache.shared.scheduleGeneration(fileURL: fileURL, tileSize: tileSize) {
+                let access = ScopedFileAccess(url: fileURL)
+                defer { withExtendedLifetime(access) {} }
                 guard let file = TIFFFileCache.shared.file(for: fileURL) else { return nil }
                 return renderFullImage(
                     fileURL: fileURL,
@@ -852,117 +651,3 @@ public struct RasterTileSource: TileImageSource {
 ///
 /// 只缓存目录结构（几 KB 的元数据），像素数据一律现解现用，
 /// 因此缓存大小与影像有多大无关。
-final class TIFFFileCache: @unchecked Sendable {
-    static let shared = TIFFFileCache()
-
-    /// 一份文件的「时间戳 + 大小」，用来发现文件被外部换掉了。
-    private struct Stamp: Equatable {
-        var modifiedAt: Date?
-        var size: Int
-    }
-
-    private struct Entry {
-        var file: TIFFFile
-        var stamp: Stamp
-    }
-
-    private let lock = NSLock()
-    private var files: [String: Entry] = [:]
-    private var order: [String] = []
-    private let limit = 4
-    /// 检查文件是否被改过的最短间隔：每块瓦片都 stat 一次太浪费，一秒一次足够。
-    private var lastStampCheck = Date.distantPast
-    private let stampCheckInterval: TimeInterval = 1
-
-    func file(for url: URL) -> TIFFFile? {
-        let key = url.path(percentEncoded: false)
-        let now = Date()
-
-        lock.lock()
-        // `lastStampCheck` 也在这个锁里 —— 它是个可变状态，多个解码线程同时进来时
-        // 在锁外读写就是数据竞争（`Date` 不是原子的）。
-        let shouldCheckStamp = now.timeIntervalSince(lastStampCheck) >= stampCheckInterval
-        if shouldCheckStamp { lastStampCheck = now }
-        let known = files[key]
-        lock.unlock()
-
-        if let known {
-            // 没到该检查的间隔就直接用解析结果；到了就 stat 一次看看文件是不是被换过
-            //（stat 放在锁外做，别让磁盘 IO 占着这份表的锁）。
-            guard shouldCheckStamp else { return known.file }
-            let stamp = Self.stamp(of: url)
-            if known.stamp == stamp { return known.file }
-            // 文件被换掉了：结构要重解析，已经解出来的块也不能再用（尺寸 / 分块都可能变了）。
-            lock.lock()
-            if files[key]?.stamp == known.stamp {
-                files.removeValue(forKey: key)
-                order.removeAll { $0 == key }
-            }
-            lock.unlock()
-            TIFFChunkCache.shared.invalidate(path: key)
-        }
-
-        guard let parsed = try? TIFFReader.parse(url: url) else { return nil }
-        let entry = Entry(file: parsed, stamp: Self.stamp(of: url))
-        lock.lock()
-        if files[key] == nil {
-            files[key] = entry
-            order.append(key)
-            while order.count > limit {
-                files.removeValue(forKey: order.removeFirst())
-            }
-        }
-        lock.unlock()
-        return parsed
-    }
-
-    /// 丢弃某个文件的解析结果（文件被外部改动后用）。
-    func invalidate(_ url: URL) {
-        let key = url.path(percentEncoded: false)
-        lock.lock()
-        files.removeValue(forKey: key)
-        order.removeAll { $0 == key }
-        lock.unlock()
-        TIFFChunkCache.shared.invalidate(path: key)
-    }
-
-    private static func stamp(of url: URL) -> Stamp {
-        let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
-        return Stamp(modifiedAt: values?.contentModificationDate, size: values?.fileSize ?? -1)
-    }
-}
-
-/// 解码出错时的提示（同一类错误只报一次，别在日志里刷屏）。
-enum TIFFDiagnostics {
-    private final class Store: @unchecked Sendable {
-        private let lock = NSLock()
-        private var reported = Set<String>()
-
-        func insertIfNew(_ key: String) -> Bool {
-            lock.lock()
-            defer { lock.unlock() }
-            return reported.insert(key).inserted
-        }
-    }
-
-    private static let store = Store()
-
-    static func record(error: Error, tile: SlippyTile, file: URL) {
-        let key = "\(file.lastPathComponent):\(error)"
-        guard store.insertIfNew(key) else { return }
-        FileHandle.standardError.write(Data(
-            "[tiff] \(file.lastPathComponent) 瓦片 \(tile)：\(error)\n".utf8
-        ))
-    }
-
-    /// 记一条「不致命但值得知道」的情况（例如某个块解出来比声明的短，只能补零）。
-    ///
-    /// 这类问题以前是完全静默的：画面上只是那一块发黑，没人知道为什么。
-    static func record(message: String, file: URL) {
-        let key = "\(file.lastPathComponent):\(message)"
-        guard store.insertIfNew(key) else { return }
-        FileHandle.standardError.write(Data(
-            "[tiff] \(file.lastPathComponent)：\(message)\n".utf8
-        ))
-    }
-}

@@ -53,6 +53,7 @@ package final class TIFFChunkCache: @unchecked Sendable {
         package var readers = 0
         package var hits = 0
         package var misses = 0
+        package var coalesced = 0
 
         package var megabytes: Double { Double(bytes) / 1_048_576 }
     }
@@ -65,17 +66,44 @@ package final class TIFFChunkCache: @unchecked Sendable {
 
     private let lock = NSLock()
     private var pixels: [Key: [UInt8]] = [:]
-    private var order: [Key] = []
+    private var order = FIFOQueue<Key>()
     private var bytes = 0
     private var hits = 0
     private var misses = 0
+    private var coalesced = 0
+
+    /// 每个键独立等待，解码期间不持全局缓存锁。RGBA 可以继续借同块的 samples。
+    private final class Pending: @unchecked Sendable {
+        private let condition = NSCondition()
+        private var result: Result<[UInt8], Error>?
+
+        func finish(_ result: Result<[UInt8], Error>) {
+            condition.lock()
+            self.result = result
+            condition.broadcast()
+            condition.unlock()
+        }
+
+        func wait() throws -> [UInt8] {
+            condition.lock()
+            defer { condition.unlock() }
+            while result == nil {
+                try Task.checkCancellation()
+                _ = condition.wait(until: Date().addingTimeInterval(0.05))
+            }
+            let completed = result
+            guard let completed else { return [] }
+            return try completed.get()
+        }
+    }
+    private var pending: [Key: Pending] = [:]
 
     /// 句柄池里的一条：`leases` 是正在用它的调用方数量。
     ///
     /// 关键点是**不能**在还有人在读的时候 `close` —— 那会让正在进行的读拿到
     /// 「坏文件描述符」。所以被淘汰的句柄只打标记（`evicted`），
     /// 等最后一个借用者归还时才真正关上（见 `releaseReader`）。
-    private final class ReaderEntry {
+    private final class ReaderEntry: @unchecked Sendable {
         let reader: TIFFSourceFile
         var leases = 0
         var evicted = false
@@ -88,7 +116,7 @@ package final class TIFFChunkCache: @unchecked Sendable {
     private var readers: [String: ReaderEntry] = [:]
     private var readerOrder: [String] = []
 
-    package init(byteLimit: Int = 64 << 20, countLimit: Int = 512, readerLimit: Int = 4) {
+    package init(byteLimit: Int = TileResourcePolicy.rasterChunkCacheBytes, countLimit: Int = 512, readerLimit: Int = 4) {
         self.byteLimit = max(4096, byteLimit)
         self.countLimit = max(1, countLimit)
         self.readerLimit = max(1, readerLimit)
@@ -108,22 +136,50 @@ package final class TIFFChunkCache: @unchecked Sendable {
         return cached
     }
 
-    /// 存一块解好的像素。
+    /// 同一块的并发 miss 只解一次；失败广播给等待者，但不缓存失败。
+    package func loadPixels(for key: Key, decode: () throws -> [UInt8]) throws -> [UInt8] {
+        lock.lock()
+        if let cached = pixels[key] {
+            hits += 1
+            lock.unlock()
+            return cached
+        }
+        if let existing = pending[key] {
+            coalesced += 1
+            lock.unlock()
+            return try existing.wait()
+        }
+        let work = Pending()
+        pending[key] = work
+        misses += 1
+        lock.unlock()
+
+        let result = Result(catching: decode)
+        lock.lock()
+        // invalidate 可能已让同一个键开始新解码；旧任务不写入新缓存。
+        if pending[key] === work {
+            pending[key] = nil
+            if case .success(let decoded) = result { storeLocked(pixels: decoded, for: key) }
+        }
+        lock.unlock()
+        work.finish(result)
+        return try result.get()
+    }
+
     package func store(pixels newPixels: [UInt8], for key: Key) {
-        // 比整个缓存还大的一块（例如「整幅一条」的横条影像）直接不缓存：
-        // 存进去只会把别的块全挤掉，自己还占着一整块的内存。
-        guard !newPixels.isEmpty, newPixels.count <= byteLimit else { return }
         lock.lock()
         defer { lock.unlock() }
-        guard pixels[key] == nil else { return }
+        storeLocked(pixels: newPixels, for: key)
+    }
+
+    private func storeLocked(pixels newPixels: [UInt8], for key: Key) {
+        guard !newPixels.isEmpty, newPixels.count <= byteLimit, pixels[key] == nil else { return }
         pixels[key] = newPixels
         order.append(key)
         bytes += newPixels.count
-        while order.count > 1, bytes > byteLimit || order.count > countLimit {
-            let oldest = order.removeFirst()
-            if let dropped = pixels.removeValue(forKey: oldest) {
-                bytes -= dropped.count
-            }
+        while bytes > byteLimit || order.count > countLimit {
+            guard let oldest = order.popFirst() else { break }
+            if let dropped = pixels.removeValue(forKey: oldest) { bytes -= dropped.count }
         }
     }
 
@@ -133,11 +189,11 @@ package final class TIFFChunkCache: @unchecked Sendable {
     package func acquireReader(url: URL) throws -> TIFFReaderLease {
         let path = url.path(percentEncoded: false)
         lock.lock()
-        if let entry = readers[path] {
+        if let entry = readers[path], !entry.evicted {
             entry.leases += 1
             touch(path)
             lock.unlock()
-            return TIFFReaderLease(cache: self, path: path, reader: entry.reader)
+            return TIFFReaderLease(reader: entry.reader) { self.releaseReader(path: path, entry: entry) }
         }
         lock.unlock()
 
@@ -146,16 +202,17 @@ package final class TIFFChunkCache: @unchecked Sendable {
 
         lock.lock()
         // 期间可能有别的线程也开了同一个文件：留一个，多出来的这次直接关掉。
-        if let existing = readers[path] {
+        if let existing = readers[path], !existing.evicted {
             existing.leases += 1
             touch(path)
             lock.unlock()
             reader.close()
-            return TIFFReaderLease(cache: self, path: path, reader: existing.reader)
+            return TIFFReaderLease(reader: existing.reader) { self.releaseReader(path: path, entry: existing) }
         }
         let entry = ReaderEntry(reader: reader)
         entry.leases = 1
         readers[path] = entry
+        readerOrder.removeAll { $0 == path }
         readerOrder.append(path)
         var doomed: [TIFFSourceFile] = []
         while readerOrder.count > readerLimit {
@@ -169,17 +226,18 @@ package final class TIFFChunkCache: @unchecked Sendable {
         }
         lock.unlock()
         for file in doomed { file.close() }
-        return TIFFReaderLease(cache: self, path: path, reader: reader)
+        return TIFFReaderLease(reader: reader) { self.releaseReader(path: path, entry: entry) }
     }
 
     /// 借用者归还（只由 `TIFFReaderLease.deinit` 调用）。
-    fileprivate func releaseReader(path: String) {
+    private func releaseReader(path: String, entry: ReaderEntry) {
         var doomed: TIFFSourceFile?
         lock.lock()
-        if let entry = readers[path] {
-            entry.leases -= 1
-            if entry.leases <= 0, entry.evicted {
-                doomed = entry.reader
+        entry.leases -= 1
+        if entry.leases == 0, entry.evicted {
+            doomed = entry.reader
+            // 旧租约归还时，不能减掉或关闭已经重新打开的同路径句柄。
+            if readers[path] === entry {
                 readers.removeValue(forKey: path)
                 readerOrder.removeAll { $0 == path }
             }
@@ -202,13 +260,14 @@ package final class TIFFChunkCache: @unchecked Sendable {
     package func invalidate(path: String) {
         var doomed: TIFFSourceFile?
         lock.lock()
-        let keys = order.filter { $0.path == path }
+        let keys = order.elements.filter { $0.path == path }
         if !keys.isEmpty {
             order.removeAll { $0.path == path }
             for key in keys {
                 if let dropped = pixels.removeValue(forKey: key) { bytes -= dropped.count }
             }
         }
+        for key in Array(pending.keys) where key.path == path { pending[key] = nil }
         if let entry = readers[path] {
             entry.evicted = true
             if entry.leases == 0 {
@@ -230,8 +289,8 @@ package final class TIFFChunkCache: @unchecked Sendable {
         let target = Int(Double(byteLimit) * min(max(fraction, 0), 1))
         lock.lock()
         defer { lock.unlock() }
-        while order.count > 1, bytes > target {
-            let oldest = order.removeFirst()
+        while bytes > target {
+            guard let oldest = order.popFirst() else { break }
             if let dropped = pixels.removeValue(forKey: oldest) { bytes -= dropped.count }
         }
     }
@@ -247,6 +306,7 @@ package final class TIFFChunkCache: @unchecked Sendable {
         value.readers = readers.count
         value.hits = hits
         value.misses = misses
+        value.coalesced = coalesced
         return value
     }
 
@@ -255,14 +315,15 @@ package final class TIFFChunkCache: @unchecked Sendable {
         defer { lock.unlock() }
         hits = 0
         misses = 0
+        coalesced = 0
     }
 
     /// 调试摘要（`EUCLID_DEBUG_MEMORY=1` 打印）。
     package func debugSummary() -> String {
         let value = stats()
         return String(
-            format: "块缓存 %d 块/%.1f MB（命中 %d / 未中 %d）· 句柄 %d",
-            value.entries, value.megabytes, value.hits, value.misses, value.readers
+            format: "块缓存 %d 块/%.1f MB（命中 %d / 未中 %d / 合并 %d）· 句柄 %d",
+            value.entries, value.megabytes, value.hits, value.misses, value.coalesced, value.readers
         )
     }
 }
@@ -270,18 +331,14 @@ package final class TIFFChunkCache: @unchecked Sendable {
 /// 读句柄的借用凭据：`deinit` 时归还，保证「还有人用就不关句柄」。
 package final class TIFFReaderLease: @unchecked Sendable {
     package let reader: TIFFSourceFile
-    private let cache: TIFFChunkCache
-    private let path: String
+    private let release: @Sendable () -> Void
 
-    init(cache: TIFFChunkCache, path: String, reader: TIFFSourceFile) {
-        self.cache = cache
-        self.path = path
+    fileprivate init(reader: TIFFSourceFile, release: @escaping @Sendable () -> Void) {
         self.reader = reader
+        self.release = release
     }
 
-    deinit {
-        cache.releaseReader(path: path)
-    }
+    deinit { release() }
 }
 
 /// 块缓存 / 句柄池的公开入口。

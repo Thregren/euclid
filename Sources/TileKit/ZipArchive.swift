@@ -10,9 +10,15 @@ import Foundation
 /// 1. **不把中央目录整个读进内存**：一个 z18 的分卷能有一百多万条记录、中央目录上百 MB。
 ///    这里只流式扫一遍，记下「每个行号（名字的第一段）对应的字节范围」；
 ///    查某一格时再单独解析那一行的记录（几十 KB）。
-/// 2. **索引按行缓存**：解析过的行做个小 LRU（默认 8 行），一屏用到的行数远小于它。
+/// 2. **索引按行缓存**：解析过的行做个小 LRU（默认 24 行），一屏用到的行数远小于它。
 /// 3. **每次读取只 seek + 读一条**，并核对长度与 CRC：正在下载、只写了一半的分卷
 ///    不会被当成有效数据（会抛错，调用方按缺片处理）。
+package struct ZipDirectorySpan: Codable, Sendable {
+    package let start: UInt64
+    package let end: UInt64
+    package init(start: UInt64, end: UInt64) { self.start = start; self.end = end }
+}
+
 public final class ZipArchive: @unchecked Sendable {
     /// 中央目录里的一条记录。
     public struct Entry: Sendable, Hashable {
@@ -51,28 +57,53 @@ public final class ZipArchive: @unchecked Sendable {
     /// 文件长度。读数据前用它兜一道，畸形索引里的超大长度就不会变成巨量内存申请。
     private var fileSize: UInt64 = 0
     /// 行号（名字里第一段）→ 该行所有记录在中央目录里占据的字节范围。
-    private var rowSpans: [String: (start: UInt64, end: UInt64)] = [:]
+    private var rowSpans: [String: [ZipDirectorySpan]] = [:]
     /// 已解析的行 → （完整名字 → 记录）。
     private var rowTables: [String: [String: Entry]] = [:]
     private var rowOrder: [String] = []
+    private final class RowLoad: @unchecked Sendable {
+        private let condition = NSCondition()
+        private var result: Result<[String: Entry], Error>?
+        func complete(_ result: Result<[String: Entry], Error>) {
+            condition.lock()
+            self.result = result
+            condition.broadcast()
+            condition.unlock()
+        }
+        func wait() throws -> [String: Entry] {
+            condition.lock()
+            defer { condition.unlock() }
+            while result == nil {
+                try Task.checkCancellation()
+                _ = condition.wait(until: Date().addingTimeInterval(0.05))
+            }
+            return try result!.get()
+        }
+    }
+    private var rowLoads: [String: RowLoad] = [:]
+    private var rowCosts: [String: Int] = [:]
+    private var rowCacheBytes = 0
     /// 解析过的行做个小 LRU。
     ///
     /// 一屏通常只落在十几行上（z17 一条行里三千多个条目，一张行表约 400 KB），
-    /// 12 行既能把整屏盖住，内存也压在几 MB 量级。
-    private static let rowCacheLimit = 12
+    /// 24 行既能把整屏盖住，内存也压在几 MB 量级。
+    private static let rowCacheLimit = 24
+    private static let rowCacheByteLimit = min(16 << 20, TileResourcePolicy.rasterChunkCacheBytes)
+    package private(set) var parsedRowCount = 0
 
     public private(set) var entryCount = 0
     public private(set) var centralDirectorySize: UInt64 = 0
     public private(set) var isZip64 = false
 
     public init(url: URL) throws {
+        try Task.checkCancellation()
         self.url = url
         guard let handle = try? FileHandle(forReadingFrom: url) else {
             throw ZipError.notAZip
         }
         self.handle = handle
         do {
-            try readCentralDirectory()
+            try TilePerformance.measure("ZIP index") { try readCentralDirectory() }
         } catch {
             try? handle.close()
             throw error
@@ -83,21 +114,38 @@ public final class ZipArchive: @unchecked Sendable {
         try? handle.close()
     }
 
+    package var rowCacheCost: Int { lock.withLock { rowCacheBytes } }
+    package func trimRows(toFraction fraction: Double) {
+        lock.withLock {
+            let target = Int(Double(rowCacheBytes) * min(max(fraction, 0), 1))
+            while rowCacheBytes > target, !rowOrder.isEmpty {
+                let key = rowOrder.removeFirst()
+                rowTables[key] = nil
+                rowCacheBytes -= rowCosts.removeValue(forKey: key) ?? 0
+            }
+        }
+    }
+
     // MARK: - 查询
 
     /// 按完整名字查一条记录（例如 `45224/215425.jpg`）。
     public func entry(named name: String) -> Entry? {
-        table(forRow: Self.rowPrefix(of: name))[name]
+        try? checkedEntry(named: name)
+    }
+
+    package func checkedEntry(named name: String) throws -> Entry? {
+        try table(forRow: Self.rowPrefix(of: name))[name]
     }
 
     /// 读出并校验一条记录的内容。
     public func data(for entry: Entry) throws -> Data {
-        try Self.read(entry: entry, handle: handle, fileSize: fileSize)
+        try TilePerformance.measure("ZIP read and inflate") { try Self.read(entry: entry, handle: handle, fileSize: fileSize) }
     }
 
     /// 读一条记录的内容。句柄与文件长度由调用方给：轻量取样（`sampleEntry`）没有索引，
     /// 只有一个临时句柄，走的是同一段读法 —— 长度与 CRC 的校验口径也就只有一处。
     static func read(entry: Entry, handle: FileHandle, fileSize: UInt64) throws -> Data {
+        try Task.checkCancellation()
         guard entry.method != 0xFFFF else {
             throw ZipError.unsupported("加密记录：\(entry.name)")
         }
@@ -197,9 +245,22 @@ public final class ZipArchive: @unchecked Sendable {
         return nil
     }
 
+    /// Streams metadata in directory order. The next offset can be saved as a resumable cursor.
+    public func visitEntries(startingAt cursor: UInt64? = nil, _ visit: (Entry, UInt64) throws -> Bool) throws {
+        let directory = try Self.locateCentralDirectory(handle: handle, fileSize: fileSize)
+        let start = cursor ?? directory.offset
+        guard start >= directory.offset, start <= directory.offset + directory.size else { throw ZipError.corrupt("审计游标越界") }
+        enum Stop: Error { case requested }
+        do {
+            try forEachRecord(from: start, to: directory.offset + directory.size) { _, entry, offset, length in
+                if try !visit(entry, offset + UInt64(length)) { throw Stop.requested }
+            }
+        } catch Stop.requested {}
+    }
+
     /// 某一行的全部条目名（升序）。探测覆盖范围用。
     public func entryNames(inRow row: String) -> [String] {
-        return table(forRow: row).keys.sorted()
+        return (try? table(forRow: row).keys.sorted()) ?? []
     }
 
     /// 索引里出现过的行号（升序，数字行号）。
@@ -258,6 +319,10 @@ public final class ZipArchive: @unchecked Sendable {
         guard directoryOffset <= size, directorySize <= size - directoryOffset else {
             throw ZipError.truncated("中央目录越过了文件末尾")
         }
+        // Every central-directory record occupies at least 46 bytes. Validate before UInt64 → Int.
+        guard Int(exactly: entries) != nil, entries <= directorySize / 46 else {
+            throw ZipError.corrupt("中央目录条目数超出可表示范围或实际目录长度")
+        }
         return CentralDirectory(
             offset: directoryOffset,
             size: directorySize,
@@ -272,7 +337,8 @@ public final class ZipArchive: @unchecked Sendable {
         guard size >= 22 else { throw ZipError.notAZip }
         // 先看有没有上次留下的索引：命中的话连中央目录都不用扫（一个 z18 分卷上百万条
         // 记录，扫一遍要一二百毫秒，而索引落盘只要几 KB）。
-        if let cached = ZipIndexCache.load(for: url, fileSize: size) {
+        if let cached = ZipIndexCache.load(for: url, fileSize: size),
+           cached.entryCount >= 0, UInt64(cached.entryCount) <= cached.centralDirectorySize / 46 {
             rowSpans = cached.rowSpans
             entryCount = cached.entryCount
             centralDirectorySize = cached.centralDirectorySize
@@ -280,7 +346,8 @@ public final class ZipArchive: @unchecked Sendable {
             return
         }
         let directory = try Self.locateCentralDirectory(handle: handle, fileSize: size)
-        entryCount = Int(directory.entries)
+        guard let count = Int(exactly: directory.entries) else { throw ZipError.corrupt("中央目录条目数越界") }
+        entryCount = count
         centralDirectorySize = directory.size
         isZip64 = directory.isZip64
         try indexRows(directoryOffset: directory.offset, directorySize: directory.size)
@@ -296,16 +363,81 @@ public final class ZipArchive: @unchecked Sendable {
         )
     }
 
-    /// 流式扫一遍中央目录，只记「行 → 字节范围」，不保留记录本身。
+    /// 首次索引只读名字前缀，不为每张瓦片构造 Entry / 完整名字 / ZIP64 extra。
+    /// 连续同一行只生成一次 String；非连续行保留独立跨度，仍支持乱序中央目录。
     private func indexRows(directoryOffset: UInt64, directorySize: UInt64) throws {
-        try forEachRecord(from: directoryOffset, to: directoryOffset + directorySize) { name, _, start, length in
-            let row = Self.rowPrefix(of: name)
-            if let span = rowSpans[row] {
-                rowSpans[row] = (min(span.start, start), max(span.end, start + UInt64(length)))
+        let end = directoryOffset + directorySize
+        var buffer = Data()
+        var bufferStart = directoryOffset
+        var readPosition = directoryOffset
+        var previousPrefix: [UInt8] = []
+        var previousRow: String?
+        var runStart = directoryOffset
+        var runEnd = directoryOffset
+        var records = 0
+        var runs = 0
+
+        func commitRun() {
+            guard let row = previousRow else { return }
+            // Cap fragmentation on adversarial ordering. Coalesce only the tail after the budget.
+            if var spans = rowSpans[row], runs >= 262_144 || spans.count >= 128 {
+                let tail = spans.removeLast()
+                spans.append(ZipDirectorySpan(start: tail.start, end: runEnd))
+                rowSpans[row] = spans
             } else {
-                rowSpans[row] = (start, start + UInt64(length))
+                rowSpans[row, default: []].append(ZipDirectorySpan(start: runStart, end: runEnd))
+                runs += 1
             }
         }
+
+        while readPosition < end {
+            try Task.checkCancellation()
+            let length = Int(min(UInt64(Self.chunkSize), end - readPosition))
+            let chunk = read(at: readPosition, count: length)
+            guard chunk.count == length else { throw ZipError.truncated("中央目录读取不完整") }
+            buffer.append(chunk)
+            readPosition += UInt64(length)
+            let consumed = try buffer.withUnsafeBytes { raw -> Int in
+                let bytes = raw.bindMemory(to: UInt8.self)
+                var offset = 0
+                while offset + 46 <= raw.count {
+                    guard UInt32(littleEndian: raw.loadUnaligned(fromByteOffset: offset, as: UInt32.self)) == 0x0201_4B50 else {
+                        throw ZipError.corrupt("中央目录记录签名不对（文件偏移 \(bufferStart + UInt64(offset))）")
+                    }
+                    let nameLength = Int(UInt16(littleEndian: raw.loadUnaligned(fromByteOffset: offset + 28, as: UInt16.self)))
+                    let extraLength = Int(UInt16(littleEndian: raw.loadUnaligned(fromByteOffset: offset + 30, as: UInt16.self)))
+                    let commentLength = Int(UInt16(littleEndian: raw.loadUnaligned(fromByteOffset: offset + 32, as: UInt16.self)))
+                    let recordLength = 46 + nameLength + extraLength + commentLength
+                    guard offset + recordLength <= raw.count else { break }
+                    let nameStart = offset + 46
+                    var prefixLength = 0
+                    while prefixLength < nameLength, bytes[nameStart + prefixLength] != 47 { prefixLength += 1 }
+                    if prefixLength == nameLength { prefixLength = 0 }
+                    var matches = previousRow != nil && prefixLength == previousPrefix.count
+                    if matches {
+                        for index in 0..<prefixLength where previousPrefix[index] != bytes[nameStart + index] {
+                            matches = false
+                            break
+                        }
+                    }
+                    let absolute = bufferStart + UInt64(offset)
+                    if !matches {
+                        commitRun()
+                        previousPrefix = Array(bytes[nameStart..<(nameStart + prefixLength)])
+                        previousRow = String(decoding: previousPrefix, as: UTF8.self)
+                        runStart = absolute
+                    }
+                    runEnd = absolute + UInt64(recordLength)
+                    records += 1
+                    offset += recordLength
+                }
+                return offset
+            }
+            buffer = Data(buffer.dropFirst(consumed))
+            bufferStart += UInt64(consumed)
+        }
+        guard buffer.isEmpty, records == entryCount else { throw ZipError.truncated("中央目录记录数或长度不一致") }
+        commitRun()
     }
 
     /// 解析某一行的全部记录（带缓存）。
@@ -316,41 +448,61 @@ public final class ZipArchive: @unchecked Sendable {
     ///    一次瞬时失败（外置盘掉线、分卷还在下载）不该有这种后果。
     /// 2. **解析在锁外做**。一行可能有几千条记录、几十到几百 KB，持锁解析会把
     ///    同一个包里其他行的读全挡住，正好落在拖动取图的热路径上。
-    private func table(forRow row: String) -> [String: Entry] {
+    private func table(forRow row: String) throws -> [String: Entry] {
         lock.lock()
         if let cached = rowTables[row] {
+            rowOrder.removeAll { $0 == row }
+            rowOrder.append(row)
             lock.unlock()
             return cached
         }
-        guard let span = rowSpans[row] else {
+        guard let spans = rowSpans[row] else {
             lock.unlock()
             return [:]
         }
+        if let load = rowLoads[row] {
+            lock.unlock()
+            return try load.wait()
+        }
+        let load = RowLoad()
+        rowLoads[row] = load
         lock.unlock()
 
         var table: [String: Entry] = [:]
         let prefix = row.isEmpty ? "" : row + "/"
         do {
-            try forEachRecord(from: span.start, to: span.end) { name, entry, _, _ in
-                guard name.hasPrefix(prefix) else { return }
-                table[name] = entry
+            for span in spans {
+                try Task.checkCancellation()
+                try forEachRecord(from: span.start, to: span.end) { name, entry, _, _ in
+                    guard name.hasPrefix(prefix) else { return }
+                    table[name] = entry
+                }
             }
         } catch {
-            return [:]
+            lock.lock()
+            rowLoads[row] = nil
+            lock.unlock()
+            load.complete(.failure(error))
+            throw error
         }
 
         lock.lock()
-        // 期间可能有别的线程把同一行填好了：用它那份，别覆盖。
-        if let cached = rowTables[row] {
-            lock.unlock()
-            return cached
-        }
-        rowTables[row] = table
-        rowOrder.append(row)
-        while rowOrder.count > Self.rowCacheLimit {
-            rowTables[rowOrder.removeFirst()] = nil
+        parsedRowCount += 1
+        rowLoads[row] = nil
+        let cost = table.reduce(0) { $0 + $1.key.utf8.count + 160 }
+        if cost <= Self.rowCacheByteLimit {
+            rowTables[row] = table
+            rowCosts[row] = cost
+            rowCacheBytes += cost
+            rowOrder.append(row)
+            while rowOrder.count > Self.rowCacheLimit || rowCacheBytes > Self.rowCacheByteLimit {
+                let evicted = rowOrder.removeFirst()
+                rowTables[evicted] = nil
+                rowCacheBytes -= rowCosts.removeValue(forKey: evicted) ?? 0
+            }
         }
         lock.unlock()
+        load.complete(.success(table))
         return table
     }
 
@@ -358,24 +510,28 @@ public final class ZipArchive: @unchecked Sendable {
     private func forEachRecord(
         from start: UInt64,
         to end: UInt64,
-        _ body: (_ name: String, _ entry: Entry, _ recordStart: UInt64, _ recordLength: Int) -> Void
+        _ body: (_ name: String, _ entry: Entry, _ recordStart: UInt64, _ recordLength: Int) throws -> Void
     ) throws {
         var buffer = Data()
         var bufferFileOffset = start
         var cursor = start
         var offset = 0
+        var readFailed = false
 
         /// 保证缓冲里从 `offset` 起至少有 `count` 字节。
         func ensure(_ count: Int) -> Bool {
             while buffer.count - offset < count, cursor < end {
                 let want = Int(min(UInt64(Self.chunkSize), end - cursor))
-                buffer.append(read(at: cursor, count: want))
+                let chunk = read(at: cursor, count: want)
+                guard chunk.count == want else { readFailed = true; return false }
+                buffer.append(chunk)
                 cursor += UInt64(want)
             }
             return buffer.count - offset >= count
         }
 
         while ensure(46) {
+            if offset % 4096 < 256 { try Task.checkCancellation() }
             guard buffer.u32(offset) == 0x0201_4B50 else {
                 throw ZipError.corrupt("中央目录记录签名不对（文件偏移 \(bufferFileOffset + UInt64(offset))）")
             }
@@ -391,7 +547,7 @@ public final class ZipArchive: @unchecked Sendable {
             let name = String(decoding: buffer[(base + 46)..<(base + 46 + nameLength)], as: UTF8.self)
             let extra = Data(buffer[(base + 46 + nameLength)..<(base + 46 + nameLength + extraLength)])
             let entry = Self.makeEntry(name: name, record: buffer, offset: offset, extra: extra)
-            body(name, entry, bufferFileOffset + UInt64(offset), recordLength)
+            try body(name, entry, bufferFileOffset + UInt64(offset), recordLength)
 
             offset += recordLength
             // 攒够一块就把已经用掉的部分丢掉，避免整个中央目录都留在内存里。
@@ -400,6 +556,9 @@ public final class ZipArchive: @unchecked Sendable {
                 bufferFileOffset += UInt64(offset)
                 offset = 0
             }
+        }
+        guard !readFailed, buffer.count == offset, cursor == end else {
+            throw ZipError.truncated("中央目录记录读取不完整")
         }
     }
 

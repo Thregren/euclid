@@ -354,6 +354,28 @@ enum DebugExportScript {
 @MainActor
 enum DebugAnalysisScript {
     static func runIfRequested(model: AppModel) {
+        if ProcessInfo.processInfo.environment["EUCLID_DEBUG_ANALYSIS_CANCEL"] != nil {
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(6))
+                _ = model.analysisReader
+                await model.analysisReaderLoadTask?.value
+                guard let first = model.activeWorkspaceTabID, model.analysisReader != nil else { return }
+                let count = model.layers.count
+                model.addSlopeLayer(scope: .whole)
+                model.addWorkspaceTab()
+                let temporaryTab = model.activeWorkspaceTabID
+                try? await Task.sleep(for: .seconds(2))
+                let newPageClean = model.layers.isEmpty && !model.analysis.isWorking
+                model.activateWorkspaceTab(first)
+                let originalClean = model.layers.count == count
+                if let temporaryTab { model.closeWorkspaceTab(temporaryTab) }
+                model.addSlopeLayer(scope: .whole)
+                model.cancelAnalysis()
+                try? await Task.sleep(for: .seconds(2))
+                let canceledClean = model.layers.count == count && !model.analysis.isWorking
+                FileHandle.standardError.write(Data("[analysis-cancel] switched=\(newPageClean) original=\(originalClean) explicit=\(canceledClean)\n".utf8))
+            }
+        }
         if ProcessInfo.processInfo.environment["EUCLID_DEBUG_ANALYSIS_SHEET"] != nil {
             Task { @MainActor in
                 try? await Task.sleep(for: .seconds(8))
@@ -366,6 +388,8 @@ enum DebugAnalysisScript {
                 FileHandle.standardError.write(Data(("[analysis] " + text + "\n").utf8))
             }
             try? await Task.sleep(for: .seconds(10))
+            _ = model.analysisReader
+            await model.analysisReaderLoadTask?.value
             guard let reader = model.analysisReader, let raster = model.analysisRaster else {
                 log("没有可分析的影像")
                 return
@@ -379,6 +403,8 @@ enum DebugAnalysisScript {
                 row: Double(reader.pixelHeight) / 2
             )
             if let center {
+                _ = model.elevationReading(at: center)
+                await model.elevationTask?.value
                 let value = model.elevationReading(at: center)
                 log("点高程(中心)=\(value.map { String(format: "%.3f", $0) } ?? "—")")
             }
@@ -457,7 +483,7 @@ enum DebugTabsScript {
                 + "测量=\(model.measurements.measurements.count) 来源=\(model.selectedSourceID ?? "无")")
 
             if let firstSource {
-                model.open(URL(fileURLWithPath: firstSource))
+                model.openForDebugging(URL(fileURLWithPath: firstSource))
                 try? await Task.sleep(for: .seconds(6))
                 log("新页打开数据后：层=\(model.layers.count) 标题=\(model.workspaceTabs.last?.title ?? "-")")
             }

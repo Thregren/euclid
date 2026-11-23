@@ -1,0 +1,15 @@
+{
+  "core_checks": 903,
+  "persistence_checks": 38,
+  "app_model_checks": 31,
+  "frozen_ui_files": 14,
+  "source_files_verified": 135,
+  "architectures": [
+    "arm64"
+  ],
+  "platforms": [
+    "macOS",
+    "iOS device",
+    "iOS simulator"
+  ]
+}

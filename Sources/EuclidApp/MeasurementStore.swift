@@ -157,6 +157,8 @@ final class MeasurementStore {
 
     /// 每次状态变化后回调，用于触发存档。
     var onChange: (() -> Void)?
+    /// Explicit replacement intent is distinct from adding/editing while an archive is loading.
+    var onReplace: (() -> Void)?
 
     var canUndo: Bool { !undoStack.isEmpty }
     var canRedo: Bool { !redoStack.isEmpty }
@@ -233,11 +235,15 @@ final class MeasurementStore {
     }
 
     /// 用存档内容替换当前测量（不进入撤销栈）。
-    func restore(_ measurements: [GeoMeasurement]) {
+    func restore(_ measurements: [GeoMeasurement], preservingDraft: Bool = false) {
         self.measurements = measurements
-        draft.removeAll()
-        selectedID = measurements.last?.id
-        liveCoordinate = nil
+        if !preservingDraft {
+            draft.removeAll()
+            liveCoordinate = nil
+        }
+        if !preservingDraft || !measurements.contains(where: { $0.id == selectedID }) {
+            selectedID = measurements.last?.id
+        }
         // 让后续新建的测量接着调色板往下取色。
         colorCounter = measurements.count
         undoStack.removeAll()
@@ -488,7 +494,8 @@ final class MeasurementStore {
     }
 
     func clearAll() {
-        guard hasContent else { return }
+        onReplace?()
+        guard hasContent else { onChange?(); return }
         markUndoPoint()
         draft.removeAll()
         measurements.removeAll()
