@@ -9,6 +9,8 @@ final class MeasurementPersistenceCoordinator {
         let revision: UInt64
         let measurements: [GeoMeasurement]
     }
+    /// Latest source archives let a reopened source reuse completed measurements while writes are pending.
+    var cachedMeasurements: [String: [GeoMeasurement]] = [:]
     private var pending: [String: Pending] = [:]
     private var revision: UInt64 = 0
     private var scheduled: Task<Void, Never>?

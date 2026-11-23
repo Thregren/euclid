@@ -5,13 +5,11 @@ import TileKit
 struct TileMapView: NSViewRepresentable {
     let controller: CanvasController
     let viewport: ViewportState
-    let measurements: MeasurementStore
     let showGrid: Bool
 
     func makeNSView(context: Context) -> TileCanvasNSView {
         let view = TileCanvasNSView()
         view.showTileGrid = showGrid
-        view.measurementStore = measurements
         view.onViewportChanged = { [weak viewport] snapshot in
             viewport?.apply(snapshot)
         }
@@ -26,9 +24,6 @@ struct TileMapView: NSViewRepresentable {
     func updateNSView(_ nsView: TileCanvasNSView, context: Context) {
         if nsView.showTileGrid != showGrid {
             nsView.showTileGrid = showGrid
-        }
-        if nsView.measurementStore !== measurements {
-            nsView.measurementStore = measurements
         }
     }
 }

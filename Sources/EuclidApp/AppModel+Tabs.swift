@@ -3,13 +3,11 @@ import Foundation
 import Observation
 import TileKit
 
-/// 一个标签页 = 一份「打开的东西」：数据集 / 影像、图层、视角、测量。
-///
-/// 标签页之间不共享任何可变状态：切换就是「把当前状态存回这一页、把另一页的状态装回来」。
-/// 存的全是值类型（数组与结构体），因此不存在两页指向同一份状态的问题。
-/// 画布、下载、导出这些不属于「某一页」的东西照样是全局的。
-struct WorkspaceTab: Identifiable {
-    let id: UUID
+/// 每个标签页拥有自己的来源、图层、视野和测量编辑状态。
+@MainActor
+@Observable
+final class WorkspaceTab: Identifiable {
+    nonisolated let id: UUID
     /// 自动标题（跟着打开的内容走）。
     var title: String
     /// 用户改过的名字；有它就优先显示。
@@ -26,13 +24,34 @@ struct WorkspaceTab: Identifiable {
     /// 与图层一起存的「已经装到画布上的来源」标记，避免切回来又重装一遍。
     var appliedLocalDatasetID: TileDataset.ID?
     var appliedOnlineSignature: String?
-    /// 切走时的视点；没动过视图就是 nil（切回来按数据范围适配）。
-    var viewpoint: WorkspaceViewpoint?
-    var measurements: [GeoMeasurement] = []
-    var draft: MeasurementDraft?
-    var measurementSourcePath: String?
-    /// Only restored sessions need reconciliation; in-process tab snapshots already share revisions.
-    var recoverMeasurementArchive = false
+    var swipePivotLayerID: String?
+    @ObservationIgnored var viewpoint: WorkspaceViewpoint?
+    let measurements = MeasurementStore()
+    @ObservationIgnored var measurementSourcePath: String?
+
+    var anchorLayer: MapLayer? { layers.first { $0.isAnchor } }
+
+    /// 保证「基准层」这个不变量：本地数据里有且只有一层是基准层。
+    ///
+    /// 基准层决定测量、存档与相机尺度。任何会动图层列表的操作（增删、排序、改基准身份）
+    /// 之后都过一遍这里：一是别留下两个「基准」（那样「点它切过去」会失效），
+    /// 二是别在还有本地数据时一个基准都没有（那样测量与相机就没依据了）。
+    func normalizeAnchor() {
+        let isLocal: (MapLayer) -> Bool = { $0.kind != .online }
+        let anchors = layers.filter { $0.isAnchor && isLocal($0) }
+        if anchors.count > 1 {
+            // 留下第一个（画布上最下面那层优先），其余降为普通层
+            var kept = false
+            for index in layers.indices where layers[index].isAnchor && isLocal(layers[index]) {
+                if kept { layers[index].isAnchor = false } else { kept = true }
+            }
+        } else if anchors.isEmpty,
+                  let index = layers.lastIndex(where: isLocal) {
+            // 一个基准层都没有：把最下面那份本地数据当基准层
+            layers[index].isAnchor = true
+            if selectedSourceID == nil { selectedSourceID = layers[index].sourceID }
+        }
+    }
 
     init(id: UUID = UUID(), title: String = "空标签页") {
         self.id = id
@@ -46,95 +65,91 @@ struct WorkspaceTab: Identifiable {
     }
 }
 
-/// 多标签页：同时开着好几份数据，来回切。
-///
-/// 实现上刻意选「状态快照互换」而不是「把 AppModel 拆成每页一个实例」：
-/// 后者要把所有 `layers` / `datasets` 的调用点都改成 `activePage.layers`，改动面极大；
-/// 前者只在切换的那一刻把值搬运一遍，其余代码一行不用动，风险小得多。
 extension AppModel {
-    /// 当前页在一览里的下标。
-    var activeWorkspaceTabIndex: Int? {
-        guard let id = activeWorkspaceTabID else { return nil }
-        return workspaceTabs.firstIndex { $0.id == id }
+    var activeWorkspaceTabID: UUID { activeWorkspaceTab.id }
+
+    // These accessors keep commands and panels pointed at the current document.
+    var datasets: [TileDataset] {
+        get { activeWorkspaceTab.datasets }
+        set { activeWorkspaceTab.datasets = newValue }
     }
 
-    /// 没有分过页时，按当前状态补出第一页（启动后第一次用到标签页时调用）。
-    ///
-    /// 只补空壳，不捕获当前状态：这样「刚打开数据就出现在第一页」的路径
-    /// 与以前完全一致（谁也不用去猜那一刻状态是不是完整的）。
-    func ensureWorkspaceTabs() {
-        guard workspaceTabs.isEmpty else { return }
-        let tab = WorkspaceTab(title: derivedTabTitle())
-        workspaceTabs = [tab]
-        activeWorkspaceTabID = tab.id
+    var rasters: [RasterDataset] {
+        get { activeWorkspaceTab.rasters }
+        set { activeWorkspaceTab.rasters = newValue }
     }
 
-    /// 这一页该叫什么：跟着打开的内容走，没有内容就叫「空标签页」。
-    func derivedTabTitle() -> String {
-        if let name = selectedSourceName { return name }
-        if usesOnlineBasemap, let basemap = onlineBasemap { return basemap.name }
-        return "空标签页"
+    var selectedSourceID: String? {
+        get { activeWorkspaceTab.selectedSourceID }
+        set { activeWorkspaceTab.selectedSourceID = newValue }
     }
 
-    /// 把当前模型状态存回当前页。切页 / 关页 / 记标题时调用。
-    func captureCurrentWorkspaceTab() {
-        guard let index = activeWorkspaceTabIndex else { return }
-        workspaceTabs[index].title = derivedTabTitle()
-        workspaceTabs[index].datasets = datasets
-        workspaceTabs[index].rasters = rasters
-        workspaceTabs[index].selectedSourceID = selectedSourceID
-        workspaceTabs[index].rootFolder = rootFolder
-        workspaceTabs[index].extent = extent
-        workspaceTabs[index].layers = layers
-        workspaceTabs[index].selectedLayerID = selectedLayerID
-        workspaceTabs[index].usesOnlineBasemap = usesOnlineBasemap
-        workspaceTabs[index].appliedLocalDatasetID = appliedLocalDatasetID
-        workspaceTabs[index].appliedOnlineSignature = appliedOnlineSignature
-        workspaceTabs[index].viewpoint = canvas.workspaceViewpoint
-        workspaceTabs[index].measurements = measurements.measurements
-        workspaceTabs[index].draft = measurements.workspaceDraft
-        workspaceTabs[index].measurementSourcePath = measurementOwnerPath
+    var rootFolder: URL? {
+        get { activeWorkspaceTab.rootFolder }
+        set { activeWorkspaceTab.rootFolder = newValue }
     }
 
-    /// 把某一页的状态装回模型，并让画布跟上。
-    func applyWorkspaceTab(_ tab: WorkspaceTab) {
+    var extent: DatasetExtent? {
+        get { activeWorkspaceTab.extent }
+        set { activeWorkspaceTab.extent = newValue }
+    }
+
+    var layers: [MapLayer] {
+        get { activeWorkspaceTab.layers }
+        set { activeWorkspaceTab.layers = newValue }
+    }
+
+    var selectedLayerID: String? {
+        get { activeWorkspaceTab.selectedLayerID }
+        set { activeWorkspaceTab.selectedLayerID = newValue }
+    }
+
+    var usesOnlineBasemap: Bool {
+        get { activeWorkspaceTab.usesOnlineBasemap }
+        set {
+            activeWorkspaceTab.usesOnlineBasemap = newValue
+            applyBasemap()
+        }
+    }
+
+    var appliedLocalDatasetID: TileDataset.ID? {
+        get { activeWorkspaceTab.appliedLocalDatasetID }
+        set { activeWorkspaceTab.appliedLocalDatasetID = newValue }
+    }
+
+    var appliedOnlineSignature: String? {
+        get { activeWorkspaceTab.appliedOnlineSignature }
+        set { activeWorkspaceTab.appliedOnlineSignature = newValue }
+    }
+
+    var swipePivotLayerID: String? {
+        get { activeWorkspaceTab.swipePivotLayerID }
+        set {
+            guard newValue != activeWorkspaceTab.swipePivotLayerID else { return }
+            activeWorkspaceTab.swipePivotLayerID = newValue
+            canvas.updateWorkspaceSwipe()
+        }
+    }
+
+    var measurements: MeasurementStore { activeWorkspaceTab.measurements }
+    var measurementOwnerPath: String? { activeWorkspaceTab.measurementSourcePath }
+    var anchorLayer: MapLayer? { activeWorkspaceTab.anchorLayer }
+
+    private func presentWorkspaceTab(_ tab: WorkspaceTab) {
         cancelAnalysis()
         cancelSourceLoading()
-        isSwitchingWorkspaceTab = true
-        defer { isSwitchingWorkspaceTab = false }
-
-        datasets = tab.datasets
-        rasters = tab.rasters
-        selectedSourceID = tab.selectedSourceID
-        rootFolder = tab.rootFolder
-        extent = tab.extent
+        activeWorkspaceTab = tab
         restoreOnlineConfiguration(from: tab.layers)
-        selectedLayerID = tab.selectedLayerID
-
-        // 在线底图开关会顺带重装在线层；放在图层列表之前，随后的整体赋值说了算。
-        if usesOnlineBasemap != tab.usesOnlineBasemap {
-            usesOnlineBasemap = tab.usesOnlineBasemap
+        canvas.showWorkspaceTab(tab)
+        if let dataset = selectedDataset, let anchor = tab.anchorLayer, anchor.kind == .dataset, anchor.fitRect == nil {
+            resolveExtent(for: dataset)
         }
+    }
 
-        layers = tab.layers
-        appliedLocalDatasetID = tab.appliedLocalDatasetID
-        appliedOnlineSignature = tab.appliedOnlineSignature
-        normalizeAnchor()
-        pushLayers()
-
-        // 测量不走 onChange：切页不该把这一页的测量写进另一页的自动存档。
-        changeMeasurementDocument(to: tab.measurementSourcePath ?? measurementPath(for: tab.selectedSourceID), initial: tab.measurements, recoverArchive: tab.recoverMeasurementArchive)
-        if let draft = tab.draft {
-            measurements.restoreDraft(draft)
-            canvas.refreshOverlay()
-        }
-
-        // 视角：记过就跳回去，没记过就按数据范围适配。
-        if let viewpoint = tab.viewpoint {
-            canvas.restoreWorkspaceViewpoint(viewpoint)
-        } else if let rect = anchorLayer?.fitRect {
-            canvas.fit(to: rect)
-        }
+    func restoreWorkspaceTabs(_ tabs: [WorkspaceTab], activeID: UUID?) {
+        guard let active = tabs.first(where: { $0.id == activeID }) ?? tabs.first else { return }
+        workspaceTabs = tabs
+        presentWorkspaceTab(active)
     }
 
     private func restoreOnlineConfiguration(from layers: [MapLayer]) {
@@ -153,54 +168,34 @@ extension AppModel {
         download.datum = Datum(rawValue: layer.sourceKey.components(separatedBy: "|").last ?? "") ?? .wgs84
     }
 
-    /// 切到指定标签页。
     func activateWorkspaceTab(_ id: UUID) {
-        guard id != activeWorkspaceTabID,
-              let tab = workspaceTabs.first(where: { $0.id == id }) else { return }
-        captureCurrentWorkspaceTab()
-        activeWorkspaceTabID = id
-        applyWorkspaceTab(tab)
+        guard id != activeWorkspaceTabID, let tab = workspaceTabs.first(where: { $0.id == id }) else { return }
+        presentWorkspaceTab(tab)
     }
 
-    /// 新开一页（空白），并把当前页存回。
     func addWorkspaceTab() {
-        ensureWorkspaceTabs()
-        captureCurrentWorkspaceTab()
-        var tab = WorkspaceTab()
-        tab.title = "空标签页"
+        let tab = WorkspaceTab()
+        bindMeasurementArchive(to: tab)
         workspaceTabs.append(tab)
-        activeWorkspaceTabID = tab.id
-        applyWorkspaceTab(tab)
+        presentWorkspaceTab(tab)
         setStatus("已新建标签页")
     }
 
-    /// 关掉一页。关掉最后一页时留一个空白页，不留「一页都没有」的状态。
+    /// 关掉当前页后优先切到右邻，最后一页关闭后显示空白页。
     func closeWorkspaceTab(_ id: UUID) {
-        ensureWorkspaceTabs()
-        captureCurrentWorkspaceTab()
         guard let index = workspaceTabs.firstIndex(where: { $0.id == id }) else { return }
-        let wasActive = id == activeWorkspaceTabID
         workspaceTabs.remove(at: index)
-
+        guard id == activeWorkspaceTabID else { return }
         if workspaceTabs.isEmpty {
             let tab = WorkspaceTab()
-            workspaceTabs = [tab]
-            activeWorkspaceTabID = tab.id
-            applyWorkspaceTab(tab)
-            return
+            bindMeasurementArchive(to: tab)
+            workspaceTabs.append(tab)
         }
-        guard wasActive else { return }
-        // 关掉的是当前页：接到右边一页，没有右边就接左边一页。
-        let next = workspaceTabs[min(index, workspaceTabs.count - 1)]
-        activeWorkspaceTabID = next.id
-        applyWorkspaceTab(next)
+        presentWorkspaceTab(workspaceTabs[min(index, workspaceTabs.count - 1)])
     }
 
-    /// 关掉当前页（菜单 / ⌥⌘W）。
     func closeActiveWorkspaceTab() {
-        ensureWorkspaceTabs()
-        guard let id = activeWorkspaceTabID else { return }
-        closeWorkspaceTab(id)
+        closeWorkspaceTab(activeWorkspaceTabID)
     }
 
     /// 往后（右）切一页，循环。
@@ -214,25 +209,21 @@ extension AppModel {
     }
 
     private func cycleWorkspaceTab(step: Int) {
-        ensureWorkspaceTabs()
-        guard workspaceTabs.count > 1, let index = activeWorkspaceTabIndex else { return }
+        guard workspaceTabs.count > 1,
+              let index = workspaceTabs.firstIndex(where: { $0 === activeWorkspaceTab }) else { return }
         let count = workspaceTabs.count
         let next = ((index + step) % count + count) % count
         activateWorkspaceTab(workspaceTabs[next].id)
     }
 
-    /// 给当前页改名（留空则恢复自动标题）。
     func renameWorkspaceTab(_ id: UUID, to name: String) {
-        guard let index = workspaceTabs.firstIndex(where: { $0.id == id }) else { return }
+        guard let tab = workspaceTabs.first(where: { $0.id == id }) else { return }
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        workspaceTabs[index].customName = trimmed.isEmpty ? nil : trimmed
+        tab.customName = trimmed.isEmpty ? nil : trimmed
     }
 
-    /// 打开数据之后刷新当前页的自动标题（切页前看不到，标签栏里也不该写着旧名字）。
     func refreshActiveWorkspaceTabTitle() {
-        guard !isSwitchingWorkspaceTab, let index = activeWorkspaceTabIndex else { return }
-        let title = derivedTabTitle()
-        guard workspaceTabs[index].title != title else { return }
-        workspaceTabs[index].title = title
+        let title = selectedSourceName ?? onlineBasemap?.name ?? "空标签页"
+        if activeWorkspaceTab.title != title { activeWorkspaceTab.title = title }
     }
 }

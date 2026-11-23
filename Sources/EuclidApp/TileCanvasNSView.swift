@@ -245,7 +245,9 @@ final class TileCanvasNSView: NSView {
     }
 
     var onViewportChanged: ((ViewportSnapshot) -> Void)?
+    var onWorkspaceViewpointChanged: ((WorkspaceViewpoint) -> Void)?
     var onTileStatsChanged: ((Int, Int) -> Void)?
+    var onFirstLayout: (() -> Void)?
 
     var showTileGrid = false {
         didSet {
@@ -697,6 +699,9 @@ final class TileCanvasNSView: NSView {
         super.layout()
         traceGeometryEvent("layout")
         guard bounds.width > 1, bounds.height > 1 else { return }
+        let firstLayout = onFirstLayout
+        onFirstLayout = nil
+        firstLayout?()
         camera.viewportSize = bounds.size
         adoptZoomBoundsToViewport()
         camera = camera.clamped(zoomLevelRange: zoomBounds)
@@ -848,10 +853,15 @@ final class TileCanvasNSView: NSView {
     func reportViewport(visibleTiles: Int) {
         lastVisibleTiles = visibleTiles
         let camera = effectiveCamera
+        let center = WebMercator.coordinate(fromNormalized: camera.center)
+        if !layers.isEmpty, !awaitingExtent {
+            onWorkspaceViewpointChanged?(WorkspaceViewpoint(center: center, zoomLevel: camera.zoomLevel,
+                                                           mapViewpoint: MapViewpoint(camera)))
+        }
         onViewportChanged?(ViewportSnapshot(
             zoomLevel: camera.zoomLevel,
             dataZoom: currentDataZoom,
-            center: WebMercator.coordinate(fromNormalized: camera.center),
+            center: center,
             metersPerPoint: camera.groundMetersPerPoint,
             visibleTiles: visibleTiles
         ))

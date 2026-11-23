@@ -10,7 +10,7 @@ import TileKit
 @MainActor
 enum DebugFixtures {
     /// 是否启用调试示例数据。读一次留成常量：这个判断每次测量变化都会被问到
-    /// （见 `AppModel.scheduleArchiveSave`），而环境字典每读一次都要重拼（约 29 µs）。
+    /// （见 `AppModel+Persistence.swift`），而环境字典每读一次都要重拼（约 29 µs）。
     static let isEnabled = ProcessInfo.processInfo.environment["EUCLID_DEMO_MEASUREMENT"] != nil
 
     /// 在数据集覆盖范围内铺几条示例测量。

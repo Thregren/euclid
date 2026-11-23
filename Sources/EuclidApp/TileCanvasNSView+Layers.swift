@@ -3,9 +3,10 @@ import QuartzCore
 import TileKit
 import TileRendering
 extension TileCanvasNSView {
-    func setLayers(_ newLayers: [MapLayer], focus: CGRect?) {
-        let hadContent = !stacks.isEmpty
+    func setLayers(_ newLayers: [MapLayer], focus: CGRect?, preservingView: Bool = true) {
+        let hadContent = preservingView && !stacks.isEmpty
         let previousScale = camera.groundMetersPerPoint
+        if !preservingView { extentRect = nil }
         if Self.tracesLayers {
             let names = newLayers.map { "\($0.id.prefix(6))/\($0.sourceKey.prefix(24))" }
             traceGeometryEvent("setLayers 层数=\(newLayers.count) [\(names.joined(separator: " "))]")
@@ -75,6 +76,7 @@ extension TileCanvasNSView {
             refreshCamera(fitRect: nil, defaultZoomLevel: nil)
             restoreGroundScale(previousScale, when: true)
         } else {
+            if !preservingView { camera.center = CGPoint(x: 0.5, y: 0.5) }
             refreshCamera(fitRect: focusRect, defaultZoomLevel: focusRect == nil ? 2 : nil)
         }
         // 图层增删改序之后遮罩对象可能对不上了，重刷一遍（未开启对比时是空操作）。

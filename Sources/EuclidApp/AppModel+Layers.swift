@@ -5,10 +5,7 @@ import SwiftUI
 import TileKit
 import UniformTypeIdentifiers
 
-/// 图层：增删改查、排序、基准层与图层工厂。
-///
-/// 从 `AppModel.swift`（状态中枢）里拆出来，纯搬移：状态与生命周期仍在那边，
-/// 这里只放操作图层的方法。
+/// 当前标签页的图层操作、基准层管理与图层工厂。
 extension AppModel {
     /// 各层瓦片缓存的上限，按物理内存分档。
     ///
@@ -130,32 +127,10 @@ extension AppModel {
             let stillUsed = layers.contains { ($0.source as? RasterTileSource)?.fileURL == raster.fileURL }
             if !stillUsed { RasterCache.discard(fileURL: raster.fileURL) }
         }
-        normalizeAnchor()
+        activeWorkspaceTab.normalizeAnchor()
         if removed.isAnchor { changeMeasurementDocument(to: measurementPath(for: selectedSourceID)) }
         pushLayers()
         releaseUnusedZipArchives()
-    }
-
-    /// 保证「基准层」这个不变量：本地数据里有且只有一层是基准层。
-    ///
-    /// 基准层决定测量、存档与相机尺度。任何会动图层列表的操作（增删、排序、改基准身份）
-    /// 之后都过一遍这里：一是别留下两个「基准」（那样「点它切过去」会失效），
-    /// 二是别在还有本地数据时一个基准都没有（那样测量与相机就没依据了）。
-    func normalizeAnchor() {
-        let isLocal: (MapLayer) -> Bool = { $0.kind != .online }
-        let anchors = layers.filter { $0.isAnchor && isLocal($0) }
-        if anchors.count > 1 {
-            // 留下第一个（画布上最下面那层优先），其余降为普通层
-            var kept = false
-            for index in layers.indices where layers[index].isAnchor && isLocal(layers[index]) {
-                if kept { layers[index].isAnchor = false } else { kept = true }
-            }
-        } else if anchors.isEmpty,
-                  let index = layers.lastIndex(where: isLocal) {
-            // 一个基准层都没有：把最下面那份本地数据当基准层
-            layers[index].isAnchor = true
-            if selectedSourceID == nil { selectedSourceID = layers[index].sourceID }
-        }
     }
 
     /// 调整叠放次序（列表末尾在最上面）。
@@ -164,7 +139,7 @@ extension AppModel {
         let target = up ? index + 1 : index - 1
         guard layers.indices.contains(target) else { return }
         layers.swapAt(index, target)
-        normalizeAnchor()
+        activeWorkspaceTab.normalizeAnchor()
         pushLayers()
     }
 
@@ -176,7 +151,7 @@ extension AppModel {
         copy.isAnchor = false
         layers.insert(copy, at: index + 1)
         selectedLayerID = copy.id
-        normalizeAnchor()
+        activeWorkspaceTab.normalizeAnchor()
         pushLayers()
         setStatus("已复制图层：\(copy.name)", autoClearAfter: 5)
     }
@@ -201,7 +176,7 @@ extension AppModel {
         let layer = layers.remove(at: from)
         if target > from { target -= 1 }
         layers.insert(layer, at: min(max(target, 0), layers.count))
-        normalizeAnchor()
+        activeWorkspaceTab.normalizeAnchor()
         pushLayers()
     }
 
@@ -224,16 +199,14 @@ extension AppModel {
         }
         layers.append(layer)
         selectedLayerID = layer.id
-        normalizeAnchor()
+        activeWorkspaceTab.normalizeAnchor()
         pushLayers()
         if announce { setStatus("已添加图层：\(layer.name)", autoClearAfter: 5) }
     }
 
-    /// 把图层列表推给画布。
-    /// 把图层列表推给画布（图层与来源两个扩展都要用，故不加 private）。
+    /// 图层改动后同步当前标签页的画布和自动标题。
     func pushLayers() {
-        canvas.set(layers: layers, focus: anchorLayer?.fitRect)
-        // 图层变了常常意味着「打开的东西」变了，顺手刷新当前标签页的自动标题。
+        canvas.updateWorkspaceLayers()
         refreshActiveWorkspaceTabTitle()
     }
 

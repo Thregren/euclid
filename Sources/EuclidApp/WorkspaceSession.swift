@@ -31,7 +31,7 @@ extension AppModel {
             reportPersistenceFailure(failure)
             return failure
         }
-        captureCurrentWorkspaceTab()
+        if force { canvas.commitViewportInteraction() }
         var assets: [SessionAsset] = []
         let tabs = workspaceTabs.map { tab in
             let recipes = tab.layers.map { layer in
@@ -51,8 +51,8 @@ extension AppModel {
                 selectedSourceID: tab.selectedSourceID, selectedLayerID: tab.selectedLayerID,
                 rootPath: tab.rootFolder?.canonicalFilePath, center: tab.viewpoint?.center,
                 zoom: tab.viewpoint?.zoomLevel,
-                measurements: tab.measurementSourcePath.flatMap { measurementSnapshots[$0] } ?? tab.measurements,
-                layers: recipes, measurementSourcePath: tab.measurementSourcePath, draft: tab.draft,
+                measurements: tab.measurements.measurements,
+                layers: recipes, measurementSourcePath: tab.measurementSourcePath, draft: tab.measurements.workspaceDraft,
                 mapViewpoint: tab.viewpoint?.mapViewpoint)
         }
         do {
@@ -82,13 +82,14 @@ extension AppModel {
         var tabs: [WorkspaceTab] = []
         for item in loaded {
             let saved = item.recipe
-            var tab = WorkspaceTab(id: saved.id, title: saved.title)
-            tab.customName = saved.customName; tab.rootFolder = saved.rootPath.map { URL(fileURLWithPath: $0) }
-            tab.measurements = saved.measurements
-            tab.draft = saved.draft
-            tab.recoverMeasurementArchive = true
-            tab.measurementSourcePath = saved.measurementSourcePath
+            let tab = WorkspaceTab(id: saved.id, title: saved.title)
+            tab.customName = saved.customName
+            tab.rootFolder = saved.rootPath.map { URL(fileURLWithPath: $0) }
+            let measurementPath = saved.measurementSourcePath
                 ?? saved.selectedSourceID.flatMap { $0.hasPrefix("/") ? $0 : nil }
+            bindMeasurementArchive(to: tab)
+            loadMeasurementDocument(for: tab, path: measurementPath, initial: saved.measurements, recoverArchive: true)
+            if let draft = saved.draft { tab.measurements.restoreDraft(draft) }
             for restored in item.layers {
                 let recipe = restored.recipe
                 var layer: MapLayer?
@@ -112,7 +113,8 @@ extension AppModel {
                 }
             }
             tab.selectedSourceID = saved.selectedSourceID; tab.selectedLayerID = saved.selectedLayerID
-            tab.appliedLocalDatasetID = saved.selectedSourceID
+            tab.normalizeAnchor()
+            tab.appliedLocalDatasetID = tab.selectedSourceID
             tab.usesOnlineBasemap = tab.layers.contains { $0.kind == .online }
             if let online = item.layers.first(where: { $0.recipe.kind == "online" })?.recipe, let template = online.template {
                 tab.appliedOnlineSignature = "\(template.id)|\(template.urlTemplate)|\(online.key ?? "")|\(online.datum.rawValue)"
@@ -122,12 +124,9 @@ extension AppModel {
             else if let id = tab.selectedSourceID, let raster = tab.rasters.first(where: { $0.id == id }) { tab.extent = raster.extent }
             tabs.append(tab)
         }
-        workspaceTabs = tabs
-        let active = tabs.first(where: { $0.id == document.activeTab }) ?? tabs[0]
-        activeWorkspaceTabID = active.id
-        applyWorkspaceTab(active)
+        restoreWorkspaceTabs(tabs, activeID: document.activeTab)
         if ProcessInfo.processInfo.environment["EUCLID_SESSION_PATH"] != nil {
-            FileHandle.standardError.write(Data("[session] restored tabs=\(tabs.count) layers=\(active.layers.count) active=\(active.id)\n".utf8))
+            FileHandle.standardError.write(Data("[session] restored tabs=\(tabs.count) layers=\(layers.count) active=\(activeWorkspaceTabID)\n".utf8))
         }
         return true
     }

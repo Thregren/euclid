@@ -359,7 +359,8 @@ enum DebugAnalysisScript {
                 try? await Task.sleep(for: .seconds(6))
                 _ = model.analysisReader
                 await model.analysisReaderLoadTask?.value
-                guard let first = model.activeWorkspaceTabID, model.analysisReader != nil else { return }
+                guard model.analysisReader != nil else { return }
+                let first = model.activeWorkspaceTabID
                 let count = model.layers.count
                 model.addSlopeLayer(scope: .whole)
                 model.addWorkspaceTab()
@@ -368,7 +369,7 @@ enum DebugAnalysisScript {
                 let newPageClean = model.layers.isEmpty && !model.analysis.isWorking
                 model.activateWorkspaceTab(first)
                 let originalClean = model.layers.count == count
-                if let temporaryTab { model.closeWorkspaceTab(temporaryTab) }
+                model.closeWorkspaceTab(temporaryTab)
                 model.addSlopeLayer(scope: .whole)
                 model.cancelAnalysis()
                 try? await Task.sleep(for: .seconds(2))
@@ -461,11 +462,7 @@ enum DebugTabsScript {
                 FileHandle.standardError.write(Data(("[tabs] " + text + "\n").utf8))
             }
             try? await Task.sleep(for: .seconds(12))
-            model.ensureWorkspaceTabs()
-            guard let firstTabID = model.activeWorkspaceTabID else {
-                log("没有活动标签页")
-                return
-            }
+            let firstTabID = model.activeWorkspaceTabID
             let firstSource = model.selectedSourceID
 
             // 在第一页放一条测量，用来验证「切回来测量还在」。

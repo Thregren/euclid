@@ -4,7 +4,7 @@ import SwiftUI
 /// 画布顶部的标签栏：同时开着的几份数据在这里切换。
 ///
 /// 只读 `AppModel.workspaceTabs` 与一个「当前页」id，点一下就走
-/// `activateWorkspaceTab` —— 状态怎么搬运是模型的事，这里一行业务逻辑都没有。
+/// `activateWorkspaceTab` —— 由模型显示选中的页面。
 struct WorkspaceTabBar: View {
     @Environment(AppModel.self) private var model
 

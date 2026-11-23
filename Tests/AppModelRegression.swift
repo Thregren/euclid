@@ -76,6 +76,8 @@ enum AppModelRegression {
         try await vectorImportTarget(first)
         try await restoredSessionMeasurements(first, second)
         try await restoredTabDraft(first, second)
+        try await sameSourceTabs(first, second)
+        try await workspaceRoundTrip(at: root)
         try await loadCompletesAfterSwitch(first, second)
         try loadingCancellation()
         try smallRasterZoom()
@@ -114,7 +116,6 @@ enum AppModelRegression {
     private static func importTarget(_ first: GeoMeasurement) async throws {
         let gate = MeasurementReadGate([first])
         let model = AppModel()
-        model.ensureWorkspaceTabs()
         let originalTab = model.activeWorkspaceTabID
         let importing = Task {
             await model.loadMeasurements(from: URL(fileURLWithPath: "/tmp/injected-measurement-input.json"), reader: { _ in await gate.read() })
@@ -124,13 +125,12 @@ enum AppModelRegression {
         await gate.release()
         try check(await importing.value == nil, "an import targeting the old tab was accepted in the new tab")
         try check(model.measurements.measurements.isEmpty, "stale import modified the newly active tab")
-        try check(model.workspaceTabs.first(where: { $0.id == originalTab })?.measurements.isEmpty == true, "cancelled import modified its old tab")
+        try check(model.workspaceTabs.first(where: { $0.id == originalTab })?.measurements.measurements.isEmpty == true, "cancelled import modified its old tab")
     }
 
     private static func vectorImportTarget(_ first: GeoMeasurement) async throws {
         let gate = MeasurementReadGate([first])
         let model = AppModel()
-        model.ensureWorkspaceTabs()
         let importing = Task {
             await model.importVectorOverlays(from: [URL(fileURLWithPath: "/tmp/injected.geojson")], reader: { _ in .success(await gate.read()) })
         }
@@ -173,7 +173,6 @@ enum AppModelRegression {
 
     private static func restoredTabDraft(_ first: GeoMeasurement, _ second: GeoMeasurement) async throws {
         let model = AppModel()
-        model.ensureWorkspaceTabs()
         let firstTab = model.workspaceTabs[0].id
         let gate = MeasurementReadGate([first])
         model.measurementReader = { _ in (await gate.read(), nil) }
@@ -184,17 +183,121 @@ enum AppModelRegression {
         try check(expected?.points.count == 2, "test did not create an unfinished distance measurement")
         model.addWorkspaceTab()
         try check(model.measurements.draft.isEmpty, "switching tabs showed another tab's draft")
-        model.measurements.tool = .browse
-        model.activateWorkspaceTab(firstTab)
+        model.measurements.tool = .distance
+        model.measurements.addPoint(second.points[0])
+        let otherDraft = model.measurements.workspaceDraft
         let read = model.measurementLoadTasks["draft-owner"]
         await gate.release()
         await read?.value
+        try check(model.measurements.workspaceDraft == otherDraft && model.measurements.measurements.isEmpty,
+                  "archive completion on an inactive tab touched the active tab")
+        model.activateWorkspaceTab(firstTab)
         try check(model.measurements.tool == .distance && model.measurements.workspaceDraft == expected,
                   "restoring a tab or loading its archive changed the draft or measurement tool")
         try check(model.measurements.measurements == [first], "restoring the draft replaced the finished measurements")
         try check(model.measurements.finishDraft()?.points == expected?.points && model.measurements.workspaceDraft == nil,
                   "restored draft could not be finished")
         _ = await model.measurementPersistence.flush()
+    }
+
+    private static func sameSourceTabs(_ first: GeoMeasurement, _ second: GeoMeasurement) async throws {
+        let model = AppModel()
+        let firstTab = model.activeWorkspaceTab
+        model.changeMeasurementDocument(to: "shared-across-tabs", initial: [first])
+        model.measurements.tool = .distance
+        model.measurements.addPoint(first.points[0])
+        let draft = model.measurements.workspaceDraft
+
+        model.addWorkspaceTab()
+        model.changeMeasurementDocument(to: "shared-across-tabs")
+        model.measurements.addFinished(second)
+        let secondTab = model.activeWorkspaceTab
+        try check(firstTab.measurements !== secondTab.measurements && secondTab.measurements.draft.isEmpty,
+                  "two tabs of the same source shared an editing store or draft")
+        try check(firstTab.measurements.measurements == [first, second] && firstTab.measurements.workspaceDraft == draft,
+                  "a same-source archive update lost a draft or left a tab with stale completed measurements")
+        model.activateWorkspaceTab(firstTab.id)
+        try check(model.measurements === firstTab.measurements && model.measurements.workspaceDraft == draft,
+                  "switching tabs replaced the original measurement store")
+        try check(await model.measurementPersistence.flush() == nil, "shared measurement archive did not flush")
+    }
+
+    private static func workspaceRoundTrip(at root: URL) async throws {
+        let file = root.appending(path: "workspace.json")
+        setenv("EUCLID_SESSION_PATH", file.path, 1)
+        unsetenv("EUCLID_DISABLE_SESSION")
+        defer {
+            setenv("EUCLID_DISABLE_SESSION", "1", 1)
+            unsetenv("EUCLID_SESSION_PATH")
+        }
+
+        let fixture = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .appending(path: "Fixtures/TIFF/geo_utm50_deflate.tif")
+        let urls = [root.appending(path: "tab-a.tif"), root.appending(path: "tab-b.tif")]
+        for url in urls { try FileManager.default.copyItem(at: fixture, to: url) }
+
+        let frame = CGRect(x: 0, y: 0, width: 1340, height: 800)
+        let model = AppModel()
+        let canvas = TileCanvasNSView(frame: frame)
+        model.canvas.attach(canvas)
+        var viewpoints: [MapViewpoint] = []
+        var drafts: [MeasurementDraft] = []
+
+        for (index, url) in urls.enumerated() {
+            if index > 0 { model.addWorkspaceTab() }
+            model.open(url)
+            await model.sourceTask?.value
+            try check(model.selectedRaster?.fileURL == url && model.layers.count == 1, "tab opened the wrong raster")
+            model.setOpacity(of: model.layers[0].id, to: 0.5 + Double(index) * 0.25)
+            for _ in 0...index { canvas.zoomIn(anchor: CGPoint(x: 450 + index * 170, y: 340)) }
+            model.measurements.tool = .distance
+            for x in [500.0, 560.0 + Double(index) * 55] {
+                model.measurements.addPoint(canvas.camera.coordinate(forViewPoint: CGPoint(x: x, y: 400)))
+            }
+            guard let draft = model.measurements.workspaceDraft else {
+                throw Failure(description: "failed to start a distance draft")
+            }
+            viewpoints.append(MapViewpoint(canvas.camera))
+            drafts.append(draft)
+        }
+        let ids = model.workspaceTabs.map(\.id)
+        try check(viewpoints[0] != viewpoints[1] && drafts[0] != drafts[1], "test requires two distinct views and drafts")
+        for index in [0, 1] {
+            model.activateWorkspaceTab(ids[index])
+            try check(MapViewpoint(canvas.camera) == viewpoints[index] && model.measurements.workspaceDraft == drafts[index],
+                      "switching tabs lost the original map viewpoint or draft")
+            try check(model.measurements.canUndo && model.layers[0].opacity == 0.5 + Double(index) * 0.25,
+                      "switching tabs changed layer state or discarded the editing history")
+        }
+        // Simulate quitting before the canvas commits a trackpad pan.
+        canvas.panOffset = CGPoint(x: 17, y: -12)
+        viewpoints[1] = MapViewpoint(canvas.effectiveCamera.clamped(zoomLevelRange: canvas.zoomBounds))
+        try check(await model.flushPersistentState() == nil, "could not save the multi-tab workspace")
+
+        let reopened = AppModel()
+        let newCanvas = TileCanvasNSView(frame: .zero)
+        reopened.canvas.attach(newCanvas)
+        try check(await reopened.restoreWorkspaceSession(), "could not reopen the multi-tab workspace")
+        try check(reopened.activeWorkspaceTabID == ids[1] && reopened.workspaceTabs.map(\.id) == ids,
+                  "reopen lost the active tab or reordered tabs")
+        newCanvas.frame = frame
+        newCanvas.layout()
+        for index in [1, 0, 1] {
+            reopened.activateWorkspaceTab(ids[index])
+            try check(MapViewpoint(newCanvas.camera) == viewpoints[index] &&
+                      reopened.activeWorkspaceTab.viewpoint?.mapViewpoint == viewpoints[index],
+                      "reopened canvas did not restore the tab's center and scale")
+            try check(newCanvas.measurementStore === reopened.measurements && reopened.measurements.workspaceDraft == drafts[index] &&
+                      reopened.measurements.measurements.isEmpty && reopened.measurements.tool == .distance,
+                      "reopened tab did not restore its unfinished distance measurement")
+            try check(reopened.selectedRaster?.fileURL == urls[index] &&
+                      reopened.layers.first?.opacity == 0.5 + Double(index) * 0.25,
+                      "reopen assigned the wrong raster or layer settings to a tab")
+        }
+        reopened.closeWorkspaceTab(ids[0])
+        try check(await reopened.flushPersistentState() == nil, "could not save after closing an inactive tab")
+        let saved = RecoverableFile.read(SessionDocument.self, from: file)?.value
+        try check(saved?.tabs.map(\.id) == [ids[1]], "a closed tab still appeared in the session")
     }
 
     private static func loadingCancellation() throws {
@@ -204,7 +307,7 @@ enum AppModelRegression {
         let task = Task<Void, Never> { do { try await Task.sleep(for: .seconds(10)) } catch {} }
         model.sourceTask = task
         let generation = model.sourceGeneration
-        model.applyWorkspaceTab(WorkspaceTab())
+        model.addWorkspaceTab()
         try check(!model.isScanning && !model.isResolvingExtent, "tab switch left busy flags that disable autosave")
         try check(task.isCancelled && model.sourceGeneration > generation, "tab switch did not cancel and invalidate source work")
     }
@@ -222,7 +325,7 @@ enum AppModelRegression {
         try check(canvas.currentZoomLevel > fitted, "a fitted small GeoTIFF could not be enlarged")
         let controller = CanvasController()
         controller.attach(canvas)
-        guard let savedViewpoint = controller.workspaceViewpoint?.mapViewpoint else {
+        guard let savedViewpoint = WorkspaceViewpoint(camera: canvas.camera).mapViewpoint else {
             throw Failure(description: "the canvas did not capture a workspace viewpoint")
         }
         let legacyCenter = canvas.currentViewpoint.center

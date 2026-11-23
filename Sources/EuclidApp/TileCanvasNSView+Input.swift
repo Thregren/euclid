@@ -451,6 +451,24 @@ extension TileCanvasNSView {
         reportViewportThrottled(force: true)
     }
 
+    /// 结束上一页的交互，再把画布交给下一页的测量工具。
+    func endWorkspaceInteraction() {
+        commitPan()
+        readoutTask?.cancel()
+        readoutTask = nil
+        pendingReadoutPoint = nil
+        dragTarget = nil
+        dragLastPoint = nil
+        dragStartPoint = nil
+        pendingClickPoint = nil
+        middleDragLastPoint = nil
+        hoveredVertex = nil
+        lastPointerPoint = nil
+        measurementStore?.liveCoordinate = nil
+        measurementStore?.cursorInfo = nil
+        clearPickRect()
+    }
+
     /// 手势期间的「有效相机」：把还没提交的位移算进去，读数与命中判定才不会滞后。
     /// （跨文件要用，故不是 `private`：状态栏读数与命中判定在视图本体里取值。）
     var effectiveCamera: MapCamera {

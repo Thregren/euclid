@@ -28,10 +28,17 @@ struct MeasurementDraft: Codable, Equatable, Sendable {
     var style: MeasurementStyle
 }
 
-struct WorkspaceViewpoint {
+struct WorkspaceViewpoint: Equatable {
     let center: GeoCoordinate
     let zoomLevel: Double
     let mapViewpoint: MapViewpoint?
+}
+
+extension WorkspaceViewpoint {
+    init(camera: MapCamera) {
+        self.init(center: WebMercator.coordinate(fromNormalized: camera.center),
+                  zoomLevel: camera.zoomLevel, mapViewpoint: MapViewpoint(camera))
+    }
 }
 
 struct SessionTab: Codable, Sendable {

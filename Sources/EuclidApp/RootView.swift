@@ -56,7 +56,6 @@ struct RootView: View {
                 .environment(model)
         }
         .task {
-            model.ensureWorkspaceTabs()
             // 键位覆盖由这个监视器接管（没改过的命令照旧走菜单栏）。
             model.installCommandKeyMonitor()
             model.activateInitialDataset()
@@ -204,7 +203,6 @@ struct MapScreen: View {
             TileMapView(
                 controller: model.canvas,
                 viewport: model.viewport,
-                measurements: model.measurements,
                 showGrid: model.showTileGrid
             )
             // 画布铺到窗口边缘：浮层的面板与底部状态栏都压在它上面。

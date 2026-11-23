@@ -82,18 +82,64 @@ struct MapLayer: Identifiable {
 @Observable
 final class CanvasController {
     private weak var view: TileCanvasNSView?
-    /// 视图还没建好时挂起最后一次装配，`attach` 后立刻补上。
-    private var pending: (() -> Void)?
+    private weak var workspaceTab: WorkspaceTab?
+    private var isPresentingTab = false
 
     func attach(_ view: TileCanvasNSView) {
+        self.view?.onWorkspaceViewpointChanged = nil
+        self.view?.onFirstLayout = nil
         self.view = view
-        view.measurementStore = measurements
         view.areaUnit = areaUnit
         view.onDeleteLayer = onDeleteLayer
         view.boundsPicker = boundsPicker
         view.boundsPickCancel = boundsPickCancel
-        view.setSwipe(pivotLayerID: swipePivotLayerID, fraction: nil)
-        pending?()
+        view.onWorkspaceViewpointChanged = { [weak self] viewpoint in
+            guard let self, !self.isPresentingTab, let tab = self.workspaceTab,
+                  tab.viewpoint != viewpoint else { return }
+            tab.viewpoint = viewpoint
+        }
+        presentWorkspaceTab()
+    }
+
+    func showWorkspaceTab(_ tab: WorkspaceTab) {
+        if workspaceTab !== tab { view?.endWorkspaceInteraction() }
+        workspaceTab = tab
+        presentWorkspaceTab()
+    }
+
+    private func presentWorkspaceTab() {
+        guard let view, let tab = workspaceTab else { return }
+        guard view.bounds.width > 1, view.bounds.height > 1 else {
+            view.onFirstLayout = { [weak self] in self?.presentWorkspaceTab() }
+            return
+        }
+        view.onFirstLayout = nil
+        isPresentingTab = true
+        defer { isPresentingTab = false }
+        view.measurementStore = tab.measurements
+        view.setLayers(tab.layers, focus: tab.anchorLayer?.fitRect, preservingView: false)
+        if let viewpoint = tab.viewpoint, !tab.layers.isEmpty {
+            restoreWorkspaceViewpoint(viewpoint)
+        }
+        view.setSwipe(pivotLayerID: tab.swipePivotLayerID)
+        if !tab.layers.isEmpty, !view.awaitingExtent {
+            tab.viewpoint = WorkspaceViewpoint(camera: view.effectiveCamera)
+        }
+    }
+
+    func updateWorkspaceLayers() {
+        guard let tab = workspaceTab else { return }
+        if tab.layers.isEmpty { tab.viewpoint = nil }
+        guard let view, view.onFirstLayout == nil else { return }
+        view.setLayers(tab.layers, focus: tab.anchorLayer?.fitRect)
+    }
+
+    func updateWorkspaceSwipe() {
+        view?.setSwipe(pivotLayerID: workspaceTab?.swipePivotLayerID)
+    }
+
+    func commitViewportInteraction() {
+        view?.commitPan()
     }
 
     /// 「在视图上框选范围」的接收方（非 nil = 画布正在拉框）。
@@ -122,30 +168,6 @@ final class CanvasController {
         didSet { view?.onDeleteLayer = onDeleteLayer }
     }
 
-    /// 卷帘对比的分界层（nil = 关闭）。
-    ///
-    /// 画布只认这个 id：分界层**之上**的图层裁到分隔线左侧，它自己与下面那些铺满整屏。
-    var swipePivotLayerID: String? {
-        didSet { view?.setSwipe(pivotLayerID: swipePivotLayerID, fraction: nil) }
-    }
-
-    private weak var measurements: MeasurementStore?
-
-    func bind(measurements: MeasurementStore) {
-        self.measurements = measurements
-        view?.measurementStore = measurements
-    }
-
-    /// 按图层列表装配画布（多图层）。
-    func set(layers: [MapLayer], focus: CGRect?) {
-        let apply: () -> Void = { [weak self] in
-            guard let self else { return }
-            self.view?.setLayers(layers, focus: focus)
-        }
-        pending = apply
-        apply()
-    }
-
     func updateExtent(_ extent: DatasetExtent?) {
         view?.setExtent(extent)
     }
@@ -153,13 +175,6 @@ final class CanvasController {
     /// 当前视点（书签记的就是它）。
     var viewpoint: (center: GeoCoordinate, zoomLevel: Double)? {
         view?.currentViewpoint
-    }
-
-    var workspaceViewpoint: WorkspaceViewpoint? {
-        guard let view else { return nil }
-        let legacy = view.currentViewpoint
-        return WorkspaceViewpoint(center: legacy.center, zoomLevel: legacy.zoomLevel,
-                                  mapViewpoint: MapViewpoint(view.camera))
     }
 
     func restoreWorkspaceViewpoint(_ viewpoint: WorkspaceViewpoint) {
@@ -229,18 +244,10 @@ final class AppModel {
     /// 全局共享实例：AppDelegate 需要用它来响应「用本应用打开文件夹」。
     static let shared = AppModel()
 
-    /// 瓦片数据集（`<z>/<x>/<y>` 目录）。
-    var datasets: [TileDataset] = []
-    /// 单幅影像（GeoTIFF / TIFF / 普通图片，按需解出屏幕上的那一块）。
-    var rasters: [RasterDataset] = []
-    /// 当前选中的本地来源 id：瓦片数据集是目录路径，单幅影像是文件路径。
-    var selectedSourceID: String?
     var isScanning = false
     /// 正在读取数据范围：这期间画布是空的，界面上要给个进度指示。
     var isResolvingExtent = false
     var statusMessage: String?
-    var rootFolder: URL?
-    var extent: DatasetExtent?
     var recentFolders: [URL] = []
 
     var showInspector = true
@@ -297,44 +304,11 @@ final class AppModel {
         }
         setStatus("在画布上按住左键拖出一个矩形，松手即填入下载范围（Esc 取消）", autoClearAfter: 8)
     }
-    /// 是否用在线底图。与下载面板共用同一套源参数（预设、模板、密钥），两处永远一致。
-    var usesOnlineBasemap = false {
-        didSet { applyBasemap() }
-    }
-
-    /// 画布上的图层（下 → 上），标记 `isAnchor` 的那层是测量、存档与相机尺度的依据。
-    ///
-    /// 图层的种类与数量都不写死：在线底图、本地瓦片数据集、单幅影像都可以叠，
-    /// 每层各有一条不透明度。改它请走 `AppModel+Layers.swift` 里的方法；
-    /// 这里没写 `private(set)` 是因为 Swift 的 `private` 是文件级的，拆到扩展文件里就看不到了。
-    var layers: [MapLayer] = []
-
-    /// 面板里选中的那一层（不透明度等属性作用于它）。
-    var selectedLayerID: String?
-
-    /// 标签页：每一页记住自己那份「打开的东西」（数据集 / 影像、图层、视角、测量）。
-    ///
-    /// 空数组表示「还没分过页」—— 第一次需要时再按当前状态补出一页，启动路径不受影响。
-    var workspaceTabs: [WorkspaceTab] = []
-    /// 当前显示的是哪一页。
-    var activeWorkspaceTabID: UUID?
-    /// 正在切换标签页：切换过程中会改一堆状态，用它挡住「顺手重算 / 重装」的副作用。
-    @ObservationIgnored var isSwitchingWorkspaceTab = false
+    var workspaceTabs: [WorkspaceTab]
+    var activeWorkspaceTab: WorkspaceTab
 
     var selectedLayer: MapLayer? {
         layers.first { $0.id == selectedLayerID } ?? anchorLayer ?? layers.last
-    }
-
-    /// 卷帘对比：分界层 id（nil = 关闭）。
-    ///
-    /// 它**之上**的图层只在分隔线左侧显示，它自己与下面那些铺满整屏 ——
-    /// 于是同一视野里两期影像各占一半，中间那条线可以直接拖。
-    /// 分界层被移除时自动关掉（见 `AppModel+Layers`）。
-    var swipePivotLayerID: String? {
-        didSet {
-            guard swipePivotLayerID != oldValue else { return }
-            canvas.swipePivotLayerID = swipePivotLayerID
-        }
     }
 
     /// 以某一层为分界开启 / 关闭卷帘对比。
@@ -355,8 +329,6 @@ final class AppModel {
         setStatus("卷帘对比：拖动画面中间的分隔线左右移动", autoClearAfter: 6)
     }
 
-    /// 基准层（本地来源）。
-    var anchorLayer: MapLayer? { layers.first { $0.isAnchor } }
     /// 最上面那层在线底图（界面上的「底图」指的就是它）。
     var onlineLayer: MapLayer? { layers.last { $0.kind == .online } }
 
@@ -377,7 +349,6 @@ final class AppModel {
 
     let viewport = ViewportState()
     let canvas = CanvasController()
-    let measurements = MeasurementStore()
     /// 书签视点（中心 + 层级），存在偏好里。
     let bookmarks = BookmarkStore()
     /// 可自定义的快捷键（⌘K 命令面板与键盘监视器共用）。
@@ -425,9 +396,6 @@ final class AppModel {
     /// 对不上代号就整段丢掉 —— 否则它会拿旧结果把用户刚选的东西覆盖掉。
     var sourceGeneration = 0
     @ObservationIgnored var sourceTask: Task<Void, Never>?
-    /// 已经装配到画布上的本地数据集与在线源，避免重复重装。
-    var appliedLocalDatasetID: TileDataset.ID?
-    var appliedOnlineSignature: String?
     /// 状态栏提示的自动清除任务。
     var statusClearTask: Task<Void, Never>?
     /// 巡检图集导出任务（重新导出时先取消上一次）。
@@ -435,8 +403,6 @@ final class AppModel {
     /// 上一次导出图集的目录（菜单里「在访达中显示」用）。
     var lastAtlasDirectory: URL?
     @ObservationIgnored let measurementPersistence = MeasurementPersistenceCoordinator()
-    @ObservationIgnored var measurementOwnerPath: String?
-    @ObservationIgnored var measurementSnapshots: [String: [GeoMeasurement]] = [:]
     @ObservationIgnored var measurementLoadTasks: [String: Task<Void, Never>] = [:]
     @ObservationIgnored var measurementEditedWhileLoading: Set<String> = []
     @ObservationIgnored var measurementReplacedWhileLoading: Set<String> = []
@@ -457,7 +423,11 @@ final class AppModel {
     private var memoryPressureSource: DispatchSourceMemoryPressure?
 
     init() {
-        canvas.bind(measurements: measurements)
+        let tab = WorkspaceTab()
+        workspaceTabs = [tab]
+        activeWorkspaceTab = tab
+        bindMeasurementArchive(to: tab)
+        canvas.showWorkspaceTab(tab)
         download.onStatus = { [weak self] message in
             self?.setStatus(message, autoClearAfter: 6)
         }
@@ -467,13 +437,6 @@ final class AppModel {
         }
         tileExport.onStatus = { [weak self] message in
             self?.setStatus(message, autoClearAfter: 8)
-        }
-        measurements.onChange = { [weak self] in
-            self?.scheduleArchiveSave()
-        }
-        measurements.onReplace = { [weak self] in
-            guard let self, let path = self.measurementOwnerPath, self.measurementLoadTasks[path] != nil else { return }
-            self.measurementReplacedWhileLoading.insert(path)
         }
         measurementPersistence.onFailure = { [weak self] message in
             self?.reportPersistenceFailure(message)
@@ -547,22 +510,6 @@ final class AppModel {
             guard !Task.isCancelled else { return }
             self?.statusMessage = nil
         }
-    }
-
-    // MARK: - 测量存档
-
-    func scheduleArchiveSave() {
-        // 无人值守的调试 / 自检运行会真的落点、清空、再读回，**一律不写**用户的自动存档；
-        // 演示样本（EUCLID_DEMO_MEASUREMENT）同理。这条守卫必须留在唯一的那条写盘入口上。
-        guard !DebugFixtures.isEnabled, !Self.skipsArchiveWrites else { return }
-        guard let path = measurementOwnerPath else { return }
-        let snapshot = measurements.measurements
-        measurementSnapshots[path] = snapshot
-        if measurementLoadTasks[path] != nil {
-            measurementEditedWhileLoading.insert(path)
-            return
-        }
-        measurementPersistence.record(snapshot, for: path)
     }
 
     /// 撤销 / 重做测量操作。

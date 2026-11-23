@@ -5,11 +5,7 @@ import SwiftUI
 import TileKit
 import UniformTypeIdentifiers
 
-/// 数据源与底图：打开 / 扫描 / 选中来源、装配基准层与在线层、范围解析与汇报。
-///
-/// 同样是从 `AppModel.swift` 拆出来的纯搬移。其中「当前装配到画布上的来源」这几个字段
-/// 要在图层扩展里一起维护（`appliedLocalDatasetID` 等），因此没有写成 private ——
-/// Swift 的 `private` 是文件级的，拆文件之后跨文件就看不到了。
+/// 当前标签页的来源读取、基准层与在线层装配、范围解析。
 extension AppModel {
     /// 当前在线底图；用本地数据时为 nil。
     var onlineBasemap: OnlineBasemap? {
@@ -98,7 +94,7 @@ extension AppModel {
         layer.opacity = previousOpacity
         layer.isVisible = previousVisibility
         layers.append(layer)
-        normalizeAnchor()
+        activeWorkspaceTab.normalizeAnchor()
         pushLayers()
 
         var message = "底图：\(basemap.name)"
@@ -451,7 +447,6 @@ extension AppModel {
     func selectSource(_ id: String?) {
         cancelAnalysis()
         cancelSourceLoading()
-        let generation = sourceGeneration
         AppModel.trace("select \(id ?? "nil")")
         changeMeasurementDocument(to: measurementPath(for: id))
         selectedSourceID = id
@@ -483,6 +478,11 @@ extension AppModel {
         // 选数据集就重装本地图层；在线底图是否叠加由 `usesOnlineBasemap` 决定，互不影响。
         applyLocalLayer(force: true)
         applyOnlineLayer()
+        resolveExtent(for: dataset)
+    }
+
+    func resolveExtent(for dataset: TileDataset) {
+        let generation = sourceGeneration
         // 数据范围要扫完目录才知道，这期间画布先不铺图（在错误位置铺一屏空占位只会闪）。
         setStatus("正在读取数据范围…", autoClearAfter: 0)
         isResolvingExtent = true
