@@ -1,0 +1,220 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {};
+	objectVersion = 60;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		100000000000000000000001 /* EuclidMobileApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000001 /* EuclidMobileApp.swift */; };
+		100000000000000000000002 /* MobileWorkspace.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000002 /* MobileWorkspace.swift */; };
+		100000000000000000000003 /* MobileMap.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000003 /* MobileMap.swift */; };
+		100000000000000000000004 /* TileKit in Frameworks */ = {isa = PBXBuildFile; productRef = 900000000000000000000001 /* TileKit */; };
+		100000000000000000000005 /* TileRendering in Frameworks */ = {isa = PBXBuildFile; productRef = 900000000000000000000002 /* TileRendering */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		200000000000000000000001 /* EuclidMobileApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EuclidMobileApp.swift; sourceTree = "<group>"; };
+		200000000000000000000002 /* MobileWorkspace.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileWorkspace.swift; sourceTree = "<group>"; };
+		200000000000000000000003 /* MobileMap.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileMap.swift; sourceTree = "<group>"; };
+		200000000000000000000004 /* EuclidMobile.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; path = EuclidMobile.app; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		300000000000000000000001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				100000000000000000000004 /* TileKit in Frameworks */,
+				100000000000000000000005 /* TileRendering in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		400000000000000000000001 = {
+			isa = PBXGroup;
+			children = (
+				400000000000000000000002 /* EuclidMobile */,
+				400000000000000000000003 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		400000000000000000000002 /* EuclidMobile */ = {
+			isa = PBXGroup;
+			children = (
+				200000000000000000000001 /* EuclidMobileApp.swift */,
+				200000000000000000000002 /* MobileWorkspace.swift */,
+				200000000000000000000003 /* MobileMap.swift */,
+			);
+			name = EuclidMobile;
+			path = Apps/EuclidMobile;
+			sourceTree = "<group>";
+		};
+		400000000000000000000003 /* Products */ = {
+			isa = PBXGroup;
+			children = (200000000000000000000004 /* EuclidMobile.app */);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		500000000000000000000001 /* EuclidMobile */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 800000000000000000000002 /* Build configuration list for PBXNativeTarget "EuclidMobile" */;
+			buildPhases = (
+				600000000000000000000001 /* Sources */,
+				300000000000000000000001 /* Frameworks */,
+			);
+			buildRules = ();
+			dependencies = ();
+			name = EuclidMobile;
+			packageProductDependencies = (
+				900000000000000000000001 /* TileKit */,
+				900000000000000000000002 /* TileRendering */,
+			);
+			productName = EuclidMobile;
+			productReference = 200000000000000000000004 /* EuclidMobile.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		500000000000000000000002 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastSwiftUpdateCheck = 2710;
+				LastUpgradeCheck = 2710;
+			};
+			buildConfigurationList = 800000000000000000000001 /* Build configuration list for PBXProject "EuclidMobile" */;
+			compatibilityVersion = "Xcode 15.0";
+			developmentRegion = "zh-Hans";
+			hasScannedForEncodings = 0;
+			knownRegions = ("zh-Hans", Base);
+			mainGroup = 400000000000000000000001;
+			packageReferences = (900000000000000000000003 /* XCLocalSwiftPackageReference "." */);
+			productRefGroup = 400000000000000000000003 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (500000000000000000000001 /* EuclidMobile */);
+		};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		600000000000000000000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				100000000000000000000001 /* EuclidMobileApp.swift in Sources */,
+				100000000000000000000002 /* MobileWorkspace.swift in Sources */,
+				100000000000000000000003 /* MobileMap.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		700000000000000000000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		700000000000000000000002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
+		700000000000000000000003 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 36;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "尺规";
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				"INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad" = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				MARKETING_VERSION = 1.18.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.thregren.euclid;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				"ARCHS[sdk=iphonesimulator*]" = arm64;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		700000000000000000000004 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 36;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "尺规";
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				"INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad" = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				MARKETING_VERSION = 1.18.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.thregren.euclid;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				"ARCHS[sdk=iphonesimulator*]" = arm64;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		800000000000000000000001 /* Build configuration list for PBXProject "EuclidMobile" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				700000000000000000000001 /* Debug */,
+				700000000000000000000002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		800000000000000000000002 /* Build configuration list for PBXNativeTarget "EuclidMobile" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				700000000000000000000003 /* Debug */,
+				700000000000000000000004 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		900000000000000000000003 /* XCLocalSwiftPackageReference "." */ = {isa = XCLocalSwiftPackageReference; relativePath = "."; };
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		900000000000000000000001 /* TileKit */ = {isa = XCSwiftPackageProductDependency; package = 900000000000000000000003; productName = TileKit; };
+		900000000000000000000002 /* TileRendering */ = {isa = XCSwiftPackageProductDependency; package = 900000000000000000000003; productName = TileRendering; };
+/* End XCSwiftPackageProductDependency section */
+
+	};
+	rootObject = 500000000000000000000002 /* Project object */;
+}

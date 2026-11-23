@@ -198,12 +198,15 @@ AppKit 模型回归需要可访问系统 GUI 服务的环境。测试使用临�
 | `TileKit` | 数据源、投影、测量、ZIP / TIFF / MBTiles、分析、Metal、下载、HTTP 服务、资源预算与存档 |
 | `TileRendering` | 共享瓦片图层调度、Core Animation 合成、离屏出图、UIKit 画布 |
 | `EuclidApp` | macOS SwiftUI / AppKit 窗口、输入、图层、工具面板与文档状态 |
+| `EuclidMobile` | iPhone 与 iPad 共用的 SwiftUI 应用、Files 导入、测距和移动端工作区 |
 | `TileTools` | 检查、提取与本地服务的命令行入口 |
 | `TileKitCheck` / `TileKitBench` | 回归检查与 Release 基准 |
 
 共享核心与渲染模块支持 **macOS 14+、iOS / iPadOS 17+**，只构建 ARM64，包括 ARM64 模拟器。UIKit 画布已有触控输入、无障碍、文件访问租约和移动端资源预算。
 
-**目前交付的是 macOS 应用及可复用的移动端共享模块，尚无完整 iPhone / iPad 应用或安装包。** 三套 SDK 编译通过不代表完成移动产品交付；独立 App target、导航与文档流程、测量标注适配、Apple Pencil、签名和真机交互仍需后续实现与验证。接入说明见 [ARM 与移动平台](docs/06-ARM与移动平台.md)。
+用 Xcode 27.1 或更新版本打开 `EuclidMobile.xcodeproj`，选择 `EuclidMobile` scheme 和 ARM64 iPhone、iPhone Duo 或 iPad 模拟器。App 最低支持 iOS / iPadOS 17。
+
+在「文件」中选取 GeoTIFF、TIFF、PNG 或 JPEG，可拖动、捏合或轻点两次缩放影像。打开已配准的影像后，点「测距」并在地图上添加测点。重新启动时恢复最近打开的影像、地图中心、缩放和测距草稿。iPhone Duo 内外屏切换时保留地图中心和缩放，随可用屏幕尺寸扩展或缩小可见范围。
 
 ## 已知边界
 
