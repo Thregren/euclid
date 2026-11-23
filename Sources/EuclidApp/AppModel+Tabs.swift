@@ -29,6 +29,7 @@ struct WorkspaceTab: Identifiable {
     /// 切走时的视点；没动过视图就是 nil（切回来按数据范围适配）。
     var viewpoint: (center: GeoCoordinate, zoomLevel: Double)?
     var measurements: [GeoMeasurement] = []
+    var draft: MeasurementDraft?
     var measurementSourcePath: String?
     /// Only restored sessions need reconciliation; in-process tab snapshots already share revisions.
     var recoverMeasurementArchive = false
@@ -91,6 +92,7 @@ extension AppModel {
         workspaceTabs[index].appliedOnlineSignature = appliedOnlineSignature
         workspaceTabs[index].viewpoint = canvas.viewpoint
         workspaceTabs[index].measurements = measurements.measurements
+        workspaceTabs[index].draft = measurements.workspaceDraft
         workspaceTabs[index].measurementSourcePath = measurementOwnerPath
     }
 
@@ -122,6 +124,10 @@ extension AppModel {
 
         // 测量不走 onChange：切页不该把这一页的测量写进另一页的自动存档。
         changeMeasurementDocument(to: tab.measurementSourcePath ?? measurementPath(for: tab.selectedSourceID), initial: tab.measurements, recoverArchive: tab.recoverMeasurementArchive)
+        if let draft = tab.draft {
+            measurements.restoreDraft(draft)
+            canvas.refreshOverlay()
+        }
 
         // 视角：记过就跳回去，没记过就按数据范围适配。
         if let viewpoint = tab.viewpoint {

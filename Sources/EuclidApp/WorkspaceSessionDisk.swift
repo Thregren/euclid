@@ -22,6 +22,12 @@ struct SessionLayer: Codable, Sendable {
     var pixelHeight: Int?
 }
 
+struct MeasurementDraft: Codable, Equatable, Sendable {
+    var kind: MeasurementKind
+    var points: [GeoCoordinate]
+    var style: MeasurementStyle
+}
+
 struct SessionTab: Codable, Sendable {
     var id: UUID
     var title: String
@@ -34,6 +40,7 @@ struct SessionTab: Codable, Sendable {
     var measurements: [GeoMeasurement]
     var layers: [SessionLayer]
     var measurementSourcePath: String?
+    var draft: MeasurementDraft? = nil
 }
 
 struct SessionDocument: Codable, Sendable {

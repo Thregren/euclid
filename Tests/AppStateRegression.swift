@@ -72,15 +72,21 @@ enum AppStateRegression {
         let disk = WorkspaceSessionDisk(url: url, credentials: MemoryCredentials())
         let loaded = try await disk.restore()
         try check(loaded?.1.first?.layers.isEmpty == true, "offline layer should remain unavailable")
+        try check(loaded?.0.tabs.first?.draft == nil, "a workspace without a draft did not decode with an empty draft")
         edited.customName = "edited while disk offline"
         edited.zoom = 12
         edited.layers = []
         edited.measurements = [GeoMeasurement(kind: .point, points: [GeoCoordinate(longitude: 120, latitude: 25)])]
+        edited.draft = MeasurementDraft(kind: .distance, points: [
+            GeoCoordinate(longitude: 120, latitude: 25), GeoCoordinate(longitude: 121, latitude: 26)
+        ], style: .standard)
         let document = SessionDocument(activeTab: edited.id, tabs: [edited])
         try await disk.save(document, assets: [])
         let saved = RecoverableFile.read(SessionDocument.self, from: url)!.value.tabs[0]
         try check(saved.customName == edited.customName && saved.zoom == 12, "offline preservation discarded tab edits")
         try check(saved.measurements == edited.measurements, "offline preservation discarded new measurements")
+        let reopened = try await WorkspaceSessionDisk(url: url, credentials: MemoryCredentials()).restore()
+        try check(reopened?.0.tabs.first?.draft == edited.draft, "reopened workspace lost its unfinished measurement")
         try check(saved.layers.map(\.id) == [missing.id], "offline recipe should survive independently of tab state")
         let identity = FileIdentity(url: url)
         for _ in 0..<10 { try await disk.save(document, assets: []) }

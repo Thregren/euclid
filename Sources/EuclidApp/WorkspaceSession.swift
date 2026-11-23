@@ -52,7 +52,7 @@ extension AppModel {
                 rootPath: tab.rootFolder?.canonicalFilePath, center: tab.viewpoint?.center,
                 zoom: tab.viewpoint?.zoomLevel,
                 measurements: tab.measurementSourcePath.flatMap { measurementSnapshots[$0] } ?? tab.measurements,
-                layers: recipes, measurementSourcePath: tab.measurementSourcePath)
+                layers: recipes, measurementSourcePath: tab.measurementSourcePath, draft: tab.draft)
         }
         do {
             try await WorkspaceSessionDisk.shared.save(SessionDocument(activeTab: activeWorkspaceTabID, tabs: tabs), assets: assets)
@@ -84,6 +84,7 @@ extension AppModel {
             var tab = WorkspaceTab(id: saved.id, title: saved.title)
             tab.customName = saved.customName; tab.rootFolder = saved.rootPath.map { URL(fileURLWithPath: $0) }
             tab.measurements = saved.measurements
+            tab.draft = saved.draft
             tab.recoverMeasurementArchive = true
             tab.measurementSourcePath = saved.measurementSourcePath
                 ?? saved.selectedSourceID.flatMap { $0.hasPrefix("/") ? $0 : nil }
@@ -116,7 +117,7 @@ extension AppModel {
                 tab.appliedOnlineSignature = "\(template.id)|\(template.urlTemplate)|\(online.key ?? "")|\(online.datum.rawValue)"
             }
             if let center = saved.center, let zoom = saved.zoom, center.longitude.isFinite, center.latitude.isFinite, zoom.isFinite {
-                tab.viewpoint = (center, min(max(zoom, 0), 30))
+                tab.viewpoint = (center, zoom)
             }
             if let id = tab.selectedSourceID, let source = item.layers.first(where: { $0.dataset?.id == id }) { tab.extent = source.extent }
             else if let id = tab.selectedSourceID, let raster = tab.rasters.first(where: { $0.id == id }) { tab.extent = raster.extent }

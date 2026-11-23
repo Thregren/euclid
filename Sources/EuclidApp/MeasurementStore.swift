@@ -167,6 +167,11 @@ final class MeasurementStore {
         MeasurementCalculator.evaluate(kind: draftKind, points: draft)
     }
 
+    var workspaceDraft: MeasurementDraft? {
+        guard !draft.isEmpty, tool.measurementKind == draftKind else { return nil }
+        return MeasurementDraft(kind: draftKind, points: draft, style: pendingStyle)
+    }
+
     var selectedMeasurement: GeoMeasurement? {
         measurements.first { $0.id == selectedID }
     }
@@ -249,6 +254,23 @@ final class MeasurementStore {
         undoStack.removeAll()
         redoStack.removeAll()
         lastUndoKey = nil
+    }
+
+    /// 装回当前标签页的未完成测量。已完成的测量由独立存档恢复。
+    func restoreDraft(_ saved: MeasurementDraft) {
+        guard !saved.points.isEmpty,
+              saved.points.allSatisfy({ $0.longitude.isFinite && $0.latitude.isFinite }) else { return }
+        switch saved.kind {
+        case .distance: tool = .distance
+        case .area: tool = .area
+        case .circle: tool = .circle
+        case .point, .annotation: return
+        }
+        draftKind = saved.kind
+        draft = saved.points
+        pendingStyle = saved.style.sanitized()
+        selectedID = nil
+        liveCoordinate = nil
     }
 
     private func switchTool(from oldValue: MapTool) {

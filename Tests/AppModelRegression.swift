@@ -75,8 +75,10 @@ enum AppModelRegression {
         try await importTarget(first)
         try await vectorImportTarget(first)
         try await restoredSessionMeasurements(first, second)
+        try await restoredTabDraft(first, second)
         try await loadCompletesAfterSwitch(first, second)
         try loadingCancellation()
+        try smallRasterZoom()
         try await elevation(at: root)
         print("App model regression: \(checks) checks passed")
     }
@@ -169,6 +171,32 @@ enum AppModelRegression {
         _ = await model.measurementPersistence.flush()
     }
 
+    private static func restoredTabDraft(_ first: GeoMeasurement, _ second: GeoMeasurement) async throws {
+        let model = AppModel()
+        model.ensureWorkspaceTabs()
+        let firstTab = model.workspaceTabs[0].id
+        let gate = MeasurementReadGate([first])
+        model.measurementReader = { _ in (await gate.read(), nil) }
+        model.changeMeasurementDocument(to: "draft-owner")
+        model.measurements.tool = .distance
+        for point in first.points + second.points { model.measurements.addPoint(point) }
+        let expected = model.measurements.workspaceDraft
+        try check(expected?.points.count == 2, "test did not create an unfinished distance measurement")
+        model.addWorkspaceTab()
+        try check(model.measurements.draft.isEmpty, "switching tabs showed another tab's draft")
+        model.measurements.tool = .browse
+        model.activateWorkspaceTab(firstTab)
+        let read = model.measurementLoadTasks["draft-owner"]
+        await gate.release()
+        await read?.value
+        try check(model.measurements.tool == .distance && model.measurements.workspaceDraft == expected,
+                  "restoring a tab or loading its archive changed the draft or measurement tool")
+        try check(model.measurements.measurements == [first], "restoring the draft replaced the finished measurements")
+        try check(model.measurements.finishDraft()?.points == expected?.points && model.measurements.workspaceDraft == nil,
+                  "restored draft could not be finished")
+        _ = await model.measurementPersistence.flush()
+    }
+
     private static func loadingCancellation() throws {
         let model = AppModel()
         model.isScanning = true
@@ -179,6 +207,19 @@ enum AppModelRegression {
         model.applyWorkspaceTab(WorkspaceTab())
         try check(!model.isScanning && !model.isResolvingExtent, "tab switch left busy flags that disable autosave")
         try check(task.isCancelled && model.sourceGeneration > generation, "tab switch did not cancel and invalidate source work")
+    }
+
+    private static func smallRasterZoom() throws {
+        let fixture = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .appending(path: "Fixtures/TIFF/geo_utm50_deflate.tif")
+        let raster = try RasterLoader.load(url: fixture)
+        var layer = AppModel().makeLayer(raster: raster)
+        layer.isAnchor = true
+        let canvas = TileCanvasNSView(frame: CGRect(x: 0, y: 0, width: 1340, height: 800))
+        canvas.setLayers([layer], focus: raster.worldRect)
+        let fitted = canvas.currentZoomLevel
+        canvas.zoomIn()
+        try check(canvas.currentZoomLevel > fitted, "a fitted small GeoTIFF could not be enlarged")
     }
 
     private static func sample(_ model: AppModel, coordinate: GeoCoordinate) async -> Float? {

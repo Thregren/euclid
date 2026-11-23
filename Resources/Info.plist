@@ -30,6 +30,11 @@
         <key>CFBundleTypeRole</key><string>Viewer</string>
         <key>LSHandlerRank</key><string>Alternate</string>
         <key>LSItemContentTypes</key><array><string>com.thregren.euclid.mbtiles</string></array>
+    </dict><dict>
+        <key>CFBundleTypeName</key><string>GeoTIFF / TIFF 影像</string>
+        <key>CFBundleTypeRole</key><string>Viewer</string>
+        <key>LSHandlerRank</key><string>Alternate</string>
+        <key>LSItemContentTypes</key><array><string>public.tiff</string></array>
     </dict></array>
     <key>UTImportedTypeDeclarations</key>
     <array><dict>
