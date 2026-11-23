@@ -201,6 +201,13 @@ public final class TileLayerStack {
         baseTileSize * (tileSizeFollowsDisplayScale ? displayScale : 1)
     }
 
+    /// 允许小幅栅格在适配视口之后继续放大。瓦片请求仍使用数据本身的层级。
+    public static func rasterCameraZoomLimit(
+        dataLimit: Double, fittedZoom: Double, maximumFitZoom: Double = .infinity
+    ) -> Double {
+        max(dataLimit, min(fittedZoom + 3, maximumFitZoom))
+    }
+
     /// 「一屏还铺得出来」的最低相机层级。
     ///
     /// 相机缩到比数据最低层级还小时，这一层会把瓦片层级夹在数据的最低层级上，

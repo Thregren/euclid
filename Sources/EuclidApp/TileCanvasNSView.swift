@@ -615,12 +615,6 @@ final class TileCanvasNSView: NSView {
     /// 适配窗口：优先本地数据范围，其次在线底图范围。
 
 
-    /// 缩放到指定的世界范围。
-
-
-    /// 把相机移动到指定地理坐标（保持当前层级）。
-
-
     /// 跳到指定视点（中心 + 缩放层级），书签与「巡检图集」用。
     func goTo(_ coordinate: GeoCoordinate, zoomLevel: Double?) {
         markViewPositioned()
@@ -631,6 +625,15 @@ final class TileCanvasNSView: NSView {
         camera = camera.clamped(zoomLevelRange: zoomBounds)
         syncLayers()
         reportViewport(visibleTiles: lastVisibleTiles)
+    }
+
+    func restoreViewpoint(_ viewpoint: MapViewpoint) -> Bool {
+        guard let restored = viewpoint.applying(to: camera) else { return false }
+        markViewPositioned()
+        camera = restored.clamped(zoomLevelRange: zoomBounds)
+        syncLayers()
+        reportViewport(visibleTiles: lastVisibleTiles)
+        return true
     }
 
     /// 当前视点（书签记的就是这个）。

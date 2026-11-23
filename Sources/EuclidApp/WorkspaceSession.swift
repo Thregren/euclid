@@ -52,7 +52,8 @@ extension AppModel {
                 rootPath: tab.rootFolder?.canonicalFilePath, center: tab.viewpoint?.center,
                 zoom: tab.viewpoint?.zoomLevel,
                 measurements: tab.measurementSourcePath.flatMap { measurementSnapshots[$0] } ?? tab.measurements,
-                layers: recipes, measurementSourcePath: tab.measurementSourcePath, draft: tab.draft)
+                layers: recipes, measurementSourcePath: tab.measurementSourcePath, draft: tab.draft,
+                mapViewpoint: tab.viewpoint?.mapViewpoint)
         }
         do {
             try await WorkspaceSessionDisk.shared.save(SessionDocument(activeTab: activeWorkspaceTabID, tabs: tabs), assets: assets)
@@ -116,9 +117,7 @@ extension AppModel {
             if let online = item.layers.first(where: { $0.recipe.kind == "online" })?.recipe, let template = online.template {
                 tab.appliedOnlineSignature = "\(template.id)|\(template.urlTemplate)|\(online.key ?? "")|\(online.datum.rawValue)"
             }
-            if let center = saved.center, let zoom = saved.zoom, center.longitude.isFinite, center.latitude.isFinite, zoom.isFinite {
-                tab.viewpoint = (center, zoom)
-            }
+            tab.viewpoint = saved.workspaceViewpoint
             if let id = tab.selectedSourceID, let source = item.layers.first(where: { $0.dataset?.id == id }) { tab.extent = source.extent }
             else if let id = tab.selectedSourceID, let raster = tab.rasters.first(where: { $0.id == id }) { tab.extent = raster.extent }
             tabs.append(tab)

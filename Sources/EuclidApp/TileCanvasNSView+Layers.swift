@@ -131,8 +131,9 @@ extension TileCanvasNSView {
             hasActive = true
         }
         if anchorLayer?.kind == .raster, rect != nil {
-            // 小影像适配窗口时可能已超过原始比例。允许继续放大查看像素，瓦片请求仍用实际数据层级。
-            upper = max(upper, min(fitCamera.zoomLevel + 3, 30))
+            upper = TileLayerStack.rasterCameraZoomLimit(
+                dataLimit: upper, fittedZoom: fitCamera.zoomLevel, maximumFitZoom: 30
+            )
         }
         // 只有「真的要重新适配视野」时才按适配层级算下限；否则沿用原下限（否则每开关一次底图，
         // 能缩小的范围就被当前相机重新收紧一次，看起来就像视野被改动了）。

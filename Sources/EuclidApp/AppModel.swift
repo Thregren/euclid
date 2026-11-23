@@ -155,6 +155,18 @@ final class CanvasController {
         view?.currentViewpoint
     }
 
+    var workspaceViewpoint: WorkspaceViewpoint? {
+        guard let view else { return nil }
+        let legacy = view.currentViewpoint
+        return WorkspaceViewpoint(center: legacy.center, zoomLevel: legacy.zoomLevel,
+                                  mapViewpoint: MapViewpoint(view.camera))
+    }
+
+    func restoreWorkspaceViewpoint(_ viewpoint: WorkspaceViewpoint) {
+        if let mapViewpoint = viewpoint.mapViewpoint, view?.restoreViewpoint(mapViewpoint) == true { return }
+        jump(to: viewpoint.center, zoomLevel: viewpoint.zoomLevel)
+    }
+
     /// 跳到指定视点（中心 + 层级）。
     func jump(to coordinate: GeoCoordinate, zoomLevel: Double? = nil) {
         view?.goTo(coordinate, zoomLevel: zoomLevel)

@@ -220,6 +220,21 @@ enum AppModelRegression {
         let fitted = canvas.currentZoomLevel
         canvas.zoomIn()
         try check(canvas.currentZoomLevel > fitted, "a fitted small GeoTIFF could not be enlarged")
+        let controller = CanvasController()
+        controller.attach(canvas)
+        guard let savedViewpoint = controller.workspaceViewpoint?.mapViewpoint else {
+            throw Failure(description: "the canvas did not capture a workspace viewpoint")
+        }
+        let legacyCenter = canvas.currentViewpoint.center
+        canvas.zoomOut()
+        controller.restoreWorkspaceViewpoint(WorkspaceViewpoint(center: legacyCenter, zoomLevel: fitted,
+                                                                mapViewpoint: savedViewpoint))
+        try check(MapViewpoint(canvas.camera) == savedViewpoint,
+                  "workspace restore used the legacy tile level instead of the saved point scale")
+        controller.restoreWorkspaceViewpoint(WorkspaceViewpoint(center: legacyCenter, zoomLevel: fitted,
+                                                                mapViewpoint: nil))
+        try check(abs(canvas.currentZoomLevel - fitted) < 1e-8,
+                  "a workspace from an older release could not restore its legacy tile level")
     }
 
     private static func sample(_ model: AppModel, coordinate: GeoCoordinate) async -> Float? {

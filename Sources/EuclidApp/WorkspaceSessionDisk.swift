@@ -28,6 +28,12 @@ struct MeasurementDraft: Codable, Equatable, Sendable {
     var style: MeasurementStyle
 }
 
+struct WorkspaceViewpoint {
+    let center: GeoCoordinate
+    let zoomLevel: Double
+    let mapViewpoint: MapViewpoint?
+}
+
 struct SessionTab: Codable, Sendable {
     var id: UUID
     var title: String
@@ -41,6 +47,12 @@ struct SessionTab: Codable, Sendable {
     var layers: [SessionLayer]
     var measurementSourcePath: String?
     var draft: MeasurementDraft? = nil
+    var mapViewpoint: MapViewpoint? = nil
+
+    var workspaceViewpoint: WorkspaceViewpoint? {
+        guard let center, let zoom, center.longitude.isFinite, center.latitude.isFinite, zoom.isFinite else { return nil }
+        return WorkspaceViewpoint(center: center, zoomLevel: zoom, mapViewpoint: mapViewpoint)
+    }
 }
 
 struct SessionDocument: Codable, Sendable {

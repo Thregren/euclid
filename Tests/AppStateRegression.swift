@@ -73,8 +73,13 @@ enum AppStateRegression {
         let loaded = try await disk.restore()
         try check(loaded?.1.first?.layers.isEmpty == true, "offline layer should remain unavailable")
         try check(loaded?.0.tabs.first?.draft == nil, "a workspace without a draft did not decode with an empty draft")
+        try check(loaded?.0.tabs.first?.mapViewpoint == nil, "a legacy session did not decode without a map viewpoint")
         edited.customName = "edited while disk offline"
         edited.zoom = 12
+        let center = GeoCoordinate(longitude: 120, latitude: 25)
+        edited.center = center
+        edited.mapViewpoint = MapViewpoint(MapCamera(center: WebMercator.normalized(center),
+                                                     zoomLevel: 12, viewportSize: .zero, tilePixelSize: 256))
         edited.layers = []
         edited.measurements = [GeoMeasurement(kind: .point, points: [GeoCoordinate(longitude: 120, latitude: 25)])]
         edited.draft = MeasurementDraft(kind: .distance, points: [
@@ -87,6 +92,8 @@ enum AppStateRegression {
         try check(saved.measurements == edited.measurements, "offline preservation discarded new measurements")
         let reopened = try await WorkspaceSessionDisk(url: url, credentials: MemoryCredentials()).restore()
         try check(reopened?.0.tabs.first?.draft == edited.draft, "reopened workspace lost its unfinished measurement")
+        try check(reopened?.0.tabs.first?.workspaceViewpoint?.mapViewpoint == edited.mapViewpoint,
+                  "reopened workspace lost the saved map center or point scale")
         try check(saved.layers.map(\.id) == [missing.id], "offline recipe should survive independently of tab state")
         let identity = FileIdentity(url: url)
         for _ in 0..<10 { try await disk.save(document, assets: []) }

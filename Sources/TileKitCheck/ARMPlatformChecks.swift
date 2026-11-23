@@ -51,6 +51,27 @@ func runARMPlatformChecks() async {
 
     let camera = MapCamera(center: CGPoint(x: 0.6, y: 0.4), zoomLevel: 12,
                            viewportSize: CGSize(width: 400, height: 300), tilePixelSize: 512, displayScale: 3)
+    let mobileViewpoint = Data(#"{"center":[0.6,0.4],"pointsPerWorldUnit":699050.7}"#.utf8)
+    let decoded = try? JSONDecoder().decode(MapViewpoint.self, from: mobileViewpoint)
+    let desktop = MapCamera(center: .zero, zoomLevel: 1, viewportSize: CGSize(width: 1024, height: 768),
+                            tilePixelSize: 256, displayScale: 2)
+    let restored = decoded?.applying(to: desktop)?.clamped(zoomLevelRange: 0...30)
+    expect(restored?.center == camera.center && restored?.pixelsPerWorldUnit == 699050.7,
+           "旧移动端视野跨屏幕恢复时保留中心和视图比例")
+    expect(restored?.viewportSize == desktop.viewportSize && restored?.displayScale == desktop.displayScale
+           && restored?.tilePixelSize == desktop.tilePixelSize,
+           "恢复视野使用当前屏幕尺寸、像素比和瓦片边长")
+    let roundTripped = (try? JSONEncoder().encode(MapViewpoint(camera))).flatMap {
+        try? JSONDecoder().decode(MapViewpoint.self, from: $0)
+    }
+    expect(roundTripped == MapViewpoint(camera), "共享视野可无损写入和恢复")
+    let invalidCamera = MapCamera(center: camera.center, pixelsPerWorldUnit: 0,
+                                  viewportSize: .zero, tilePixelSize: 512)
+    expect(MapViewpoint(invalidCamera).applying(to: desktop) == nil, "无效的视图比例不会覆盖当前相机")
+    expect(TileLayerStack.rasterCameraZoomLimit(dataLimit: 20, fittedZoom: 25) == 28
+           && TileLayerStack.rasterCameraZoomLimit(dataLimit: 20, fittedZoom: 29, maximumFitZoom: 30) == 30
+           && TileLayerStack.rasterCameraZoomLimit(dataLimit: 24, fittedZoom: 10) == 24,
+           "小幅影像保留适配后的放大空间，原数据层级和桌面上限仍生效")
     let point = CGPoint(x: 83, y: 42)
     let coordinate = camera.coordinate(forLayerPoint: point)
     let roundtrip = camera.layerPoint(for: coordinate)

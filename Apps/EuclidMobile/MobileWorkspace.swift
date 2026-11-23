@@ -2,28 +2,11 @@ import Foundation
 import Observation
 import TileKit
 
-struct MobileViewpoint: Codable, Equatable, Sendable {
-    let center: CGPoint
-    let pointsPerWorldUnit: Double
-
-    init(_ camera: MapCamera) {
-        center = camera.center
-        pointsPerWorldUnit = camera.pixelsPerWorldUnit
-    }
-
-    func camera(tileSize: Int) -> MapCamera? {
-        guard center.x.isFinite, center.y.isFinite, pointsPerWorldUnit.isFinite,
-              pointsPerWorldUnit > 0 else { return nil }
-        return MapCamera(center: center, pixelsPerWorldUnit: pointsPerWorldUnit,
-                         viewportSize: .zero, tilePixelSize: Double(tileSize))
-    }
-}
-
 private struct MobileSession: Codable, Sendable {
     var bookmark: Data
     var name: String
     var fingerprint: RasterFingerprint?
-    var viewpoint: MobileViewpoint?
+    var viewpoint: MapViewpoint?
     var isMeasuring = false
     var draft: [GeoCoordinate] = []
     var measurements: [GeoMeasurement] = []
@@ -85,7 +68,7 @@ final class MobileWorkspace {
 
     @ObservationIgnored private let file: URL
     @ObservationIgnored private var session: MobileSession?
-    @ObservationIgnored private var viewpoint: MobileViewpoint?
+    @ObservationIgnored private(set) var viewpoint: MapViewpoint?
     @ObservationIgnored private var opening: UUID?
     @ObservationIgnored private var saveTask: Task<Void, Never>?
     @ObservationIgnored private var needsSave = false
@@ -161,13 +144,9 @@ final class MobileWorkspace {
         }
     }
 
-    func initialCamera(for raster: MobileRaster) -> MapCamera? {
-        viewpoint?.camera(tileSize: raster.dataset.tileSize)
-    }
-
     func updateCamera(_ camera: MapCamera, rasterID: UUID) {
         guard rasterID == raster?.id else { return }
-        let newViewpoint = MobileViewpoint(camera)
+        let newViewpoint = MapViewpoint(camera)
         guard newViewpoint != viewpoint else { return }
         viewpoint = newViewpoint
         needsSave = true

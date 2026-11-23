@@ -1,6 +1,26 @@
 import CoreGraphics
 import Foundation
 
+/// 工作区保存的地图中心与比例。视口尺寸、设备像素比和瓦片边长由当前画布提供。
+public struct MapViewpoint: Codable, Equatable, Sendable {
+    public let center: CGPoint
+    public let pointsPerWorldUnit: Double
+
+    public init(_ camera: MapCamera) {
+        center = camera.center
+        pointsPerWorldUnit = camera.pixelsPerWorldUnit
+    }
+
+    public func applying(to camera: MapCamera) -> MapCamera? {
+        guard center.x.isFinite, center.y.isFinite,
+              pointsPerWorldUnit.isFinite, pointsPerWorldUnit > 0 else { return nil }
+        var restored = camera
+        restored.center = center
+        restored.pixelsPerWorldUnit = pointsPerWorldUnit
+        return restored
+    }
+}
+
 /// 地图相机。
 ///
 /// 两个坐标系：
@@ -226,8 +246,10 @@ public struct MapCamera: Sendable, Equatable {
     }
 
     public func clamped(zoomLevelRange: ClosedRange<Double>) -> MapCamera {
+        let current = zoomLevel
+        let zoom = min(max(current, zoomLevelRange.lowerBound), zoomLevelRange.upperBound)
+        guard zoom != current else { return self }
         var camera = self
-        let zoom = min(max(zoomLevel, zoomLevelRange.lowerBound), zoomLevelRange.upperBound)
         camera.pixelsPerWorldUnit = pow(2, zoom) * tilePixelSize / displayScale
         return camera
     }

@@ -34,7 +34,7 @@ struct MobileMap: UIViewRepresentable {
         let dataset = raster.dataset
         canvas.setSource(raster.source, name: dataset.name, tileSize: dataset.tileSize,
                          worldRect: dataset.worldRect, maximumDataZoom: dataset.maximumDataZoom,
-                         initialCamera: workspace.initialCamera(for: raster))
+                         initialCamera: workspace.viewpoint?.applying(to: canvas.camera))
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }

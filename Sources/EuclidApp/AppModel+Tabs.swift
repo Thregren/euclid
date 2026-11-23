@@ -27,7 +27,7 @@ struct WorkspaceTab: Identifiable {
     var appliedLocalDatasetID: TileDataset.ID?
     var appliedOnlineSignature: String?
     /// 切走时的视点；没动过视图就是 nil（切回来按数据范围适配）。
-    var viewpoint: (center: GeoCoordinate, zoomLevel: Double)?
+    var viewpoint: WorkspaceViewpoint?
     var measurements: [GeoMeasurement] = []
     var draft: MeasurementDraft?
     var measurementSourcePath: String?
@@ -90,7 +90,7 @@ extension AppModel {
         workspaceTabs[index].usesOnlineBasemap = usesOnlineBasemap
         workspaceTabs[index].appliedLocalDatasetID = appliedLocalDatasetID
         workspaceTabs[index].appliedOnlineSignature = appliedOnlineSignature
-        workspaceTabs[index].viewpoint = canvas.viewpoint
+        workspaceTabs[index].viewpoint = canvas.workspaceViewpoint
         workspaceTabs[index].measurements = measurements.measurements
         workspaceTabs[index].draft = measurements.workspaceDraft
         workspaceTabs[index].measurementSourcePath = measurementOwnerPath
@@ -131,7 +131,7 @@ extension AppModel {
 
         // 视角：记过就跳回去，没记过就按数据范围适配。
         if let viewpoint = tab.viewpoint {
-            canvas.jump(to: viewpoint.center, zoomLevel: viewpoint.zoomLevel)
+            canvas.restoreWorkspaceViewpoint(viewpoint)
         } else if let rect = anchorLayer?.fitRect {
             canvas.fit(to: rect)
         }

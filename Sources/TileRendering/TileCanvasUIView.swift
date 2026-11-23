@@ -15,7 +15,7 @@ public final class TileCanvasUIView: UIView, UIGestureRecognizerDelegate {
     public var onViewportChanged: ((MapCamera) -> Void)?
     public var showsGrid = false { didSet { sync() } }
     private var sourceExtent: CGRect?
-    private var pendingFit: CGRect?
+    private var needsFit = false
     private var panning = false
     private var pinching = false
     private var zoomBounds: ClosedRange<Double> = 0...22
@@ -78,7 +78,7 @@ public final class TileCanvasUIView: UIView, UIGestureRecognizerDelegate {
                             memoryLimitBytes: TileResourcePolicy.defaultTileCacheBytes,
                             maxConcurrentRequests: TileResourcePolicy.concurrentDecodes)
         sourceExtent = worldRect
-        pendingFit = initialCamera == nil ? worldRect : nil
+        needsFit = initialCamera == nil && worldRect != nil
         lastReportedCamera = nil
         camera.tilePixelSize = tileStack.cameraTileSize(displayScale: camera.displayScale)
         if let initialCamera { setCamera(initialCamera) } else { sync() }
@@ -87,7 +87,7 @@ public final class TileCanvasUIView: UIView, UIGestureRecognizerDelegate {
     public func clearSource() {
         tileStack.clear()
         sourceExtent = nil
-        pendingFit = nil
+        needsFit = false
     }
 
     public func setCamera(_ camera: MapCamera) {
@@ -98,7 +98,7 @@ public final class TileCanvasUIView: UIView, UIGestureRecognizerDelegate {
     }
 
     public func fitToData() {
-        pendingFit = sourceExtent
+        needsFit = sourceExtent != nil
         sync()
     }
 
@@ -120,18 +120,20 @@ public final class TileCanvasUIView: UIView, UIGestureRecognizerDelegate {
         camera.displayScale = max(1, traitCollection.displayScale)
         camera.tilePixelSize = tileStack.cameraTileSize(displayScale: camera.displayScale)
         let lower = tileStack.affordableCameraZoom(viewportSize: bounds.size, displayScale: camera.displayScale)
-        var upper = tileStack.zoomLevelRange.upperBound
-        if let rect = sourceExtent, rect.width > 0, rect.height > 0,
-           rect.width.isFinite, rect.height.isFinite {
-            // A small raster can already be overzoomed when fitted to the viewport.
-            // Leave room to inspect its pixels at and beyond that fitted scale.
-            upper = max(upper, camera.fitting(rect).zoomLevel + 3)
+        let fittedCamera = sourceExtent.flatMap { rect -> MapCamera? in
+            guard rect.width > 0, rect.height > 0,
+                  rect.width.isFinite, rect.height.isFinite,
+                  rect.midX.isFinite, rect.midY.isFinite else { return nil }
+            return camera.fitting(rect)
         }
+        let dataLimit = tileStack.zoomLevelRange.upperBound
+        let upper = fittedCamera.map {
+            TileLayerStack.rasterCameraZoomLimit(dataLimit: dataLimit, fittedZoom: $0.zoomLevel)
+        } ?? dataLimit
         zoomBounds = lower...max(lower, upper, camera.zoomLevel)
-        if let rect = pendingFit, rect.width > 0, rect.height > 0,
-           rect.width.isFinite, rect.height.isFinite, rect.origin.x.isFinite, rect.origin.y.isFinite {
-            camera = camera.fitting(rect)
-            pendingFit = nil
+        if needsFit, let fittedCamera {
+            camera = fittedCamera
+            needsFit = false
         }
         // The display can resize or change scale when a window moves or folds. Retain the
         // geographic center and map points per world unit between input gestures.
